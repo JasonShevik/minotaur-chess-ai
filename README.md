@@ -1,2 +1,20 @@
 # minotaur-chess-ai
-This is an AI for playing chess that I am developing. It utilizes a neural network to evaluate the board and determine the next move. This AI does not use a search function to look multiple moves ahead. I'm interested to see how powerful I can make this bot without ever calculating ahead.
+This is a chess AI that I am developing. It utilizes a neural network to evaluate the board and determine the best next move. This AI does not use a search function to look multiple moves ahead. I'm interested to see how powerful I can make this bot without ever calculating ahead.
+
+Since the model will not calculate ahead, it will be a classifier model rather than a regression model. It will have two output nodes with one for the starting square and one for the ending square which together describe a single move (there will be a special case for castling).
+
+## Training plan
+#### Supervised learning
+A collection of chess positions will be curated (through random generation and/or randomly chosen positions in lichess chess960 games). These positions will then be evaluated by Stockfish 16 at high depth to ensure very high quality data. The Stockfish evaluation depth will be determined by the evaluation of the position at depth 20. The more even the position, the higher the depth, up to a depth of 50 or 60 for the most equal positions. This is to optimize the data labeling process, since close positions are more critical, and I don't want to waste additional compute power on clearly won/lost positions.
+
+Since chess is solved for positions with 7 or fewer pieces, I will only use Stockfish to evaluate positions with greater than 7 pieces. Endgame databases will be used to get high quality labeled data for positions with 7 or fewer pieces.
+
+#### Reinforcement learning
+The model will also be trained using reinforcement learning through [self-play](https://en.wikipedia.org/wiki/Self-play), similar to AlphaZero or LeelaChessZero. I would like to employ this method both as a fine-tuning strategy after doing supervised learning, and as a standalone strategy to be used from scratch, then look at the results of both strategies.
+
+I would also like to do self-play in a tournament structure rather than one-on-one matches. I believe this will reduce gaps in knowledge and result in a model that is the most well-rounded.
+
+#### Adversarial model -> supervised learning
+After using the previous methods (either supervised + self-play fine-tuning, or standalone self-play) I would like to train an adversarial network to learn the weaknesses of my model. This method was used to [defeat the superhuman Go AI, KataGo](https://arxiv.org/abs/2211.00241). Afterward, the American human, Kellin Pelrine, was able to learn this strategy to [defeat KataGo](https://arstechnica.com/information-technology/2023/02/man-beats-machine-at-go-in-human-victory-over-ai/). If my adversarial model is able to defeat the Minotaur model, I will then take positions from games that Minotaur lost and feed them into Stockfish 16 at high depth, and use that data to fine-tune the model with additional supervised learning.
+
+This process will then be repeated.
