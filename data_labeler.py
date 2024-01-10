@@ -12,7 +12,7 @@ depth_score_breaks = [[20,  8],
                       [40,  2],
                       [50,  1],
                       [60,  -1]]  # Maximum depth
-hopeless = 60
+hopeless = 300
 
 # Directory for the positions to be labeled
 positions_dir = "lichess-positions/lichess_positions_part_1.txt"
@@ -23,8 +23,8 @@ output_filepath = "lichess-positions/results.csv"
 
 # Set up the engine, and configure it to utilize a lot of resources
 engine = chess.engine.SimpleEngine.popen_uci(stockfish_dir)
-engine.configure({"Threads": 20,
-                  "Hash": 40000})
+engine.configure({"Threads": 19,
+                  "Hash": 45000})
 
 # Check if this is the first time this is being run
 if os.path.exists(output_filepath):
@@ -51,14 +51,35 @@ with (open(positions_dir, "r") as source_file,
 
         # Begin the analysis of this position
         with engine.analysis(board) as analysis:
+
+            print()
+
             # Analyze continuously, depth by depth, until we meet a break condition
             for info in analysis:
                 # Get the current depth
                 depth = info.get("depth")
                 score = info.get("score")
-                if depth is not None and score is not None:
+
+                if depth is not None:
+
+                    # There is an error causing some positions to give a score of None
+                    # This seems to occur when positions are very equal at somewhat high depth (around 27-33)
+                    if score is None:
+                        print(position)
+                        print()
+                        print(board)
+                        print()
+                        print(depth)
+                        print()
+                        output_file.write(f"{position.rstrip()},--,{depth},ERROR\n")
+                        break
+
+
+
                     # Retrieve the absolute value of the score
                     score = abs(int(str(score.pov(True))))
+
+                    print(score)
 
                     # If the game is completely and utterly lost, stop the eval; there's no need to go deeper
                     if score > hopeless:
@@ -83,14 +104,15 @@ with (open(positions_dir, "r") as source_file,
                             threshold_index += 1
 
         foobar += 1
-        if foobar == 50:
+        if foobar == 20:
             break
         # break  # Break out of for position in file after 1
 
 
 engine.quit()
 
-# TODO: add a way to keep track of how far into the source_file you got
-
+# TODO: add a way to keep track of how far into the source_file you got.
+# TODO: fix the error causing Stockfish to refuse to evaluate deeper than around 28-33 depth.
+# TODO: change depth_score_breaks thresholds.
 
 
