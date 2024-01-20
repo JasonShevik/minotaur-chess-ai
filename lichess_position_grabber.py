@@ -5,13 +5,13 @@ from random import randrange
 positions_per_game = 1
 output_positions = set()
 
-# Loop through each of the database files in the lichess-positions directory
-for filename in os.listdir("lichess-positions"):
+# Loop through each of the database files in the lichess-games directory
+for filename in os.listdir("lichess-games"):
 
     # Only proceed if it is a pgn files (Portable Game Notation), and open it
     if filename[-4:].lower() == ".pgn":
         print("Beginning:\t" + filename)
-        with open("lichess-positions/" + filename) as pgn:
+        with open("lichess-games/" + filename) as pgn:
 
             # Loop through every game in the pgn file
             for current_game in iter(lambda: chess.pgn.read_game(pgn), None):
@@ -82,5 +82,27 @@ print("\nWriting the selected positions to the output file.")
 with open("chosen_lichess_positions.txt", "w") as output_file:
     output_file.write("\n".join(output_positions))
 
+
+# Define a function to split the large file into smaller ones
+def split_file(original_file, num_files=5):
+    # Open the original file and read the lines
+    with open(original_file, 'r') as file:
+        lines = file.readlines()
+
+    # Calculate the number of lines per file
+    lines_per_file = len(lines) // num_files
+
+    for i in range(num_files):
+        with open(f'lichess_positions_part_{i+1}.txt', 'w') as file:
+            # Write a segment of lines to each new file
+            file.writelines(lines[i*lines_per_file : (i+1)*lines_per_file])
+
+    # Handle any remaining lines for the last file
+    if len(lines) % num_files != 0:
+        with open(f'lichess_positions_part_{num_files}.txt', 'a') as file:
+            file.writelines(lines[num_files*lines_per_file:])
+
+
+split_file('chosen_lichess_positions.txt')
 
 
