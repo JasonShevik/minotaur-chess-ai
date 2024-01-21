@@ -19,7 +19,7 @@ depth_score_breaks = [[20,  600],
 hopeless = 1500
 
 # Directory for the positions to be labeled
-positions_dir = "lichess-positions/lichess_positions_part_1.txt"
+positions_filepath = "lichess-positions/lichess_positions_part_1.txt"
 # Directory for chess engines to be used in the analysis
 stockfish_dir = "stockfish/stockfish-windows-x86-64-avx2.exe"
 # leela_dir = ""
@@ -47,7 +47,7 @@ def analyze_chunk(chunk_start, chunk_length):
 
     chunk_place = 0
     # Open the positions file (positions to analyze) and output file
-    with (open(positions_dir, "r") as source_file,
+    with (open(positions_filepath, "r") as source_file,
           open(output_filepath, "a") as output_file):
 
         # If this is the first run, put the header row in the results file
@@ -55,7 +55,8 @@ def analyze_chunk(chunk_start, chunk_length):
             output_file.write("Position,Move,Depth,Score\n")
 
         # Begin looping through each game, starting at chunk_start
-        for position in itertools.islice(source_file, chunk_start, None):   #Test this so that chunk_start doesn't skip a line
+        for position in itertools.islice(source_file, chunk_start, None):
+            time.sleep(2)
             # Set the board object for this position
             board = chess.Board(position)
 
@@ -64,8 +65,8 @@ def analyze_chunk(chunk_start, chunk_length):
 
             # Begin the analysis of this position
             with engine.analysis(board) as analysis:
-
-                print(chunk_place)
+                os.system("cls")
+                print(f"Chunk progress: {int((chunk_place/chunk_length)*100)}%")
 
                 # Analyze continuously, depth by depth, until we meet a break condition
                 for info in analysis:
@@ -111,12 +112,11 @@ def analyze_chunk(chunk_start, chunk_length):
                 break
 
 
-# ### Functions and variables have been set up ###
+# Initialize a dictionary for the progress associated with each positions file
+progress_dict = {}
+
 # Check for a progress file
 if os.path.exists(progress_filepath):
-    # Initialize a dictionary for the progress associated with each positions file
-    progress_dict = {}
-
     # Open the progress file we found
     with open(progress_filepath, "r") as progress_file:
         progress_reader = csv.reader(progress_file)
@@ -127,35 +127,51 @@ if os.path.exists(progress_filepath):
         for row in progress_reader:
             progress_dict[row[0]] = int(row[1])
 
-        # Find the starting row that corresponds to the positions_dir file for analysis
-        starting_row = progress_dict[positions_dir]
+        # Check if the progress file included the positions_filepath
+        if positions_filepath in progress_dict:
+            # Find the starting row that corresponds to the positions_filepath file for analysis
+            starting_row = progress_dict[positions_filepath]
+        else:
+            # Create an empty line for this positions_filepath file
+            progress_file.write(f"{positions_filepath},0\n")
+
+            # Add this positions file to the dictionary
+            progress_dict[positions_filepath] = 0
+            # Set the starting row for the positions_filepath file for analysis
+            starting_row = 0
 else:
     # Create a new progress file
     with open(progress_filepath, "a") as progress_file:
         # Write the header
         progress_file.write("File,Row\n")
         # Make note that we have made no progress yet on our current file
-        progress_file.write(f"{positions_dir},0\n")
+        progress_file.write(f"{positions_filepath},0\n")
 
-        # Set the starting row for the positions_dir file for analysis
+        # Add this positions file to the dictionary
+        progress_dict[positions_filepath] = 0
+        # Set the starting row for the positions_filepath file for analysis
         starting_row = 0
 
 
-chunk_length = 3
+chunk_length = 2
 for i in range(2):
     # Analyze this chunk
     analyze_chunk(chunk_start=starting_row, chunk_length=chunk_length)
+
+    # Increase the starting row by the chunk_length, so that in the next iteration we start at the right place
     starting_row += chunk_length
+    # Update the progress for this positions_filepath
+    progress_dict[positions_filepath] += chunk_length
 
+    # Create a new progress file to save our new progress
+    with open(progress_filepath, "w") as new_progress_file:
+        # Write the header of the new progress file
+        new_progress_file.write("File,Row\n")
 
-
-    # UPDATE THE PROGRESS FILE
-
+        # Iterate over the keys in the progress dictionary
+        for key in progress_dict:
+            # Write the current dictionary entry to the new progress file
+            new_progress_file.write(f"{key},{progress_dict[key]}\n")
 
 engine.quit()
-
-# TODO: add a way to keep track of how far into the source_file you got.
-# TODO: change depth_score_breaks thresholds.
-
-
 
