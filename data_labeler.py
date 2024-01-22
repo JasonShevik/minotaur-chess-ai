@@ -2,7 +2,6 @@ import chess.engine
 import chess
 import itertools
 import logging
-import time
 import csv
 import os
 
@@ -11,26 +10,36 @@ import os
 # If you reach the move and the evaluation is greater than the score, you stop analyzing
 # This is to optimize the data labeling. Positions where one side has a significant advantage are less critical
 #                    [move, score (centipawns)]
-depth_score_breaks = [[20,  600],
-                      [30,  400],
+depth_score_breaks = [[20,  400],
+                      [30,  200],
                       [40,  100],
-                      [50,  50],
-                      [60,  -1]]  # Maximum depth
+                      [50,  -1]]  # Maximum depth
 hopeless = 1500
 
 # Directory for the positions to be labeled
 positions_filepath = "lichess-positions/lichess_positions_part_1.txt"
 # Directory for chess engines to be used in the analysis
 stockfish_dir = "stockfish/stockfish-windows-x86-64-avx2.exe"
-# leela_dir = ""
-output_filepath = "analysis-output/results.csv"
-progress_filepath = "analysis-output/progress.csv"
+leela_dir = "lc0-v0.30.0-windows-gpu-nvidia-cuda/lc0.exe"
 
 # Set up the engine, and configure it to utilize a lot of resources
-engine = chess.engine.SimpleEngine.popen_uci(stockfish_dir)
-engine.configure({"Threads": 15,
-                  "Hash": 30000,
-                  "UCI_Elo": 3190})
+is_stockfish = False
+
+if is_stockfish:
+    engine = chess.engine.SimpleEngine.popen_uci(stockfish_dir)
+    engine.configure({"Threads": 14,
+                      "Hash": 35000,
+                      "UCI_Elo": 3190})
+    output_filepath = "output-stockfish/results.csv"
+    progress_filepath = "output-stockfish/progress.csv"
+else:
+    engine = chess.engine.SimpleEngine.popen_uci(leela_dir)
+    engine.configure({"Threads": 20,
+                      "NNCacheSize": 1000000,
+                      "MinibatchSize": 1024,
+                      "RamLimitMb": 40000})
+    output_filepath = "output-leela/results.csv"
+    progress_filepath = "output-leela/progress.csv"
 
 # Start the log
 logging.basicConfig(filename="chess_engine.log",
@@ -56,7 +65,6 @@ def analyze_chunk(chunk_start, chunk_length):
 
         # Begin looping through each game, starting at chunk_start
         for position in itertools.islice(source_file, chunk_start, None):
-            time.sleep(2)
             # Set the board object for this position
             board = chess.Board(position)
 
@@ -81,15 +89,24 @@ def analyze_chunk(chunk_start, chunk_length):
                     if score is None:
                         continue
 
-                    # Retrieve the absolute value of the score
-                    score = abs(int(str(score.pov(True))))
+                    score = str(score.pov(True))
+                    # If we discovered a checkmate before we realized it's hopeless
+                    if "#" in score:
+                        # Get the first move of the principle variation
+                        best_move = info.get("pv")[0]
+                        # Write to the file
+                        output_file.write(
+                            f"{position.rstrip()},{best_move},{depth},{str(info.get('score').pov(True))}\n")
+                        break
 
+                    # Retrieve the absolute value of the score
+                    score = abs(int(score))
                     # If the game is completely and utterly lost, stop the eval; there's no need to go deeper
                     if score > hopeless:
                         # Get the first move of the principle variation
                         best_move = info.get("pv")[0]
                         # Write to the file
-                        output_file.write(f"{position.rstrip()},{best_move},{depth},{score}\n")
+                        output_file.write(f"{position.rstrip()},{best_move},{depth},{str(info.get('score').pov(True))}\n")
                         break
 
                     # If we've reached a depth milestone specified by depth_score_breaks
@@ -100,7 +117,7 @@ def analyze_chunk(chunk_start, chunk_length):
                             # Get the first move of the principle variation
                             best_move = info.get("pv")[0]
                             # Write to the file
-                            output_file.write(f"{position.rstrip()},{best_move},{depth},{score}\n")
+                            output_file.write(f"{position.rstrip()},{best_move},{depth},{str(info.get('score').pov(True))}\n")
                             break
                         else:
                             # The evaluation is close enough that we want to analyze deeper
@@ -153,8 +170,8 @@ else:
         starting_row = 0
 
 
-chunk_length = 2
-for i in range(2):
+chunk_length = 1
+for i in range(1):
     # Analyze this chunk
     analyze_chunk(chunk_start=starting_row, chunk_length=chunk_length)
 
@@ -174,4 +191,8 @@ for i in range(2):
             new_progress_file.write(f"{key},{progress_dict[key]}\n")
 
 engine.quit()
+
+
+# TODO: Add a way for the user to interrupt the loop
+#           - This interrupt should be threaded. Then the user doesn't need to hold the key down.
 
