@@ -5,41 +5,56 @@ import logging
 import csv
 import os
 
-
-# These breakdowns represent the depth that the engine evaluates to based on the score
-# If you reach the move and the evaluation is greater than the score, you stop analyzing
-# This is to optimize the data labeling. Positions where one side has a significant advantage are less critical
-#                    [move, score (centipawns)]
-depth_score_breaks = [[20,  400],
-                      [30,  200],
-                      [40,  100],
-                      [50,  -1]]  # Maximum depth
-hopeless = 1500
-
-# Directory for the positions to be labeled
-positions_filepath = "lichess-positions/lichess_positions_part_1.txt"
 # Directory for chess engines to be used in the analysis
 stockfish_dir = "stockfish/stockfish-windows-x86-64-avx2.exe"
 leela_dir = "lc0-v0.30.0-windows-gpu-nvidia-cuda/lc0.exe"
 
 # Set up the engine, and configure it to utilize a lot of resources
-is_stockfish = False
+which_engine = "stockfish"
 
-if is_stockfish:
+if which_engine == "stockfish":
+    # These breakdowns represent the depth that the engine evaluates to based on the score
+    # If you reach the move and the evaluation is greater than the score, you stop analyzing
+    # This is to optimize the data labeling. Positions where one side has a significant advantage are less critical
+    #                    [move, score (centipawns)]
+    depth_score_breaks = [[20, 400],
+                          [30, 200],
+                          [40, 100],
+                          [50, -1]]  # Maximum depth
+    hopeless = 1500
+
+    # Directory for the positions to be labeled
+    positions_filepath = "lichess-positions/lichess_positions_part_1.txt"
+
     engine = chess.engine.SimpleEngine.popen_uci(stockfish_dir)
-    engine.configure({"Threads": 14,
-                      "Hash": 35000,
+    engine.configure({"Threads": 13,
+                      "Hash": 30000,
                       "UCI_Elo": 3190})
     output_filepath = "output-stockfish/results.csv"
     progress_filepath = "output-stockfish/progress.csv"
-else:
+elif which_engine == "leela":
+    # These breakdowns represent the depth that the engine evaluates to based on the score
+    # If you reach the move and the evaluation is greater than the score, you stop analyzing
+    # This is to optimize the data labeling. Positions where one side has a significant advantage are less critical
+    #                    [move, score (centipawns)]
+    depth_score_breaks = [[10, 400],
+                          [13, 200],
+                          [16, 100],
+                          [19, -1]]  # Maximum depth
+    hopeless = 1500
+
+    # Directory for the positions to be labeled
+    positions_filepath = "lichess-positions/lichess_positions_part_2.txt"
+
     engine = chess.engine.SimpleEngine.popen_uci(leela_dir)
-    engine.configure({"Threads": 20,
+    engine.configure({"Threads": 14,
                       "NNCacheSize": 1000000,
                       "MinibatchSize": 1024,
                       "RamLimitMb": 40000})
     output_filepath = "output-leela/results.csv"
     progress_filepath = "output-leela/progress.csv"
+else:
+    exit(1)
 
 # Start the log
 logging.basicConfig(filename="chess_engine.log",
@@ -170,8 +185,8 @@ else:
         starting_row = 0
 
 
-chunk_length = 1
-for i in range(1):
+chunk_length = 2
+for i in range(10):
     # Analyze this chunk
     analyze_chunk(chunk_start=starting_row, chunk_length=chunk_length)
 
