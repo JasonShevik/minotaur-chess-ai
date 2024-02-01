@@ -2,6 +2,7 @@ import chess.engine
 import chess
 import itertools
 import logging
+import time
 import csv
 import os
 
@@ -10,7 +11,7 @@ stockfish_dir = "stockfish/stockfish-windows-x86-64-avx2.exe"
 leela_dir = "lc0-v0.30.0-windows-gpu-nvidia-cuda/lc0.exe"
 
 # Set up the engine, and configure it to utilize a lot of resources
-which_engine = "stockfish"
+which_engine = "leela"
 
 if which_engine == "stockfish":
     # These breakdowns represent the depth that the engine evaluates to based on the score
@@ -27,7 +28,7 @@ if which_engine == "stockfish":
     positions_filepath = "lichess-positions/lichess_positions_part_1.txt"
 
     engine = chess.engine.SimpleEngine.popen_uci(stockfish_dir)
-    engine.configure({"Threads": 13,
+    engine.configure({"Threads": 12,
                       "Hash": 30000,
                       "UCI_Elo": 3190})
     output_filepath = "output-stockfish/results.csv"
@@ -91,6 +92,8 @@ def analyze_chunk(chunk_start, chunk_length):
                 os.system("cls")
                 print(f"Chunk progress: {int((chunk_place/chunk_length)*100)}%")
 
+                num_nodes_last = 0
+
                 # Analyze continuously, depth by depth, until we meet a break condition
                 for info in analysis:
                     # Get the current depth
@@ -123,6 +126,16 @@ def analyze_chunk(chunk_start, chunk_length):
                         # Write to the file
                         output_file.write(f"{position.rstrip()},{best_move},{depth},{str(info.get('score').pov(True))}\n")
                         break
+
+                    num_nodes = info.get("nodes")
+                    if num_nodes_last >= num_nodes:
+                        # Get the first move of the principle variation
+                        best_move = info.get("pv")[0]
+                        # Write to the file
+                        output_file.write(
+                            f"{position.rstrip()},{best_move},{depth},{str(info.get('score').pov(True))}\n")
+                        break
+                    num_nodes_last = num_nodes
 
                     # If we've reached a depth milestone specified by depth_score_breaks
                     if depth == depth_score_breaks[threshold_index][0]:
@@ -185,8 +198,8 @@ else:
         starting_row = 0
 
 
-chunk_length = 2
-for i in range(10):
+chunk_length = 1
+for i in range(1):
     # Analyze this chunk
     analyze_chunk(chunk_start=starting_row, chunk_length=chunk_length)
 
@@ -204,6 +217,7 @@ for i in range(10):
         for key in progress_dict:
             # Write the current dictionary entry to the new progress file
             new_progress_file.write(f"{key},{progress_dict[key]}\n")
+
 
 engine.quit()
 
