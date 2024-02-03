@@ -42,6 +42,7 @@ elif which_engine == "leela":
                           [13, 200],
                           [16, 100],
                           [19, -1]]  # Maximum depth
+
     hopeless = 1500
 
     # Directory for the positions to be labeled
@@ -51,7 +52,8 @@ elif which_engine == "leela":
     engine.configure({"Threads": 14,
                       "NNCacheSize": 1000000,
                       "MinibatchSize": 1024,
-                      "RamLimitMb": 40000})
+                      "RamLimitMb": 40000,
+                      "WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb"})
     output_filepath = "output-leela/results.csv"
     progress_filepath = "output-leela/progress.csv"
 else:
@@ -90,7 +92,7 @@ def analyze_chunk(chunk_start, chunk_length):
             # Begin the analysis of this position
             with engine.analysis(board) as analysis:
                 os.system("cls")
-                print(f"Chunk progress: {int((chunk_place/chunk_length)*100)}%")
+                #print(f"Chunk progress: {int((chunk_place/chunk_length)*100)}%")
 
                 num_nodes_last = 0
 
@@ -199,7 +201,8 @@ else:
 
 
 chunk_length = 1
-for i in range(1):
+for i in range(500):
+    print(i)
     # Analyze this chunk
     analyze_chunk(chunk_start=starting_row, chunk_length=chunk_length)
 
