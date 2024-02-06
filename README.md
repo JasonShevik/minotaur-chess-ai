@@ -4,6 +4,13 @@ This is a chess AI that I am developing. It utilizes a neural network to evaluat
 Since the model will not calculate ahead, it will be a classifier model rather than a regression model. It will have two output nodes with one for the starting square and one for the ending square which together describe a single move (there will be a special case for castling).
 
 ## Training plan
+#### Pre-training (RL)
+The model will be pre-trained on a very large collection of unlabeled chess960 positions to predict legal moves without regard to their quality. This will be done with reinforcement learning, where a penalty will be applied for illegal moves, and a reward for legal moves. 
+
+The penalty may be increased based on the ridiculousness of the output (ie trying to move your opponent's pieces is worse than moving your own piece wrong?). 
+
+The rewards will be modified based on the recency of the legal move that was chosen. I am sure that a3 is statistically a legal move far more often than Nh7, and I don't want the model to learn to just predict a3 over and over. So if it correctly chose a3 recently, it would get a smaller reward for correctly picking it again if it had another legal option, and it would get a higher reward for choosing a legal move that it hasn't chosen for a long time.
+
 #### Supervised learning
 A collection of chess positions will be curated (through random generation and/or randomly chosen positions in lichess chess960 games). These positions will then be evaluated by Stockfish 16 at high depth to ensure very high quality data. The Stockfish evaluation depth will be determined by the evaluation of the position at depth 20. The more even the position, the higher the depth, up to a depth of 50 or 60 for the most equal positions. This is to optimize the data labeling process, since close positions are more critical, and I don't want to waste additional compute power on clearly won/lost positions.
 
