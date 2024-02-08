@@ -26,12 +26,7 @@ import torch.optim as optim
 #  [x,x,x,x,x,x,x,x]]
 
 # ##### ##### ##### ##### #####
-# Supervised learning
-
-# The network will be trained via supervised learning on very high quality single-move chess puzzles created
-# by giving generated chess positions to stockfish to be evaluated at very high depth, as well as positions
-# from endgame databases where correct moves are proven.
-# This will bring the model to a base level. I'm interested to see what this level will be.
+# Architecture
 
 def create_minotaur(name):
     hidden_depth = 100
@@ -46,6 +41,36 @@ def create_minotaur(name):
     net = nn.Sequential(*layers)
 
     torch.save(net.state_dict(),f"{name}.pt")
+
+# ##### ##### ##### ##### #####
+# Pre-training
+
+# The model will be trained on a large number of chess positions to generate legal moves.
+# The model will be rewarded for legal moves, and punished for illegal ones
+# ~~The reward will be boosted if it predicts legal moves that it hasn't predicted recently~~
+# This is to increase the diversity of legal moves that it generates and prevent bias toward certain moves
+# The more diverse and unbiased the moves it learns to suggest, the better situated we'll be for the next step
+
+# Change of plans:
+# Boosting the reward based on recency of the move it chooses will create bias.
+# It would bias the model to choose the most obscure move in any position, like an overcorrection.
+# Instead, the model should choose a move for N positions, and the reward will be boosted based on
+# the ratio between how often it had the opportunity to play each move versus how often it chose that.
+# OR instead:
+# I could do a monte carlo simulation for the set of positions where I randomly choose moves, then
+# compare the found distribution to the one the AI does, and boost reward based on closeness to the random dist.
+
+
+
+# ##### ##### ##### ##### #####
+# Supervised learning
+
+# The model will be trained via supervised learning on very high quality single-move chess puzzles created
+# by giving chess positions to engines to be evaluated at very high depth, as well as positions
+# from endgame databases where correct moves are proven.
+# This will bring the model to a base level. I'm interested to see what this level will be.
+
+
 
 
 
