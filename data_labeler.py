@@ -28,7 +28,7 @@ if which_engine == "stockfish":
     positions_filepath = "lichess-positions/lichess_positions_part_1.txt"
 
     engine = chess.engine.SimpleEngine.popen_uci(stockfish_dir)
-    engine.configure({"Threads": 12,
+    engine.configure({"Threads": 10,
                       "Hash": 30000,
                       "UCI_Elo": 3190})
     output_filepath = "output-stockfish/results.csv"
@@ -52,8 +52,8 @@ elif which_engine == "leela":
     engine.configure({"Threads": 14,
                       "NNCacheSize": 1000000,
                       "MinibatchSize": 1024,
-                      "RamLimitMb": 40000,
-                      "WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb"})
+                      #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
+                      "RamLimitMb": 40000})
     output_filepath = "output-leela/results.csv"
     progress_filepath = "output-leela/progress.csv"
 else:
@@ -201,7 +201,7 @@ else:
 
 
 chunk_length = 1
-for i in range(500):
+for i in range(400):
     print(i)
     # Analyze this chunk
     analyze_chunk(chunk_start=starting_row, chunk_length=chunk_length)
