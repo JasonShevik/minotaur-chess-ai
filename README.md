@@ -3,6 +3,10 @@ This is a chess AI that I am developing. It utilizes a neural network to evaluat
 
 Since the model will not calculate ahead, it will be a classifier model rather than a regression model. It will have two output nodes with one for the starting square and one for the ending square which together describe a single move (there will be a special case for castling).
 
+## To Do:
+* Now that the "hopeless" mechanic has been removed (Previously, if a position had a high enough score, the analysis would stop before reaching the first depth threshhold. Now, the analysis only stops early if the engine stops making progress or finds a forced checkmate.), I will need to write a function to go over all analyzed positions with low depth and re-analyze them.
+* Write a function to convert the [FEN format](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation) positions into the 74 inputs for the neural net. 
+
 ## Training plan
 #### Pre-training (RL)
 The model will be pre-trained on a very large collection of unlabeled chess960 positions to predict legal moves without regard to their quality. This will be done with reinforcement learning, where a penalty will be applied for illegal moves, and a reward for legal moves. 
