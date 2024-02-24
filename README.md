@@ -5,7 +5,9 @@ Since the model will not calculate ahead, it will be a classifier model rather t
 
 ## To Do:
 * Now that the "hopeless" mechanic has been removed (Previously, if a position had a high enough score, the analysis would stop before reaching the first depth threshhold. Now, the analysis only stops early if the engine stops making progress or finds a forced checkmate.), I will need to write a function to go over all analyzed positions with low depth and re-analyze them.
-* Write a function to convert the [FEN format](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation) positions into the 74 inputs for the neural net. 
+* Write a function to convert the [FEN format](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation) positions into the 74 inputs for the neural net.
+* Incorporate [dropout](https://towardsdatascience.com/dropout-in-neural-networks-47a162d621d9) into the learning methods.
+* Incorporate [adding nosie](https://machinelearningmastery.com/train-neural-networks-with-noise-to-reduce-overfitting/) into the learning methods.
 
 ## Training plan
 #### Pre-training (RL)
