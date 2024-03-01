@@ -270,7 +270,7 @@ def analyze_hopeless(engine, analysis_path, depth_score_breaks):
         with open("results no hopeless.csv", "w") as output_file:
             output_file.write("Position,Move,Depth,Score\n")
             for row in file_rows:
-                output_file.write(row + "\n")
+                output_file.write(row.rstrip() + "\n")
 
 
 # Start the log
@@ -304,12 +304,20 @@ stockfish_config = {"Threads": 8,
 
 
 # If you're redoing the analysis from hopeless mechanic
-if True:
-    which = "leela"
-    the_breaks = leela_breaks
-    hopeless_engine = initialize_engine(which, leela_config)
+doing_hopeless = False
+if doing_hopeless:
+    which = "stockfish"
+    if which == "leela":
+        the_breaks = leela_breaks
+        the_config = leela_config
+    elif which == "stockfish":
+        the_breaks = stockfish_breaks
+        the_config = stockfish_config
+    else:
+        exit(0)
+    hopeless_engine = initialize_engine(which, the_config)
     analyze_hopeless(hopeless_engine, f"output-{which}/results.csv", the_breaks)
-    hopeless.quit()
+    hopeless_engine.quit()
     exit(0)
 
 # Create a stop event object, so that we can end the analysis on demand
