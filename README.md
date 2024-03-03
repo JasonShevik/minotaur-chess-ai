@@ -3,11 +3,29 @@ This is a chess AI that I am developing. It utilizes a neural network to evaluat
 
 Since the model will not calculate ahead, it will be a classifier model rather than a regression model. It will have two output nodes with one for the starting square and one for the ending square which together describe a single move (there will be a special case for castling).
 
+## Table of Contents
+
+* To Do
+* Training plan
+   * Pre-training
+   * Supervised learning
+   * Reinforcement learning
+   * Adversarial model
+* Reinforcement Learning Details
+   * Evolutionary AI
+   * Hyperspheres and randomness
+* Application
+   * ONNX
+   * Clojure
+
+
 ## To Do:
-* Now that the "hopeless" mechanic has been removed (Previously, if a position had a high enough score, the analysis would stop before reaching the first depth threshhold. Now, the analysis only stops early if the engine stops making progress or finds a forced checkmate.), I will need to write a function to go over all analyzed positions with low depth and re-analyze them.
 * Write a function to convert the [FEN format](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation) positions into the 74 inputs for the neural net.
 * Incorporate [dropout](https://towardsdatascience.com/dropout-in-neural-networks-47a162d621d9) into the learning methods.
 * Incorporate [adding nosie](https://machinelearningmastery.com/train-neural-networks-with-noise-to-reduce-overfitting/) into the learning methods.
+* Write the neural net.
+* Start writing some of the application stuff in Clojure/Java.
+* Reorganize the files and folders of this repo.
 
 ## Training plan
 #### Pre-training (RL)
@@ -33,7 +51,7 @@ After using the previous methods (either supervised + self-play fine-tuning, or 
 This process will then be repeated.
 
 
-## Reinforcement learning details
+### Reinforcement learning details
 #### Evolutionary AI
 After a base version of the AI has been trained, I will use an [evolutionary algorithm](https://en.wikipedia.org/wiki/Evolutionary_algorithm) to train the model further. The model's weights represent a specific point in a parameter space. We define a hypersphere around the point, and instantiate a number of other models in that region of the parameter space. Those models will then compete in a large tournament, and the model with the best score will be kept. We then repeat the process of defining a hypersphere and choosing additional points within the resulting . 
 
@@ -47,4 +65,12 @@ Other methods, like randomly generating polar coordinates, or randomly choosing 
 I would like to explore the effect that these different uniform vs non-uniform distributions have on the training process and the convergence of the model.
 
 
+## Application
+#### ONNX
+After training the model with Pytorch, I plan to export it in the [ONNX format](https://en.wikipedia.org/wiki/Open_Neural_Network_Exchange). This will allow the trained model to be more flexible and platform agnostic. [Tutorials are available](https://pytorch.org/tutorials//beginner/onnx/export_simple_model_to_onnx_tutorial.html).
 
+#### Clojure Interop
+Once the model has been saved in ONNX format, I can load it into other environments. I would like to create an application using Clojure and Java that will allow the user to play with the trained model. This can be done with the [ONNX runtime library](https://onnxruntime.ai/docs/get-started/with-java.html).
+
+#### Integration
+Having this as a Clojure/Java application would allow me to seemlessly integrate it into some of my other projects, such as making it available as an addon for my [game tracker](https://github.com/JasonShevik/Game-Tracker)
