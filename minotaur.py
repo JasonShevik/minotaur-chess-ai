@@ -21,9 +21,9 @@ import torch.optim as optim
 #  [x,x,x,x,x,x,x,x],
 #  [x,x,x,x,x,x,x,x],
 # Right to castle
-#  [x,x],
+#  [x],
 # Right to en passant
-#  [x,x,x,x,x,x,x,x]]
+#  [x]]
 
 # ##### ##### ##### ##### #####
 # Architecture
@@ -177,8 +177,10 @@ def get_nearby_net(input_net, dist_type, max_radius):
 
 
 
+# ##### ##### ##### ##### #####
+# Program Body
 
-
+create_minotaur("test-minotaur")
 
 
 

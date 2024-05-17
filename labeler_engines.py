@@ -292,14 +292,14 @@ stockfish_breaks = [[20, 400],
                     [40, 100],
                     [50, -1]]  # Maximum depth
 
-leela_config = {"Threads": 8,
+leela_config = {"Threads": 6,
                 "NNCacheSize": 1000000,
                 "MinibatchSize": 1024,
                 #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
-                "RamLimitMb": 22000}
+                "RamLimitMb": 20000}
 
 stockfish_config = {"Threads": 8,
-                    "Hash": 22000,
+                    "Hash": 20000,
                     "UCI_Elo": 3190}
 
 
@@ -325,8 +325,8 @@ stop_event = threading.Event()
 
 # Create the threads for the engines we're analyzing with
 # (name, engine, depth_score_breaks, positions_filepath, output_filepath, progress_filepath)
-leela_thread = threading.Thread(target=continuous_analysis, args=("Leela", initialize_engine("leela", leela_config), leela_breaks, "lichess-positions/lichess_positions_part_2.txt", "output-leela/results.csv", "output-leela/progress.csv"))
-stockfish_thread = threading.Thread(target=continuous_analysis, args=("Stockfish", initialize_engine("stockfish", stockfish_config), stockfish_breaks, "lichess-positions/lichess_positions_part_1.txt", "output-stockfish/results.csv", "output-stockfish/progress.csv"))
+leela_thread = threading.Thread(target=continuous_analysis, args=("Leela", initialize_engine("leela", leela_config), leela_breaks, "lichess-positions/lichess_positions_part_2.txt", "training-supervised-engines/results_part_2_leela.csv", "training-supervised-engines/progress_part_2_leela.csv"))
+stockfish_thread = threading.Thread(target=continuous_analysis, args=("Stockfish", initialize_engine("stockfish", stockfish_config), stockfish_breaks, "lichess-positions/lichess_positions_part_1.txt", "training-supervised-engines/results_part_1_stockfish.csv", "training-supervised-engines/progress_part_1_stockfish.csv"))
 
 # Start the threads
 leela_thread.start()
