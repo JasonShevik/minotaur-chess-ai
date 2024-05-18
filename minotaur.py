@@ -4,88 +4,64 @@ import torch.optim as optim
 
 
 # ##### ##### ##### ##### #####
-# Creation
-
-# Since this Chess AI only looks at the next move, and does not do search, then it will be a classifier AI.
-# Have two output nodes, one for the starting square, and one for the destination square.
-# Nodes can choose any one of 64 squares, plus two additional squares represent castling. (65,65), (66,66) mean castle.
-
-# A board position should look like this:
-# The pieces on the board
-# [[x,x,x,x,x,x,x,x],
-#  [x,x,x,x,x,x,x,x],
-#  [x,x,x,x,x,x,x,x],
-#  [x,x,x,x,x,x,x,x],
-#  [x,x,x,x,x,x,x,x],
-#  [x,x,x,x,x,x,x,x],
-#  [x,x,x,x,x,x,x,x],
-#  [x,x,x,x,x,x,x,x],
-# Right to castle
-#  [x],
-# Right to en passant
-#  [x]]
-
-# ##### ##### ##### ##### #####
 # Architecture
 
-def create_minotaur(name):
-    hidden_depth = 100
-    hidden_width = 74
+class Minotaur(nn.Module):
+    def __init__(self, mode="normal", pretrain_model=None):
+        super(Minotaur, self).__init__()
+        self.input_layer = nn.Linear(66, 128)  # 64 squares + castling + en passant = 66 inputs
+        self.hidden_layers = nn.ModuleList([nn.Linear(128, 128) for _ in range(99)])
 
-    layers = []
+        if mode == "pretrain":
+            self.output_layer = nn.Linear(128, 40)
+        elif mode == "normal":
+            if pretrain_model is not None:
+                self.load_pretrained_weights(pretrain_model)
 
-    for i in range(hidden_depth):
-        layers.append(nn.Linear(hidden_width, i))
-        layers.append(nn.ReLU)
+            self.output_layer = nn.Linear(128, 4)
+        else:
+            # Handle an exception?
+            self.output_layer = nn.Linear(128, 4)
 
-    net = nn.Sequential(*layers)
+    def forward(self, x):
+        x = torch.relu(self.input_layer(x))
+        for layer in self.hidden_layers:    # Is it slow to do this with a loop? What about map or something?
+            x = torch.relu(layer(x))
+        x = self.output_layer(x)
+        x = (torch.tanh(x) + 1) * 3.5 + 1
+        return x  # Should this have a rounding function?
 
-    torch.save(net.state_dict(),f"{name}.pt")
+    def load_pretrained_weights(self, pretrain_model):
+        pretrain_dict = pretrain_model.state_dict()
+        model_dict = self.state_dict()
+
+        pretrain_dict = {k: v for k, v in pretrain_dict.items() if "output_layer" not in k}  # Is this right?
+
+        model_dict.update(pretrain_dict)
+        self.load_state_dict(model_dict)
 
 # ##### ##### ##### ##### #####
 # Pre-training
 
 # The model will be trained on a large number of chess positions to generate legal moves.
 # The model will be rewarded for legal moves, and punished for illegal ones
-# ~~The reward will be boosted if it predicts legal moves that it hasn't predicted recently~~
-# This is to increase the diversity of legal moves that it generates and prevent bias toward certain moves
-# The more diverse and unbiased the moves it learns to suggest, the better situated we'll be for the next step
-
-# Change of plans:
-# Boosting the reward based on recency of the move it chooses will create bias.
-# It would bias the model to choose the most obscure move in any position, like an overcorrection.
-# Instead, the model should choose a move for N positions, and the reward will be boosted based on
-# the ratio between how often it had the opportunity to play each move versus how often it chose that.
-# OR instead:
 # I could do a monte carlo simulation for the set of positions where I randomly choose moves, then
 # compare the found distribution to the one the AI does, and boost reward based on closeness to the random dist.
-
-
 
 # ##### ##### ##### ##### #####
 # Supervised learning
 
-# The model will be trained via supervised learning on very high quality single-move chess puzzles created
-# by giving chess positions to engines to be evaluated at very high depth, as well as positions
-# from endgame databases where correct moves are proven.
-# This will bring the model to a base level. I'm interested to see what this level will be.
-
-
-
-
+# The model will be trained via supervised learning on chess960 positions analyzed at high depth.
+# It will also be trained on endgame databases, and forced checkmate sequences.
+# The latter two represent perfect quality data. I'm interested in how each of these sources impacts performance.
 
 # ##### ##### ##### ##### #####
 # Reinforcement learning
 
-# The bot will then be fine-tuned using reinforcement learning through self play.
-# Rather than having two versions play each other and picking the winner, this fine-tuning will be to have
-# a small tournament with multiple versions of the AI and choosing the winner. This method should
-# reduce gaps in knowledge, and ensure that the model converges to a well-rounded style that is resistant
-# to exploitation.
 
 # ##### Testing functions
 
-def analyze_distribution(method):
+def analyze_distribution(method="uniform"):
 
     generated_points = []
 
@@ -114,7 +90,7 @@ def analyze_distribution(method):
     # Make a heatmap of point density on the surface of the sphere, transform, and plot it
 
 
-# ##### Random vector functions
+# ##### Random vectors in hyper-spheres
 
 def get_random_vector_uniform(num_dimensions, max_radius):
     """
@@ -148,7 +124,6 @@ def get_random_vector_gaussian_noise(num_dimensions, max_radius):
     :return:
     """
 
-# ##### Training functions
 
 def get_nearby_net(input_net, dist_type, max_radius):
     """
@@ -166,22 +141,12 @@ def get_nearby_net(input_net, dist_type, max_radius):
     # Return
 
 
-
 # ##### ##### ##### ##### #####
 # Adversarial learning
 
 # I would then like to train an adversarial network against it to attempt to find gaps in its knowledge.
 # Then I will feed positions from games it loses against the adversarial network into Stockfish at very high
 # depth and repeat the process.
-
-
-
-
-# ##### ##### ##### ##### #####
-# Program Body
-
-create_minotaur("test-minotaur")
-
 
 
 
