@@ -16,8 +16,8 @@ class Minotaur(nn.Module):
             self.output_layer = nn.Linear(128, 40)
         elif mode == "normal":
             if pretrain_model is not None:
-                self.load_pretrained_weights(pretrain_model)
-
+                pretrain_dict = {k: v for k, v in pretrain_model.state_dict().items() if "output_layer" not in k}
+                self.load_state_dict(pretrain_dict, strict=False)
             self.output_layer = nn.Linear(128, 4)
         else:
             # Handle an exception?
@@ -25,20 +25,12 @@ class Minotaur(nn.Module):
 
     def forward(self, x):
         x = torch.relu(self.input_layer(x))
-        for layer in self.hidden_layers:    # Is it slow to do this with a loop? What about map or something?
+        for layer in self.hidden_layers:
             x = torch.relu(layer(x))
-        x = self.output_layer(x)
-        x = (torch.tanh(x) + 1) * 3.5 + 1
-        return x  # Should this have a rounding function?
+        x = torch.tanh(self.output_layer(x))
+        x = (x + 1) * 3.5 + 1  # Transforms: [-1, 1] -> [1, 8]
+        return x.round().tolist()
 
-    def load_pretrained_weights(self, pretrain_model):
-        pretrain_dict = pretrain_model.state_dict()
-        model_dict = self.state_dict()
-
-        pretrain_dict = {k: v for k, v in pretrain_dict.items() if "output_layer" not in k}  # Is this right?
-
-        model_dict.update(pretrain_dict)
-        self.load_state_dict(model_dict)
 
 # ##### ##### ##### ##### #####
 # Pre-training
