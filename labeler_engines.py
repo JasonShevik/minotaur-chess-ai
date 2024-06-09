@@ -1,5 +1,6 @@
 import chess.engine
 import chess
+import helper_functions
 import itertools
 import threading
 import keyboard
@@ -9,62 +10,10 @@ import csv
 import os
 
 
-# This function creates and returns a chess engine object according to the configuration settings
-def initialize_engine(which_engine, configure_options):
-    if which_engine == "leela":
-        engine_dir = "lc0-v0.30.0-windows-gpu-nvidia-cuda/lc0.exe"
-    elif which_engine == "stockfish":
-        engine_dir = "stockfish/stockfish-windows-x86-64-avx2.exe"
-    else:
-        print("Invalid Engine Choice")
-        engine_dir = ""
-
-    this_engine = chess.engine.SimpleEngine.popen_uci(engine_dir)
-    this_engine.configure(configure_options)
-    return this_engine
-
-
 #
 def continuous_analysis(name, engine, depth_score_breaks, positions_filepath, output_filepath, progress_filepath):
     # Initialize a dictionary for the progress associated with each positions file
-    progress_dict = {}
-
-    # Check for a progress file
-    if os.path.exists(progress_filepath):
-        # Open the progress file we found
-        with open(progress_filepath, "r") as progress_file:
-            progress_reader = csv.reader(progress_file)
-            # Skip the header row
-            next(progress_reader, None)
-
-            # Read every row of the progress file into a dictionary
-            for row in progress_reader:
-                progress_dict[row[0]] = int(row[1])
-
-            # Check if the progress file included the positions_filepath
-            if positions_filepath in progress_dict:
-                # Find the starting row that corresponds to the positions_filepath file for analysis
-                current_row = progress_dict[positions_filepath] - 1
-            else:
-                # Create an empty line for this positions_filepath file
-                progress_file.write(f"{positions_filepath},0\n")
-
-                # Add this positions file to the dictionary
-                progress_dict[positions_filepath] = 0
-                # Set the starting row for the positions_filepath file for analysis
-                current_row = -1
-    else:
-        # Create a new progress file
-        with open(progress_filepath, "a") as progress_file:
-            # Write the header
-            progress_file.write("File,Row\n")
-            # Make note that we have made no progress yet on our current file
-            progress_file.write(f"{positions_filepath},0\n")
-
-            # Add this positions file to the dictionary
-            progress_dict[positions_filepath] = 0
-            # Set the starting row for the positions_filepath file for analysis.
-            current_row = -1
+    [progress_dict, current_row] = helper_functions.process_progress_file(progress_filepath, positions_filepath)
 
     # Open the files for positions to analyze and for outputting results
     with (open(positions_filepath, "r") as source_file,
@@ -298,7 +247,7 @@ leela_config = {"Threads": 6,
                 #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
                 "RamLimitMb": 20000}
 
-stockfish_config = {"Threads": 8,
+stockfish_config = {"Threads": 6,
                     "Hash": 20000,
                     "UCI_Elo": 3190}
 
@@ -315,7 +264,7 @@ if doing_hopeless:
         the_config = stockfish_config
     else:
         exit(0)
-    hopeless_engine = initialize_engine(which, the_config)
+    hopeless_engine = helper_functions.initialize_engine(which, the_config)
     analyze_hopeless(hopeless_engine, f"output-{which}/results.csv", the_breaks)
     hopeless_engine.quit()
     exit(0)
@@ -325,8 +274,8 @@ stop_event = threading.Event()
 
 # Create the threads for the engines we're analyzing with
 # (name, engine, depth_score_breaks, positions_filepath, output_filepath, progress_filepath)
-leela_thread = threading.Thread(target=continuous_analysis, args=("Leela", initialize_engine("leela", leela_config), leela_breaks, "lichess-positions/lichess_positions_part_2.txt", "training-supervised-engines/results_part_2_leela.csv", "training-supervised-engines/progress_part_2_leela.csv"))
-stockfish_thread = threading.Thread(target=continuous_analysis, args=("Stockfish", initialize_engine("stockfish", stockfish_config), stockfish_breaks, "lichess-positions/lichess_positions_part_1.txt", "training-supervised-engines/results_part_1_stockfish.csv", "training-supervised-engines/progress_part_1_stockfish.csv"))
+leela_thread = threading.Thread(target=continuous_analysis, args=("Leela", helper_functions.initialize_engine("leela", leela_config), leela_breaks, "lichess-positions/lichess_positions_part_2.txt", "training-supervised-engines/results_part_2_leela.csv", "training-supervised-engines/progress_part_2_leela.csv"))
+stockfish_thread = threading.Thread(target=continuous_analysis, args=("Stockfish", helper_functions.initialize_engine("stockfish", stockfish_config), stockfish_breaks, "lichess-positions/lichess_positions_part_1.txt", "training-supervised-engines/results_part_1_stockfish.csv", "training-supervised-engines/progress_part_1_stockfish.csv"))
 
 # Start the threads
 leela_thread.start()

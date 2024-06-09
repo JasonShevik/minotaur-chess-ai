@@ -1,6 +1,7 @@
 import chess.engine
 import chess
 from heapdict import heapdict
+import helper_functions
 import threading
 import itertools
 import logging
@@ -10,13 +11,13 @@ import csv
 # This function will take in a filepath and open the file, then loop through each of the FEN game strings.
 # It will analyze each string to a depth of 10-20 to determine if there is a forced checkmate sequence.
 # It then collects the positions that are a forced checkmate, along with the length of the sequence.
-def collect_positions(data_filepath, output_filepath, engine, current_row):
+def collect_positions(data_filepath, output_filepath, progress_filepath, engine, current_row):
     with open(data_filepath) as file:
         for position in itertools.islice(file, current_row, None):
             if not stop_event.is_set():
                 current_row += 1
                 if current_row % 50 == 0:
-                    print(f"Row: {current_row}\tCheckmates: {}")
+                    print(f"Progress: {current_row}\tTotal Checkmates: {}")
 
                 board = chess.Board(position)
                 with engine.analysis(board) as analysis:
@@ -73,22 +74,22 @@ def expand_position(initial_position):
     # For maximum speed/efficiency, don't analyze from the losing side.
     # Just find the set of legal responses from losing, then analyze the winning moves (forced checkmate moves).
     # I can make a separate function to deeply analyze losing positions at a later date to improve defensiveness.
-
+    pass
 
 #
 def expand_up(initial_position):
-
+    pass
 
 #
 def expand_down(initial_position):
-
+    pass
 
 
 
 # Initialize and configure the engine
 stockfish_engine = chess.engine.SimpleEngine.popen_uci("stockfish/stockfish-windows-x86-64-avx2.exe")
-stockfish_config = {"Threads": 8,
-                    "Hash": 20000,
+stockfish_config = {"Threads": 6,
+                    "Hash": 30000,
                     "UCI_Elo": 3190}
 stockfish_engine.configure(stockfish_config)
 
@@ -97,12 +98,12 @@ output_filepath = "training-supervised-checkmates/.txt"
 data_filepath = "lichess-positions/lichess_positions_part_5.txt"
 
 if os.path.exists(progress_filepath):
-    with
+    pass
 
 # Create a stop event object, so that we can end the analysis on demand
 stop_event = threading.Event()
 
-checkmate_analysis_thread = threading.Thread(target=collect_positions, args=(data_filepath, output_filepath, stockfish_engine, 0))
+checkmate_analysis_thread = threading.Thread(target=collect_positions, args=(data_filepath, output_filepath, progress_filepath, stockfish_engine, 0))
 
 # Start the threads
 checkmate_analysis_thread.start()
