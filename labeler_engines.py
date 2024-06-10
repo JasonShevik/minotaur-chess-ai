@@ -1,6 +1,6 @@
 import chess.engine
 import chess
-import helper_functions
+import helper_functions as hf
 import itertools
 import threading
 import keyboard
@@ -10,10 +10,54 @@ import csv
 import os
 
 
+# Set the global variables that stop_condition uses
+threshold_index = 0
+num_nodes_last = 0
+
+
+#
+def stop_conditions(info, name):
+    if stop_event.is_set():
+        return true
+
+    depth = info.get("depth")
+    score = str(info.get('score').pov(True))
+
+    if "#" in score:
+        return true
+
+    # Check threshold_index
+
+    # Check num_nodes_last
+
+    return false
+
+
+#
+def write_results(name, position, info):
+    best_move = info.get("pv")[0]
+    depth = info.get("depth")
+
+    output_file.write(f"{position.rstrip()},{best_move},{depth},{str(info.get('score').pov(True))}\n")
+
+    # Update our progress
+    progress_dict[name][positions_filepath] += 1
+
+    # Create a new progress file to save our new progress
+    with open(progress_file_dict[name], "w") as new_progress_file:
+        # Write the header of the new progress file
+        new_progress_file.write("File,Row\n")
+
+        # Iterate over the keys in the progress dictionary
+        for key in progress_dict[name]:
+            # Write the current dictionary entry to the new progress file
+            new_progress_file.write(f"{key},{progress_dict[name][key]}\n")
+
+
 #
 def continuous_analysis(name, engine, depth_score_breaks, positions_filepath, output_filepath, progress_filepath):
     # Initialize a dictionary for the progress associated with each positions file
-    [progress_dict, current_row] = helper_functions.process_progress_file(progress_filepath, positions_filepath)
+    [progress_dict, current_row] = hf.process_progress_file(progress_filepath, positions_filepath)
 
     # Open the files for positions to analyze and for outputting results
     with (open(positions_filepath, "r") as source_file,
@@ -134,6 +178,97 @@ def continuous_analysis(name, engine, depth_score_breaks, positions_filepath, ou
     print(f"{name} done!")
 
 
+# Start the log
+logging.basicConfig(filename="chess_engine.log",
+                    level=logging.DEBUG,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+
+# These breakdowns represent the depth that the engine evaluates to based on the score
+# If you reach the move and the evaluation is greater than the score, you stop analyzing
+# This is to optimize the data labeling. Positions where one side has a significant advantage are less critical
+#                    [move, score (centipawns)]
+leela_breaks = [[10, 400],
+                [13, 200],
+                [16, 100],
+                [19, -1]]  # Maximum depth
+
+stockfish_breaks = [[20, 400],
+                    [30, 200],
+                    [40, 100],
+                    [50, -1]]  # Maximum depth
+
+leela_config = {"Threads": 6,
+                "NNCacheSize": 1000000,
+                "MinibatchSize": 1024,
+                #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
+                "RamLimitMb": 20000}
+
+stockfish_config = {"Threads": 6,
+                    "Hash": 20000,
+                    "UCI_Elo": 3190}
+
+
+# Create a stop event object, so that we can end the analysis on demand
+stop_event = threading.Event()
+
+progress_dict = {}
+positions_file_dict = {}
+progress_file_dict = {}
+output_file_dict = {}
+
+# Leela
+leela_positions = "lichess-positions/lichess_positions_part_2.txt"
+positions_file_dict["leela"] = leela_positions
+leela_progress = "training-supervised-engines/progress_part_2_leela.csv"
+progress_file_dict["leela"] = leela_progress
+leela_output = "training-supervised-engines/results_part_2_leela.csv"
+output_file_dict["leela"] = leela_output
+
+leela_engine = hf.initialize_engine("leela", leela_config)
+[progress_dict["leela"], current_row] = hf.process_progress_file(leela_progress, leela_positions)
+with open(positions_filepath, "r") as leela_source_file:
+    # (name, engine, source_file, current_row, stop_condition, output_function)
+    leela_thread = threading.Thread(target=hf.engine_loop, args=("leela", leela_engine, leela_source_file, current_row, stop_conditions, write_results))
+
+# Stockfish
+stockfish_positions = "lichess-positions/lichess_positions_part_1.txt"
+positions_file_dict["stockfish"] = stockfish_positions
+stockfish_progress = "training-supervised-engines/progress_part_1_stockfish.csv"
+progress_file_dict["stockfish"] = stockfish_progress
+stockfish_output = "training-supervised-engines/results_part_1_stockfish.csv"
+output_file_dict["stockfish"] = stockfish_output
+
+[progress_dict["stockfish"], current_row] = hf.process_progress_file(stockfish_progress, stockfish_positions)
+stockfish_engine = hf.initialize_engine("stockfish", stockfish_config)
+with open(positions_filepath, "r") as stockfish_source_file:
+    # (name, engine, source_file, current_row, stop_condition, output_function)
+    stockfish_thread = threading.Thread(target=hf.engine_loop, args=("stockfish", stockfish_engine, stockfish_source_file, current_row, stop_conditions, write_results))
+
+# Start the threads
+leela_thread.start()
+stockfish_thread.start()
+
+# Wait for the user to press the key
+keyboard.wait("q")
+
+# Indicate that the stop condition has been met, so the loops in continuous_analysis should finish current position
+stop_event.set()
+
+print()
+print("Stop key detected!")
+print("Finishing final calculations...\n")
+
+leela_thread.join()
+stockfish_thread.join()
+
+
+# ----- ----- LEGACY ----- -----
+
+# This code was for fixing labeled positions after I changed methodologies.
+# There used to be a 'hopeless' mechanic such that if the score was too high, the position was deemed 'hopeless'
+# And the engine wouldn't analyze further. This was to save time and compute resources.
+# I ultimately decided that I would prefer that all positions be analyzed to at least depth 20 or forced checkmate.
+"""
 def analyze_hopeless(engine, analysis_path, depth_score_breaks):
     # This empty set will hold all of the analyzed positions to print later
     file_rows = set()
@@ -221,37 +356,6 @@ def analyze_hopeless(engine, analysis_path, depth_score_breaks):
             for row in file_rows:
                 output_file.write(row.rstrip() + "\n")
 
-
-# Start the log
-logging.basicConfig(filename="chess_engine.log",
-                    level=logging.DEBUG,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
-
-# These breakdowns represent the depth that the engine evaluates to based on the score
-# If you reach the move and the evaluation is greater than the score, you stop analyzing
-# This is to optimize the data labeling. Positions where one side has a significant advantage are less critical
-#                    [move, score (centipawns)]
-leela_breaks = [[10, 400],
-                [13, 200],
-                [16, 100],
-                [19, -1]]  # Maximum depth
-
-stockfish_breaks = [[20, 400],
-                    [30, 200],
-                    [40, 100],
-                    [50, -1]]  # Maximum depth
-
-leela_config = {"Threads": 6,
-                "NNCacheSize": 1000000,
-                "MinibatchSize": 1024,
-                #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
-                "RamLimitMb": 20000}
-
-stockfish_config = {"Threads": 6,
-                    "Hash": 20000,
-                    "UCI_Elo": 3190}
-
-
 # If you're redoing the analysis from hopeless mechanic
 doing_hopeless = False
 if doing_hopeless:
@@ -264,32 +368,11 @@ if doing_hopeless:
         the_config = stockfish_config
     else:
         exit(0)
-    hopeless_engine = helper_functions.initialize_engine(which, the_config)
+    hopeless_engine = hf.initialize_engine(which, the_config)
     analyze_hopeless(hopeless_engine, f"output-{which}/results.csv", the_breaks)
     hopeless_engine.quit()
     exit(0)
+"""
 
-# Create a stop event object, so that we can end the analysis on demand
-stop_event = threading.Event()
 
-# Create the threads for the engines we're analyzing with
-# (name, engine, depth_score_breaks, positions_filepath, output_filepath, progress_filepath)
-leela_thread = threading.Thread(target=continuous_analysis, args=("Leela", helper_functions.initialize_engine("leela", leela_config), leela_breaks, "lichess-positions/lichess_positions_part_2.txt", "training-supervised-engines/results_part_2_leela.csv", "training-supervised-engines/progress_part_2_leela.csv"))
-stockfish_thread = threading.Thread(target=continuous_analysis, args=("Stockfish", helper_functions.initialize_engine("stockfish", stockfish_config), stockfish_breaks, "lichess-positions/lichess_positions_part_1.txt", "training-supervised-engines/results_part_1_stockfish.csv", "training-supervised-engines/progress_part_1_stockfish.csv"))
 
-# Start the threads
-leela_thread.start()
-stockfish_thread.start()
-
-# Wait for the user to press the key
-keyboard.wait("q")
-
-# Indicate that the stop condition has been met, so the loops in continuous_analysis should finish current position
-stop_event.set()
-
-print()
-print("Stop key detected!")
-print("Finishing final calculations...\n")
-
-leela_thread.join()
-stockfish_thread.join()

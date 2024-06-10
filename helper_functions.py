@@ -19,7 +19,7 @@ def initialize_engine(which_engine, configure_options):
     return this_engine
 
 
-#
+# This function opens the progress file (which has the lookup info) and the positions file (the key for row value)
 def process_progress_file(progress_filepath, positions_filepath):
     progress_dict = {}
 
@@ -61,3 +61,67 @@ def process_progress_file(progress_filepath, positions_filepath):
             current_row = -1
 
     return [progress_dict, current_row]
+
+
+#
+# <Assumes that the output file already has a header>
+def engine_loop(name, engine, source_file, current_row, stop_condition, output_function):
+    """
+
+    :param name:
+    :param engine:
+    :param source_file:
+    :param current_row:
+    :param stop_condition:
+    :param output_function:
+    :return:
+    """
+
+    for position in itertools.islice(source_file, current_row, None):
+        current_row += 1
+        print(f"{name}: {current_row}")
+
+        board = chess.Board(position)
+
+        # Begin the analysis of this position
+        with engine.analysis(board) as analysis:
+
+            for info in analysis:
+
+                # Get the current depth
+                depth = info.get("depth")
+                if depth is None:
+                    continue
+
+                # Get the current score
+                score = info.get("score")
+                # Score can be None when Stockfish looks at sidelines - Skip those iterations
+                if score is None:
+                    continue
+
+                #
+                if stop_condition(info, name):
+                    output_function()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
