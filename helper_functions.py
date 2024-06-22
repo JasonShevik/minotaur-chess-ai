@@ -1,5 +1,6 @@
 import chess.engine
 import chess
+import itertools
 import csv
 import os
 
@@ -63,59 +64,80 @@ def process_progress_file(progress_filepath, positions_filepath):
     return [progress_dict, current_row]
 
 
-#
-# <Assumes that the output file already has a header>
-def engine_loop(name, engine, source_file, current_row, stop_condition, output_function):
+def engine_loop(engine, functions_dict, data_dict):
+    """
+    This is a flexible function to continuously analyze positions with user-specified conditions.
+
+    :param engine: The chess.engine object that conducts the analysis.
+    :param functions_dict:
+        A dictionary with values that are higher-order functions which this function uses.
+
+        Required functions:
+        Stop: A function that returns True if the engine_loop should stop and False if it should continue.
+        Output: A function that saves the results of the analysis.
+    :param data_dict:
+        A dictionary containing data used by either this function or those in the functions_dict.
+        User can optionally store additional information in this dictionary from within the functions_dict functions.
+
+        User created:
+        Name: The name of the engine. Used by functions_dict functions.
+        Source: The filepath of the source file (the file containing the FEN codes to analyze).
+        Row: The row to start on from the source file.
+
+        Breaks: Not required, but can be used by the Stop function to determine what depth to break at
+
+        Function created:
+        Nodes: Number of nodes explored.
+        Threshold Index: The index for which depth threshold to use in the optional Breaks value.
+            This function only initializes the index. The Stop function may be required to maintain it.
     """
 
-    :param name:
-    :param engine:
-    :param source_file:
-    :param current_row:
-    :param stop_condition:
-    :param output_function:
-    :return:
-    """
+    with open(data_dict["Source"], "r") as source_file:
+        # Loop through each position in the source file starting at the current row
+        for position in itertools.islice(source_file, data_dict["Row"], None):
+            if not data_dict["Stop"].is_set():
 
-    for position in itertools.islice(source_file, current_row, None):
-        current_row += 1
-        print(f"{name}: {current_row}")
+                # Update the row number and give the user an update
+                data_dict["Row"] += 1
+                print(f"{data_dict["Name"]}: {data_dict["Row"]}")
 
-        board = chess.Board(position)
+                # Parse the position and make an object
+                board = chess.Board(position)
 
-        # Begin the analysis of this position
-        with engine.analysis(board) as analysis:
+                # Set the index that we use with data_dict["Breaks"] to determine depth based on a score threshold
+                data_dict["Threshold Index"] = 0
 
-            for info in analysis:
+                # Begin the analysis of this board position
+                with engine.analysis(board) as analysis:
+                    # Number of nodes explored is 0 at the start of the analysis
+                    data_dict["Nodes"] = 0
+                    # Analyze continuously, depth by depth, until we meet a break condition
+                    for info in analysis:
+                        # Get the current depth
+                        depth = info.get("depth")
+                        if depth is None:
+                            continue
 
-                # Get the current depth
-                depth = info.get("depth")
-                if depth is None:
-                    continue
+                        # Get the current score
+                        score = info.get("score")
+                        # Score can be None when Stockfish looks at sidelines - Skip those iterations
+                        if score is None:
+                            continue
 
-                # Get the current score
-                score = info.get("score")
-                # Score can be None when Stockfish looks at sidelines - Skip those iterations
-                if score is None:
-                    continue
+                        # If the user-specified stop conditions are met
+                        if functions_dict["Stop"](info, data_dict):
+                            # Save the results and clean up the environment
+                            functions_dict["Output"](position, info, data_dict)
+                            break
 
-                #
-                if stop_condition(info, name):
-                    output_function()
+                        # Update the number of explored nodes
+                        data_dict["Nodes"] = info.get("nodes")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+            # If the stop_event was set
+            else:
+                engine.quit()
+                print(f"{data_dict["Name"]} done!")
+                break
 
 
 
