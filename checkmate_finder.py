@@ -1,59 +1,89 @@
 import chess.engine
 import chess
 from heapdict import heapdict
-import helper_functions
+import helper_functions as hf
 import threading
 import itertools
+import keyboard
 import logging
 import csv
 
 
-# This function will take in a filepath and open the file, then loop through each of the FEN game strings.
-# It will analyze each string to a depth of 10-20 to determine if there is a forced checkmate sequence.
-# It then collects the positions that are a forced checkmate, along with the length of the sequence.
-def collect_positions(data_filepath, output_filepath, progress_filepath, engine, current_row):
-    with open(data_filepath) as file:
-        for position in itertools.islice(file, current_row, None):
-            if not stop_event.is_set():
-                current_row += 1
-                if current_row % 50 == 0:
-                    print(f"Progress: {current_row}\tTotal Checkmates: {}")
+# ---------- ---------- ----------
+#   Collect initial positions
 
-                board = chess.Board(position)
-                with engine.analysis(board) as analysis:
-                    for info in analysis:
-                        # Get the current depth
-                        depth = info.get("depth")
-                        if depth is None:
-                            continue
+def finder_stop_conditions(info, data_dict):
+    # Get the important stuff from info
+    depth = info.get("depth")
+    score = str(info.get('score').pov(True))
 
-                        # Get the current score
-                        score = info.get("score")
-                        # Score can be None when Stockfish looks at sidelines - Skip those iterations
-                        if score is None:
-                            continue
+    # By default, we assume the position is not a checkmate.
+    data_dict["is_checkmate"] = False
 
-                        score = str(score.pov(True))
-                        # If we discovered a checkmate before we realized it's hopeless
-                        if "#" in score:
+    # Check to see if there is a forced checkmate
+    if "#" in score:
+        # Make a note that this is a checkmate so that when we get to the write_results function, we'll know
+        data_dict["is_checkmate"] = True
+        # Tell the engine_loop to stop
+        return True
 
-                            # Then we need to record the position
+    # If we haven't explored any new nodes, then we're not making progress and should stop
+    if data_dict["Nodes"] >= info.get("nodes"):
+        return True
+    # We're making progress, but...
+    # If we haven't reached a depth of 15 yet, then lets keep analyzing
+    elif depth < 15:
+        return False
+    # If we've reached a depth of 15, then lets check if it's worth continuing
+    elif 15 <= depth < 25:
+        # Retrieve the absolute value of the score
+        score = abs(int(score))
+        # If a side is winning by more than this much, then it's worth continuing
+        if score >= 300:
+            return False
+        # Otherwise, lets stop
+        else:
+            return True
+    # If we're at depth 25, and it's not a forced checkmate, then lets stop
+    else:
+        return True
 
-                        # if the depth is 10 and the relative score is below a certain amount, skip forward
-            else:
-                break
 
-    engine.quit()
-    print("Done!")
+def finder_write_results(position, info, data_dict):
+    if data_dict["is_checkmate"]:
+        with open(data_dict["Output Path"], "a") as output_file:
+            # FEN, Score, Best Move
+            output_file.write(f"{position.rstrip()},{str(info.get('score').pov(True))},{info.get("pv")[0]}\n")
+
+    # Update our progress. We're adding to the counter associated with this source file.
+    data_dict["Progress Dict"][data_dict["Source"]] += 1
+
+    # Create a new progress file to save our new progress
+    with open(data_dict["Progress Path"], "w") as new_progress_file:
+        # Write the header of the new progress file
+        new_progress_file.write("File,Row\n")
+
+        # Iterate over the keys in the progress dictionary
+        for key in data_dict["Progress Dict"]:
+            # Write the current dictionary entry to the new progress file
+            new_progress_file.write(f"{key},{data_dict["Progress Dict"][key]}\n")
+
+# ---------- ---------- ----------
+#   Expand positions
+
+def expander_stop_conditions():
+    pass
+
+def expander_write_results():
+    pass
 
 
-#
 def expand_position(initial_position):
-    to_explore_up = heapdict()
-    to_explore_down = heapdict()
+    #to_explore_up = heapdict()
+    #to_explore_down = heapdict()
     # Add initial_position to to_explore_down
 
-    positions_finished = set()
+    #positions_finished = set()
     # positions_finished.add()
     # "" in positions_finished
 
@@ -85,28 +115,55 @@ def expand_down(initial_position):
     pass
 
 
-
-# Initialize and configure the engine
-stockfish_engine = chess.engine.SimpleEngine.popen_uci("stockfish/stockfish-windows-x86-64-avx2.exe")
-stockfish_config = {"Threads": 6,
-                    "Hash": 30000,
-                    "UCI_Elo": 3190}
-stockfish_engine.configure(stockfish_config)
-
-progress_filepath = "training-supervised-checkmates/.txt"
-output_filepath = "training-supervised-checkmates/.txt"
-data_filepath = "lichess-positions/lichess_positions_part_5.txt"
-
-if os.path.exists(progress_filepath):
-    pass
+# Start the log
+logging.basicConfig(filename="checkmates_log.log",
+                    level=logging.DEBUG,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Create a stop event object, so that we can end the analysis on demand
 stop_event = threading.Event()
 
-checkmate_analysis_thread = threading.Thread(target=collect_positions, args=(data_filepath, output_filepath, progress_filepath, stockfish_engine, 0))
+# Initialize and configure the engine
+stockfish_config = {"Threads": 6,
+                    "Hash": 40000,
+                    "UCI_Elo": 3190}
 
-# Start the threads
-checkmate_analysis_thread.start()
+# Initialize the engine using the helper function
+stockfish_engine = hf.initialize_engine("stockfish", stockfish_config)
+
+
+# ---------- ---------- ----------
+# This implements the finding stuff
+
+# Initialize the relevant filepaths
+progress_filepath = "training-supervised-checkmates/progress_part_5_stockfish.csv"
+output_filepath = "training-supervised-checkmates/results_part_5_stockfish.csv"
+data_filepath = "lichess-positions/lichess_positions_part_5.txt"
+
+# Process the files to find our current progress
+[progress_dict, current_row] = hf.process_progress_file(progress_filepath, data_filepath)
+
+
+
+# Initialize all of the wrapped up data that will go to the engine_loop
+stockfish_dict = {"Name": "Stockfish",
+                  "Source": data_filepath,
+                  "Row": current_row,
+                  "Stop": stop_event,
+
+                  "Progress Dict": progress_dict,
+                  "Progress Path": progress_filepath,
+                  "Output Path": output_filepath}
+
+# These are the finder
+functions_dict = {"Stop": finder_stop_conditions,
+                  "Output": finder_write_results}
+
+# Create the thread
+checkmate_thread = threading.Thread(target=hf.engine_loop, args=(stockfish_engine, functions_dict, stockfish_dict))
+
+# Start the thread
+checkmate_thread.start()
 
 # Wait for the user to press the key
 keyboard.wait("q")
@@ -118,7 +175,8 @@ print()
 print("Stop key detected!")
 print("Finishing final calculations...\n")
 
-checkmate_analysis_thread.join()
+checkmate_thread.join()
+stockfish_engine.quit()
 
 
 
