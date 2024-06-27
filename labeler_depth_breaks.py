@@ -4,9 +4,7 @@ import helper_functions as hf
 import threading
 import keyboard
 import logging
-import time
 import csv
-import os
 
 
 # A function that saves the results of the analysis.
@@ -62,7 +60,7 @@ def stop_conditions(info, data_dict):
 
 
 # Start the log
-logging.basicConfig(filename="chess_engine.log",
+logging.basicConfig(filename="depth_breaks_log.log",
                     level=logging.DEBUG,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -87,7 +85,7 @@ leela_breaks = [[10, 400],
                 [16, 100],
                 [19, -1]]  # Maximum depth
 
-leela_config = {"Threads": 6,
+leela_config = {"Threads": 4,
                 "NNCacheSize": 1000000,
                 "MinibatchSize": 1024,
                 #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
@@ -128,7 +126,7 @@ stockfish_breaks = [[20, 400],
                     [40, 100],
                     [50, -1]]  # Maximum depth
 
-stockfish_config = {"Threads": 6,
+stockfish_config = {"Threads": 4,
                     "Hash": 20000,
                     "UCI_Elo": 3190}
 
