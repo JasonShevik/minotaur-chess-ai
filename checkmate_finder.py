@@ -68,7 +68,7 @@ def finder_write_results(position, info, data_dict):
 
 
 # Start the log
-logging.basicConfig(filename="checkmates_log.log",
+logging.basicConfig(filename="checkmate_finder_log.log",
                     level=logging.DEBUG,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -83,7 +83,6 @@ stockfish_config = {"Threads": 2,
 # Initialize the engine using the helper function
 stockfish_engine = hf.initialize_engine("stockfish", stockfish_config)
 
-
 # ---------- ---------- ----------
 # This implements the finding stuff
 
@@ -94,8 +93,6 @@ data_filepath = "lichess-positions/lichess_positions_part_5.txt"
 
 # Process the files to find our current progress
 [progress_dict, current_row] = hf.process_progress_file(progress_filepath, data_filepath)
-
-
 
 # Initialize all of the wrapped up data that will go to the engine_loop
 stockfish_dict = {"Name": "Stockfish",
