@@ -5,18 +5,87 @@ import os
 
 
 # Takes in a FEN string and returns a list of 64 numbers
+# https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation
 def fen_to_vector(fen):
+    piece_values = {"p": 1,
+                    "n": 2,
+                    "b": 3,
+                    "r": 4,
+                    "q": 5,
+                    "k": 6}
 
-    pass
+    # Split the fen by spaces
+    fen_parts = fen.split(" ")
+
+    # The first part is the board portion. Split it by '/' to get each row
+    row_strings = fen_parts[0].split("/")
+
+    # Initialize some variables for constructing the vector
+    vector_version = [0 for _ in range(64)]
+    index_buffer_num_rows = 0
+    index_buffer_this_row = 0
+
+
+
+
+    # I should reverse or not reverse row_strings based on the AI's perspective
+
+
+
+    # Iterate over the rows backwards (start from row 1 and go up)
+    for current_row in reversed(row_strings):
+        index_buffer_this_row = 0
+
+        # Loop through each character in this row of the chess board
+        for index, character in enumerate(current_row):
+            # If the character is numerical...
+            if character.isdigit():
+                # Record the number of sequential empty squares
+                index_buffer_this_row += int(character)
+
+                # For each of the empty squares
+                for index_to_zero in range(index_buffer_this_row):
+                    # Set that index of the vector_version to zero (paying mind to the index buffer from row number)
+                    vector_version[index_to_zero + (index_buffer_num_rows * 8)] = 0
+            # If the character is alphabetical...
+            else:
+                # Set the value in the vector to the piece value
+                true_index = index + (index_buffer_num_rows * 8) + index_buffer_this_row
+                vector_version[true_index] = piece_values[character.lower()]
+
+                # Check if the piece is dark or light, and check that versus our perspective
+                if character.islower() and :
+                    vector_version[true_index] *= -1
+
+
+
+        # If en passant is legal, modify a value
+
+
+
+        index_buffer_num_rows += 1
 
 
 # Take all of the results files in a directory and merge them into a single file with vectorized fen
-def merge_and_vectorize(name, directory):
+def merge_and_vectorize(directory, pretraining=False):
+    # Collect the list of files to merge from the directory (iff they have "results_" in the name)
+    files_to_merge = [file_name for file_name in os.listdir(directory) if "results_" in file_name]
+    if not files_to_merge:
+        print("No files to merge!")
+        return False
+
+    # Create a dataframe out of the first file, and remove that file from the list
+    merged_df = pd.read_csv(files_to_merge.pop(0))
+
+    # Iterate over the remaining files
+    for filename in files_to_merge:
+        # Concat each next file to the end of the merged_df
+        merged_df = pd.concat([merged_df, pd.read_csv(filename)], ignore_index=True)
 
 
-    results_files = []
 
-    for file in results_files:
+    # Merge done
+    # Insert remove_checkmates?
 
 
     # Use list comprehensions to create a list of every combination of a1 through h8
@@ -25,11 +94,37 @@ def merge_and_vectorize(name, directory):
     df_column_names = [a + x for x in numbers for a in letters]
 
     # Use a list comprehension to get the list of lists for the dataframe
-    converted_positions_df = pd.DataFrame([fen_to_vector(fen) for fen in merged_df["Positions"]], columns=df_column_names)
+    list_of_vectors = [fen_to_vector(fen) for fen in merged_df["Position"]]
+    converted_positions_df = pd.DataFrame(list_of_vectors, columns=df_column_names)
 
-    # Print the merged file
-    merged_df.to_csv(f"{name}_merged_for_training.csv", index=False)
+    if pretraining:
+        # Print the result with 64 input columns to a csv for pretraining
+        converted_positions_df.to_csv("merged_for_training.csv", index=False)
+    else:
+        # Make a dictionary to quickly look up values for move columns/rows
+        character_values = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8,
+                            "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8}
 
+        # Create a list to hold all of our data labels
+        label_list = []
+
+        # Go through each row of the input file
+        for i in range(len(merged_df.index)):
+            # Go through each character in the labeled move string
+            columns_and_rows = []
+            for character in merged_df.iloc[i]["Move"]:
+                # Add the value of that
+                columns_and_rows.append(character_values[character])
+
+            # Add those column and row labels to the list of labels
+            label_list.append(columns_and_rows)
+
+        # Use list comprehensions to grab the right elements of each label to create a list for each of the columns
+        for index, name in enumerate(["s_row", "s_column", "f_row", "f_column"]):
+            converted_positions_df[name] = [these_labels[index] for these_labels in label_list]
+
+        # Print the result with 64 input columns and 4 label columns to a csv
+        converted_positions_df.to_csv("merged_for_training.csv", index=False)
 
 
 # Take in a filepath, remove all forced checkmate rows, save the filtered file, return checkmates dataframe
@@ -39,26 +134,28 @@ def remove_checkmates(filepath):
     checkmates_df = input_df[input_df["Score"].str.contains("#")]
     non_checkmates_df = input_df[~input_df["Score"].str.contains("#")]
 
-
-    # This needs to return a dataframe
+    #
     return []
 
 
 #
 def prepare_training_files():
-    depth_breaks_dir = ""
-    checkmates_dir = ""
+    depth_breaks_dir = "training-supervised-engines/"
+    checkmates_dir = "training-supervised-checkmates/"
+
+
+
+    # I might need a remove_checkmates flag for the merge_and_vectorize function.
+    # The remove_checkmates function should happen between merging and vectorizing in the merge_and_vectorize function
+
 
     # Merge the depth breaks
-    merge_and_vectorize("", "")
-    # Remove the checkmates from the merged file and put them in a dataframe
-    filtered_checkmates = remove_checkmates("")
+    merge_and_vectorize(depth_breaks_dir, False)
 
     # Print filtered_checkmates to the checkmates_dir
-    merge_and_vectorize("", "")
+    merge_and_vectorize(checkmates_dir, False)
 
 
 #
 def prepare_pretraining_files():
     pass
-
