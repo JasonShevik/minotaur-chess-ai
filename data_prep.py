@@ -23,17 +23,24 @@ def fen_to_vector(fen):
     # Initialize some variables for constructing the vector
     vector_version = [0 for _ in range(64)]
     index_buffer_num_rows = 0
-    index_buffer_this_row = 0
 
+    # Vectors go a1, b1, ... a2, b2, ..., so if we're white then we need to go through the strings in reverse order
+    if fen_parts[1] == "w":
+        row_strings = reversed(row_strings)
 
+    # If playing as black, then we want to go through the strings in the current order
+    # BUT we need to reverse all of the individual strings like we're rotating the board
+    elif fen_parts[1] == "b":
+        for index, _ in enumerate(row_strings):
+            row_strings[index] = reversed(row_strings[index])
 
-
-    # I should reverse or not reverse row_strings based on the AI's perspective
-
-
+    # This value can only be 'w' or 'b'
+    else:
+        print(f"Invalid FEN: {fen_parts[0]}")
+        return False
 
     # Iterate over the rows backwards (start from row 1 and go up)
-    for current_row in reversed(row_strings):
+    for current_row in row_strings:
         index_buffer_this_row = 0
 
         # Loop through each character in this row of the chess board
@@ -45,29 +52,80 @@ def fen_to_vector(fen):
 
                 # For each of the empty squares
                 for index_to_zero in range(index_buffer_this_row):
-                    # Set that index of the vector_version to zero (paying mind to the index buffer from row number)
-                    vector_version[index_to_zero + (index_buffer_num_rows * 8)] = 0
+                    # Set that index of the vector_version to zero
+                    # (index_buffer_num_rows * 8) because we need to offset by the number of rows we've already done
+                    # index because we need to offset by the number of characters in this row we've already done
+                    # index_to_zero because we need to count up how many zeros we're adding based on the character
+                    # (index_buffer_this_row - int(character) - 1) because ...
+                    # if not first digit in row, need offset by more because there's fewer than 8 chars in row
+                    vector_version[index + index_to_zero + (index_buffer_num_rows * 8) + (index_buffer_this_row - int(character) - 1)] = 0
             # If the character is alphabetical...
             else:
                 # Set the value in the vector to the piece value
                 true_index = index + (index_buffer_num_rows * 8) + index_buffer_this_row
                 vector_version[true_index] = piece_values[character.lower()]
 
-                # Check if the piece is dark or light, and check that versus our perspective
-                if character.islower() and :
-                    vector_version[true_index] *= -1
-
-
-
-        # If en passant is legal, modify a value
-
-
+                # If the piece is black
+                if character.islower():
+                    # And the AI is playing as white
+                    if fen_parts[1] == "w":
+                        # Then multiply it by -1 because it's on the opponent's team
+                        vector_version[true_index] *= -1
+                # If the piece is white
+                else:
+                    # And the AI is playing as black
+                    if fen_parts[1] == "b":
+                        # Then multiply it by -1 because it's on the opponent's team
+                        vector_version[true_index] *= -1
 
         index_buffer_num_rows += 1
 
+    # ----- Castling -----
+
+    # King value of +/-6 is modified by +/-0.1 and 0.2
+    # This means the square can have 4 possible values:
+    # 6: May not castle
+    # 6.1: May castle king-side
+    # 6.2: May castle queen-side
+    # 6.3: May castle either side
+
+    # Establish what side we're on so that we know if the king is a positive or negative number
+    if fen_parts[1] == "w":
+        white_mod = 1
+        black_mod = -1
+    else:
+        white_mod = -1
+        black_mod = 1
+
+    # White may castle king-side
+    if "K" in fen_parts[2]:
+        vector_version[vector_version.index(white_mod * 6)] += (white_mod * 0.1)
+    # White may castle queen-side
+    if "Q" in fen_parts[2]:
+        vector_version[vector_version.index(white_mod * 6)] += (white_mod * 0.2)
+    # Black may castle king-side
+    if "k" in fen_parts[2]:
+        vector_version[vector_version.index(black_mod * 6)] += (black_mod * 0.1)
+    # Black may castle queen-side
+    if "q" in fen_parts[2]:
+        vector_version[vector_version.index(black_mod * 6)] += (black_mod * 0.2)
+
+    # ----- En Passant -----
+
+    # Based on if the AI's perspective is white or black, define character_values for board orientation
+    if white_mod == 1:
+        character_values = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7}
+        en_passant_square = (character_values[fen_parts[3][0]] * 8) + int(fen_parts[3][1])
+    else:
+        character_values = {"a": 7, "b": 6, "c": 5, "d": 4, "e": 3, "f": 2, "g": 1, "h": 0}
+        en_passant_square = (character_values[fen_parts[3][0]] * 8) + (8 - int(fen_parts[3][1]))
+
+    # noinspection PyTypeChecker
+    vector_version[en_passant_square] = -0.5
+
 
 # Take all of the results files in a directory and merge them into a single file with vectorized fen
-def merge_and_vectorize(directory, pretraining=False):
+def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
     # Collect the list of files to merge from the directory (iff they have "results_" in the name)
     files_to_merge = [file_name for file_name in os.listdir(directory) if "results_" in file_name]
     if not files_to_merge:
@@ -84,8 +142,11 @@ def merge_and_vectorize(directory, pretraining=False):
 
 
 
-    # Merge done
-    # Insert remove_checkmates?
+
+    if filter_mates:
+        # Insert remove_checkmates
+
+
 
 
     # Use list comprehensions to create a list of every combination of a1 through h8
