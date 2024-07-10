@@ -1,5 +1,5 @@
 import itertools
-import pandas
+import pandas as pd
 import csv
 import os
 
@@ -48,17 +48,17 @@ def fen_to_vector(fen):
             # If the character is numerical...
             if character.isdigit():
                 # Record the number of sequential empty squares
-                index_buffer_this_row += int(character)
+                index_buffer_this_row += int(character) - 1
 
                 # For each of the empty squares
-                for index_to_zero in range(index_buffer_this_row):
+                for index_to_zero in range(int(character)):
                     # Set that index of the vector_version to zero
                     # (index_buffer_num_rows * 8) because we need to offset by the number of rows we've already done
                     # index because we need to offset by the number of characters in this row we've already done
                     # index_to_zero because we need to count up how many zeros we're adding based on the character
-                    # (index_buffer_this_row - int(character) - 1) because ...
-                    # if not first digit in row, need offset by more because there's fewer than 8 chars in row
-                    vector_version[index + index_to_zero + (index_buffer_num_rows * 8) + (index_buffer_this_row - int(character) - 1)] = 0
+                    # (index_buffer_this_row - int(character) + 1) because ...
+                    # if not first digit in row, need offset by more
+                    vector_version[index + index_to_zero + (index_buffer_num_rows * 8) + (index_buffer_this_row - int(character) + 1)] = 0
             # If the character is alphabetical...
             else:
                 # Set the value in the vector to the piece value
@@ -97,20 +97,31 @@ def fen_to_vector(fen):
         white_mod = -1
         black_mod = 1
 
+    # Since we may modify kings multiple times in a row...
+    # Doing this work on separate list using indices of the old list so .index() works properly
+    working_castle_vector = vector_version[:]
+
     # White may castle king-side
     if "K" in fen_parts[2]:
-        vector_version[vector_version.index(white_mod * 6)] += (white_mod * 0.1)
+        working_castle_vector[vector_version.index(white_mod * 6)] += (white_mod * 0.1)
     # White may castle queen-side
     if "Q" in fen_parts[2]:
-        vector_version[vector_version.index(white_mod * 6)] += (white_mod * 0.2)
+        working_castle_vector[vector_version.index(white_mod * 6)] += (white_mod * 0.2)
     # Black may castle king-side
     if "k" in fen_parts[2]:
-        vector_version[vector_version.index(black_mod * 6)] += (black_mod * 0.1)
+        working_castle_vector[vector_version.index(black_mod * 6)] += (black_mod * 0.1)
     # Black may castle queen-side
     if "q" in fen_parts[2]:
-        vector_version[vector_version.index(black_mod * 6)] += (black_mod * 0.2)
+        working_castle_vector[vector_version.index(black_mod * 6)] += (black_mod * 0.2)
+
+    # Save changes to the original list
+    vector_version = working_castle_vector[:]
 
     # ----- En Passant -----
+
+    # If there is no En Passant, finish
+    if fen_parts[3][0] == "-":
+        return vector_version
 
     # Based on if the AI's perspective is white or black, define character_values for board orientation
     if white_mod == 1:
@@ -123,31 +134,29 @@ def fen_to_vector(fen):
     # noinspection PyTypeChecker
     vector_version[en_passant_square] = -0.5
 
+    return vector_version
+
 
 # Take all of the results files in a directory and merge them into a single file with vectorized fen
 def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
     # Collect the list of files to merge from the directory (iff they have "results_" in the name)
-    files_to_merge = [file_name for file_name in os.listdir(directory) if "results_" in file_name]
+    files_to_merge = [file_name for file_name in os.listdir(directory) if ("results_" in file_name or pretraining is True)]
     if not files_to_merge:
         print("No files to merge!")
         return False
 
     # Create a dataframe out of the first file, and remove that file from the list
-    merged_df = pd.read_csv(files_to_merge.pop(0))
+    merged_df = pd.read_csv(directory + files_to_merge.pop(0))
 
     # Iterate over the remaining files
     for filename in files_to_merge:
         # Concat each next file to the end of the merged_df
         merged_df = pd.concat([merged_df, pd.read_csv(filename)], ignore_index=True)
 
-
-
-
+    # If the filter_mates flag is set, then we want to remove the forced checkmates from merged_df
     if filter_mates:
-        # Insert remove_checkmates
-
-
-
+        # remove_checkmates function saves the checkmates to a separate file
+        merged_df = remove_checkmates(merged_df)
 
     # Use list comprehensions to create a list of every combination of a1 through h8
     letters = ["a", "b", "c", "d", "e", "f", "g", "h"]
@@ -158,9 +167,12 @@ def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
     list_of_vectors = [fen_to_vector(fen) for fen in merged_df["Position"]]
     converted_positions_df = pd.DataFrame(list_of_vectors, columns=df_column_names)
 
+    # Add the FEN column to the beginning of the dataframe so that we know what FEN the vector refers to
+    converted_positions_df.insert(0, "FEN", merged_df["Position"])
+
     if pretraining:
         # Print the result with 64 input columns to a csv for pretraining
-        converted_positions_df.to_csv("merged_for_training.csv", index=False)
+        converted_positions_df.to_csv(f"{directory}merged_for_training.csv", index=False)
     else:
         # Make a dictionary to quickly look up values for move columns/rows
         character_values = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8,
@@ -185,38 +197,38 @@ def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
             converted_positions_df[name] = [these_labels[index] for these_labels in label_list]
 
         # Print the result with 64 input columns and 4 label columns to a csv
-        converted_positions_df.to_csv("merged_for_training.csv", index=False)
+        converted_positions_df.to_csv(f"{directory}merged_for_training.csv", index=False)
 
 
 # Take in a filepath, remove all forced checkmate rows, save the filtered file, return checkmates dataframe
-def remove_checkmates(filepath):
-    input_df = pd.read_csv(filepath)
+def remove_checkmates(input_df):
+    save_path = "training-supervised-checkmates/"
 
     checkmates_df = input_df[input_df["Score"].str.contains("#")]
+    checkmates_df.to_csv(f"{save_path}results_merged_filtered.csv", index=False)
+
     non_checkmates_df = input_df[~input_df["Score"].str.contains("#")]
-
-    #
-    return []
+    return non_checkmates_df
 
 
-#
+# Prepares the data for the supervised training phase (including the depth breaks and checkmates data)
 def prepare_training_files():
     depth_breaks_dir = "training-supervised-engines/"
     checkmates_dir = "training-supervised-checkmates/"
 
+    # Merge the depth breaks files with filter_mates as true
+    merge_and_vectorize(depth_breaks_dir, pretraining=False, filter_mates=True)
+
+    # Merge the checkmates files which now includes those that were filtered from depth breaks
+    merge_and_vectorize(checkmates_dir, pretraining=False, filter_mates=False)
 
 
-    # I might need a remove_checkmates flag for the merge_and_vectorize function.
-    # The remove_checkmates function should happen between merging and vectorizing in the merge_and_vectorize function
-
-
-    # Merge the depth breaks
-    merge_and_vectorize(depth_breaks_dir, False)
-
-    # Print filtered_checkmates to the checkmates_dir
-    merge_and_vectorize(checkmates_dir, False)
-
-
-#
+# Prepares the data for the pretraining phase
 def prepare_pretraining_files():
-    pass
+    pretraining_data_dir = "training-pretraining/"
+
+    merge_and_vectorize(pretraining_data_dir, pretraining=True)
+
+
+prepare_pretraining_files()
+
