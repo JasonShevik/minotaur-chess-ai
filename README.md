@@ -17,7 +17,6 @@ It will have 4 output nodes (starting row and column, ending row and column) and
 
 
 ## To Do:
-* Write a function to convert the [FEN format](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation) positions into the 64 inputs for the neural net.
 * Write the pre-training function and pre-train the model
 * Incorporate [dropout](https://towardsdatascience.com/dropout-in-neural-networks-47a162d621d9) into the learning methods.
 * Incorporate [adding nosie](https://machinelearningmastery.com/train-neural-networks-with-noise-to-reduce-overfitting/) into the learning methods.
