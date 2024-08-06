@@ -16,15 +16,19 @@ It will have 4 output nodes (starting row and column, ending row and column) and
    * Hyperspheres and randomness
 
 
-## To Do:
+## In Progress:
 * Write the pre-training function and pre-train the model
-* Incorporate [dropout](https://towardsdatascience.com/dropout-in-neural-networks-47a162d621d9) into the learning methods.
-* Incorporate [adding nosie](https://machinelearningmastery.com/train-neural-networks-with-noise-to-reduce-overfitting/) into the learning methods.
 
 
 ## Training plan
 #### Pre-training (RL)
-The model will be pre-trained on a very large collection of unlabeled chess960 positions to predict legal moves without regard to their quality. This will be done with reinforcement learning, where a penalty will be applied for illegal moves, and a reward for legal moves. The model will also be encouraged to have randomly distributed moves, probably by seeing how closely its choices match a monte carlo simulation. Ideally, the model will be trained to predict long sequences of randomly distributed legal moves so that it implicitly learns about the consequences of moves. To further strengthen the robustness of its representations, I will employ dropout and noise injection. By entering the supervised learning phase with a robust and comprehensive but unbiased representation of chess, it will maximize the value of the limited data.
+The model will be pre-trained on a very large collection of unlabeled chess960 positions to predict sequences of legal moves without regard to their quality. The hope is to learn extremely robust and perfectly unbiased representations for the game of chess so as to maximize the benefit of the supervised learning phase when the model learns which moves are good. By learning to predict sequences of legal unbiased moves, rather than singular moves, the model will learn to implicitly understand the consequences of moves, and drastically increase the robustness of its representations.
+
+This will be done with reinforcement learning, where a penalty will be applied for illegal moves, and a reward for how closely the network's moves resemble a random distribution as simulated using a [Monte Carlo Method](https://en.wikipedia.org/wiki/Monte_Carlo_method). The network will learn to make these legal but random moves using [Proximal Policy Optimization (PPO)](https://en.wikipedia.org/wiki/Proximal_policy_optimization) reinforcement learning. To further strengthen the robustness of its representations, I will employ [dropout](https://towardsdatascience.com/dropout-in-neural-networks-47a162d621d9) and [noise injection](https://machinelearningmastery.com/train-neural-networks-with-noise-to-reduce-overfitting/). By entering the supervised learning phase with a robust and comprehensive but unbiased representation of chess, it will maximize the value of the limited data.
+
+The model will receive a mini-batch of random chess960 positions of size M. For each position in the mini-batch, the model will output a sequence of S moves, meaning a single mini-batch involves predicting M times S moves. A Monte-Carlo simulation will generate random moves for every position in the mini-batch as well as the positions that result from the moves chosen by the model. After both of those processes are complete, the incidence of each move chosen by the AI across all positions will be compared to the the average incidence for each move across all positions in the Monte-Carlo simulation. The mini-batch will then receive a final score based on the number of chosen moves that were legal, and how closely those legal moves matched the distribution from the Monte-Carlo simulation.
+
+The pre-training will conduct N number of mini-batches in a batch. After each batch, the action network and value networks will be updated according to Proximal Policy Optimization. A batch consists of N mini-batches, which is N times M initial positions, and up to N times M times S total chess positions.
 
 #### Supervised learning
 A collection of chess positions will be curated (through random generation and/or randomly chosen positions in lichess chess960 games). These positions will then be evaluated by Stockfish 16.1 and LeelaChessZero (lc0) at high depth to ensure very high quality data. The engine will check the score at various depth checkpoints to determine whether it is worth analyzing deeper to save computing resources. More equal positions will be analyzed more deeply.
