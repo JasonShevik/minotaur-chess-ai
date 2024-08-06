@@ -15,6 +15,12 @@ import chess
 # A function that runs a monte carlo simulation on a list of chess positions
 # randomly choosing a move for each position sim_num times
 def _monte_carlo_sim(position_vector_batch_df, sim_num):
+    """
+
+    :param position_vector_batch_df:
+    :param sim_num:
+    :return:
+    """
     # A dictionary to hold a count of randomly chosen / simulated moves
     sim_dict = {}
     # A set to keep track of all legal moves that appear
@@ -29,6 +35,9 @@ def _monte_carlo_sim(position_vector_batch_df, sim_num):
 
             # Get the list of legal moves using the chess library and the FEN string
             legal_moves = list(chess.Board(this_row["FEN"]).legal_moves)
+            # Convert the SAN format moves to UCI
+            legal_moves = [board.parse_san(move).uci() for move in legal_moves]
+
             # Make sure that these moves are in the legal_set
             legal_set.update(legal_moves)
 
@@ -53,19 +62,49 @@ def _monte_carlo_sim(position_vector_batch_df, sim_num):
 
 
 #
-def _score_random(position_vector_batch_df, choices_dict):
+def _score_random(position_vector_batch_df, choices_dict, illegal_move_penalty_factor=1):
+    """
+
+    :param position_vector_batch_df:
+    :param choices_dict:
+    :param illegal_move_penalty_factor:
+    :return:
+    """
+
     total_penalty = 0
     total_reward = 0
 
     # Start by calculating the number of illegal moves and summing a penalty
+    total_penalty += (illegal_move_penalty_factor *
+                      position_vector_batch_df['FEN'].apply(lambda x: _get_num_invalid_moves(x, choices_dict[x])).sum())
+
 
     sim_dict = _monte_carlo_sim(position_vector_batch_df, 1000)
-
     for move in sim_dict:
         # Calculate the sum of absolute difference in values for choices_dict and sim_dict
         total_penalty +=
 
     return total_reward - total_penalty
+
+
+# A function to return the number of invalid moves predicted by the network
+def _get_num_invalid_moves(fen, moves):
+    """
+
+    :param fen:
+    :param moves:
+    :return:
+    """
+    # If we've reached the base case with no moves left, then all moves were valid
+    if not moves:
+        return 0
+    # If the first move in the list is legal
+    if moves[0] in list(chess.Board(fen).legal_moves):
+        # Recursively call this function using the fen that results from that move and return the list shortened by 1
+        return _get_num_invalid_moves(chess.Board(fen).push(chess.Move.from_uci(moves[0])).fen(), moves[1:])
+    else:
+        # If the move was illegal, then all moves left in the list are illegal
+        return len(moves)
 
 
 # Reinforcement Learning Testing Functions:
@@ -158,15 +197,18 @@ class Minotaur(nn.Module):
         self.hidden_layers = nn.ModuleList([nn.Linear(128, 128) for _ in range(99)])
 
         if mode == "pretrain":
-            self.output_layer = nn.Linear(128, 40)
+            self.num_predict = 10
+            self.output_layer = nn.Linear(128, self.num_predict * 4)
         elif mode == "normal":
+            self.num_predict = 1
             if pretrain_model is not None:
                 pretrain_dict = {k: v for k, v in pretrain_model.state_dict().items() if "output_layer" not in k}
                 self.load_state_dict(pretrain_dict, strict=False)
-            self.output_layer = nn.Linear(128, 4)
+            self.output_layer = nn.Linear(128, self.num_predict * 4)
         else:
             # Handle an exception?
-            self.output_layer = nn.Linear(128, 4)
+            self.num_predict = 1
+            self.output_layer = nn.Linear(128, self.num_predict * 4)
 
     #
     def forward(self, x):
@@ -182,32 +224,53 @@ class Minotaur(nn.Module):
 
     #
     def pretrain(self, position_vector_df, batch_size, stop_event):
+        # A loop to continuously process batches of positions
         for batch_start_index in range(0, len(position_vector_df) - batch_size, batch_size):
+            # We check for stop condition here so that we don't stop mid-batch
             if not stop_event.is_set():
+                # A list of positions, including those that result from the network's predictions
                 positions_now_and_future = []
 
+                # Loop through all positions in this batch
                 for batch_progress_index in range(0, batch_size):
+                    # This row of the dataframe is a FEN and position vector (network input)
                     this_row = position_vector_df.iloc[batch_start_index + batch_progress_index]
 
+                    # Do I actually need this?
                     legal_moves = list(chess.Board(this_row["FEN"]).legal_moves)
 
                     # Append FEN column value to positions_now_and_future
                     positions_now_and_future.update(this_row["FEN"])
 
                     # Do a forward pass using this_row minus the FEN column
-                    # Store output which is N*4 nodes where N is the number of moves predicted
-                    output = self.forward(positions_now_and_future.drop(columns=["FEN"]))
+                    # Store output which is self.num_predict * 4 nodes
+                    output = self.forward(this_row.drop(columns=["FEN"]))
 
-                    # Convert output to a list of N moves
+                    # Convert output to a list of self.num_predict moves
+                    output_moves = []
+                    for i in range(0, len(output), 4):
+                        # Use these 4 elements to get a move, then add it to output_moves
+
+                    for move in output_moves:
+                        if move in legal_moves:
+                            # Do the move to the board
+                            # Retrieve the corresponding FEN
+                            # Add the FEN to positions_now_and_future
+                        else:
+                            # Break out of the loop. Don't add invalid positions to positions_now_and_future
+                            break
 
 
+                # At this point we've completed the current batch
+                # Score this batch
 
-                    # Append the FEN for board states that result from those N moves to positions_now_and_future
 
-                    # If a move is not in the list of legal moves then use a string like "bad" or something
 
             else:
                 break
+
+        # We've made predictions on one full batch
+
 
         pass
 
