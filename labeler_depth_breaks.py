@@ -1,6 +1,6 @@
 import chess.engine
 import chess
-import helper_functions as hf
+import helper_utils as hu
 import threading
 import keyboard
 import logging
@@ -85,7 +85,7 @@ leela_breaks = [[10, 400],
                 [16, 100],
                 [19, -1]]  # Maximum depth
 
-leela_config = {"Threads": 4,
+leela_config = {"Threads": 2,
                 "NNCacheSize": 1000000,
                 "MinibatchSize": 1024,
                 #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
@@ -95,8 +95,8 @@ leela_positions = "lichess-positions/lichess_positions_part_2.txt"
 leela_progress = "training-supervised-engines/progress_part_2_leela.csv"
 leela_output = "training-supervised-engines/results_part_2_leela.csv"
 
-leela_engine = hf.initialize_engine("leela", leela_config)
-[progress_dict, current_row] = hf.process_progress_file(leela_progress, leela_positions)
+leela_engine = hu.initialize_engine("leela", leela_config)
+[progress_dict, current_row] = hu.process_progress_file(leela_progress, leela_positions)
 
 leela_dict = {"Name": "Leela",
               "Source": leela_positions,
@@ -109,7 +109,7 @@ leela_dict = {"Name": "Leela",
               "Output Path": leela_output}
 
 with open(leela_positions, "r") as leela_source_file:
-    leela_thread = threading.Thread(target=hf.engine_loop, args=(leela_engine, functions_dict, leela_dict))
+    leela_thread = threading.Thread(target=hu.engine_loop, args=(leela_engine, functions_dict, leela_dict))
     threads.append(leela_thread)
     engines.append(leela_engine)
 #"""
@@ -126,7 +126,7 @@ stockfish_breaks = [[20, 400],
                     [40, 100],
                     [50, -1]]  # Maximum depth
 
-stockfish_config = {"Threads": 4,
+stockfish_config = {"Threads": 2,
                     "Hash": 20000,
                     "UCI_Elo": 3190}
 
@@ -134,8 +134,8 @@ stockfish_positions = "lichess-positions/lichess_positions_part_1.txt"
 stockfish_progress = "training-supervised-engines/progress_part_1_stockfish.csv"
 stockfish_output = "training-supervised-engines/results_part_1_stockfish.csv"
 
-[progress_dict, current_row] = hf.process_progress_file(stockfish_progress, stockfish_positions)
-stockfish_engine = hf.initialize_engine("stockfish", stockfish_config)
+[progress_dict, current_row] = hu.process_progress_file(stockfish_progress, stockfish_positions)
+stockfish_engine = hu.initialize_engine("stockfish", stockfish_config)
 
 stockfish_dict = {"Name": "Stockfish",
                   "Source": stockfish_positions,
@@ -148,7 +148,7 @@ stockfish_dict = {"Name": "Stockfish",
                   "Output Path": stockfish_output}
 
 with open(stockfish_positions, "r") as stockfish_source_file:
-    stockfish_thread = threading.Thread(target=hf.engine_loop, args=(stockfish_engine, functions_dict, stockfish_dict))
+    stockfish_thread = threading.Thread(target=hu.engine_loop, args=(stockfish_engine, functions_dict, stockfish_dict))
     threads.append(stockfish_thread)
     engines.append(stockfish_engine)
 #"""

@@ -1,6 +1,6 @@
 import chess.engine
 import chess
-import helper_functions as hf
+import helper_utils as hu
 import threading
 import keyboard
 import logging
@@ -81,7 +81,7 @@ stockfish_config = {"Threads": 2,
                     "UCI_Elo": 3190}
 
 # Initialize the engine using the helper function
-stockfish_engine = hf.initialize_engine("stockfish", stockfish_config)
+stockfish_engine = hu.initialize_engine("stockfish", stockfish_config)
 
 # ---------- ---------- ----------
 # This implements the finding stuff
@@ -92,7 +92,7 @@ output_filepath = "training-supervised-checkmates/results_part_5_stockfish.csv"
 data_filepath = "lichess-positions/lichess_positions_part_5.txt"
 
 # Process the files to find our current progress
-[progress_dict, current_row] = hf.process_progress_file(progress_filepath, data_filepath)
+[progress_dict, current_row] = hu.process_progress_file(progress_filepath, data_filepath)
 
 # Initialize all of the wrapped up data that will go to the engine_loop
 stockfish_dict = {"Name": "Stockfish",
@@ -109,7 +109,7 @@ functions_dict = {"Stop": finder_stop_conditions,
                   "Output": finder_write_results}
 
 # Create the thread
-checkmate_thread = threading.Thread(target=hf.engine_loop, args=(stockfish_engine, functions_dict, stockfish_dict))
+checkmate_thread = threading.Thread(target=hu.engine_loop, args=(stockfish_engine, functions_dict, stockfish_dict))
 
 # Start the thread
 checkmate_thread.start()

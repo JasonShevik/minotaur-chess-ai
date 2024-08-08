@@ -1,57 +1,66 @@
 import chess.engine
 import chess
-from heapdict import heapdict
-import helper_functions as hf
+import helper_utils as hu
 import threading
 import itertools
 import keyboard
 import logging
+import heapq
 import csv
 
 
 # ---------- ---------- ----------
 #   Expand positions
 
-def expander_stop_conditions():
-    pass
+# If starting from a fresh position, the heaps will have only one element, otherwise they're from the checkpoint
+def expand_position(down_heap, up_heap):
+
+    # Expand down until down_heap is empty
+    while down_heap:
 
 
-def expander_write_results():
-    pass
+
+    # Don't analyze from the losing side
+    # Add them to a database of losing positions; they could be useful later
 
 
-def expand_position(initial_position):
-    #to_explore_up = heapdict()
-    #to_explore_down = heapdict()
-    # Add initial_position to to_explore_down
 
-    #positions_finished = set()
-    # positions_finished.add()
-    # "" in positions_finished
-
-
-    # There are two functions that will make this function work: expand_up and expand_down
-    # expand_down finds all the sequences going toward the checkmate.
-    # It may take in a #+10 position as input and output a dictionary of FENs and best moves going down to checkmate.
-    # Along the way, it also adds every position to the to_explore_up heapdict.
-    # Once expand_down is done, you go through every position in to_explore_up and expand_up each one.
-    # expand_up looks at all positions that could precede the current position, and checks if any are forced checkmate.
-    # If a position is a forced checkmate, it is added to to_explore_down
-    # After checking every possible preceding position, that position is popped from to_explore_up.
-    # Then you run expand_down on each of positions, if any, in to_explore_down
-    # Repeat until to_explore_up and to_explore_down are both empty.
-
-    # Try to use some elegant recursion, but keep it efficient.
-
-    # For maximum speed/efficiency, don't analyze from the losing side.
-    # Just find the set of legal responses from losing, then analyze the winning moves (forced checkmate moves).
-    # I can make a separate function to deeply analyze losing positions at a later date to improve defensiveness.
     pass
 
 #
-def expand_up(initial_position):
+def expand_up(up_heap):
     pass
 
 #
-def expand_down(initial_position):
+def expand_down(down_heap):
     pass
+
+
+# ##### ##### ##### ##### #####
+#       Program body
+
+# This file contains the current progress in the positions file, and whether there is a checkpoint
+progress_filepath = ""
+# This file contains the list of positions that the checkmate_finder found
+positions_filepath = ""
+# This file contains the progress in expanding the current starting position (if the last one wasn't finished)
+checkpoint_filepath = ""
+# This file contains
+losing_filepath = ""
+
+
+# Start by checking the checkpoint_filepath
+with open(checkpoint_filepath, "r") as checkpoint_file:
+
+
+
+
+
+
+
+
+
+
+
+
+

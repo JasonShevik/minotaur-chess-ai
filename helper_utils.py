@@ -5,6 +5,18 @@ import csv
 import os
 
 
+#
+class TrainingPhaseInterface:
+    def forward(self):
+        pass
+
+    def train(self):
+        pass
+
+    def save(self):
+        pass
+
+
 # This function creates and returns a chess engine object according to the configuration settings
 def initialize_engine(which_engine, configure_options):
     if which_engine == "leela":
