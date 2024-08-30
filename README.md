@@ -5,7 +5,8 @@ It will have 4 output nodes (starting row and column, ending row and column) and
 
 ## Table of Contents
 
-* To Do
+* In Progress
+* Architecture
 * Training plan
    * Pre-training
    * Supervised learning
@@ -15,10 +16,17 @@ It will have 4 output nodes (starting row and column, ending row and column) and
    * Evolutionary AI
    * Hyperspheres and randomness
 
-
 ## In Progress:
 * Write the pre-training function and pre-train the model
 
+## Architecture:
+The model is currently programmed to simply use a densly connected neural network. I've also considered using a convolutional neural network, but haven't implemented that. These are very simple and standard ways to create a chess AI.
+
+Recently, however, I've considered switching to a [Graph neural network (GNN)](https://en.wikipedia.org/wiki/Graph_neural_network) such as a [Graph Convolutional Network (GCN)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_convolutional_network) or a [Graph Attention Network (GAN)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network).
+
+Rather than the input to the network being a vector of 64 values for the squares, it could be a graph with 64 nodes and 6 different edge types for each piece type which show where pieces can move. The nodes would still hold integer values from -6 to 6 showing which piece, if any, is on each square, but the AI would directly see how squares connect to each other.
+
+There should possibly be a 7th edge type that represents en passant and castling.
 
 ## Training plan
 #### Pre-training (RL)
