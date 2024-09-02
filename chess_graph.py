@@ -58,6 +58,9 @@ def create_blank_chess_graph() -> Tuple[torch.Tensor, torch.Tensor]:
     return edge_index, edge_type
 
 
+# ##### ##### ##### ##### #####
+#   Piece connection getters
+
 def get_pawn_edges() -> List[List[int]]:
     """
     Deterministically find all paths where pawns can move.
@@ -73,7 +76,7 @@ def get_pawn_edges() -> List[List[int]]:
         # From the back perspective
         pawn_column.append([col_num + (8 * 6), col_num + (8 * 4)])
 
-        # All single square connections
+        # All single square moves
         # From the front perspective
         for row_num in range(1, 7, 1):
             pawn_column.append([col_num + (8 * row_num), col_num + (8 * (row_num + 1))])
@@ -88,6 +91,99 @@ def get_pawn_edges() -> List[List[int]]:
     # Go through A through H for both sides.
     for column in range(0, 8, 1):
         edges.extend(add_column(column))
+
+    return edges
+
+
+def get_knight_edges() -> List[List[int]]:
+    """
+
+    :return:
+    """
+    def get_move_coordinates(start_coordinates: List[int]) -> List[List[int]]:
+        """
+
+        :param start_coordinates:
+        :return:
+        """
+
+        return []
+
+    def remove_invalid_coordinates(coordinate_list: List[List[int]]) -> List[List[int]]:
+        """
+
+        :param coordinate_list:
+        :return:
+        """
+
+        return []
+
+    edges: List[List[int]] = []
+
+    # Implement depth first search
+    current_square = [0, 0]
+    for destination in remove_invalid_coordinates(get_move_coordinates(current_square)):
+        edges.append([coordinates_to_index(current_square), coordinates_to_index(destination)])
+
+    return edges
+
+
+def get_light_bishop_edges() -> List[List[int]]:
+    """
+
+    :return:
+    """
+    edges: List[List[int]] = []
+
+    return edges
+
+
+def get_dark_bishop_edges() -> List[List[int]]:
+    """
+
+    :return:
+    """
+    edges: List[List[int]] = []
+
+    return edges
+
+
+def get_rook_edges() -> List[List[int]]:
+    """
+
+    :return:
+    """
+    edges: List[List[int]] = []
+
+    return edges
+
+
+def get_queen_edges() -> List[List[int]]:
+    """
+
+    :return:
+    """
+    edges: List[List[int]] = []
+
+    return edges
+
+
+def get_king_edges() -> List[List[int]]:
+    """
+
+    :return:
+    """
+    edges: List[List[int]] = []
+
+    return edges
+
+
+def get_en_passant_edges() -> List[List[int]]:
+    """
+
+    :return:
+    """
+    edges: List[List[int]] = []
 
     return edges
 
@@ -110,6 +206,25 @@ def get_castling_edges(board_vector) -> List[List[int]]:
     # Connect them with castling edges
 
     return edges
+
+
+# ##### ##### ##### ##### #####
+#       Helper functions
+
+def coordinates_to_index(coord_pair: List[int]) -> int:
+    """
+
+    :param coord_pair:
+    :return:
+    """
+
+    return 0
+
+
+
+
+
+
 
 
 
