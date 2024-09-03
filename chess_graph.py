@@ -17,21 +17,32 @@ def create_blank_chess_graph() -> Tuple[torch.Tensor, torch.Tensor]:
 
     # This holds all of the different information for each piece type
     # A function that returns a list for edges_list, and the corresponding value for edge_types_list
-    pieces_list: List[Tuple[Callable[[], List[Tuple[int, int]]], int]] = [
-        (get_pawn_edges,        0),
-        (get_knight_edges,      1),
-        (get_light_bishop_edges,2), # Dark and light bishops have same connection type.
-        (get_dark_bishop_edges, 2), # No dark or light squares will be connected to each other, though.
-        (get_rook_edges,        3),
-        (get_queen_edges,       4),
-        (get_king_edges,        5),
-        (get_en_passant_edges,  6)
+    pieces_list: List[Tuple[Callable[[Tuple[int, int]], List[Tuple[int, int]]], Tuple[int, int], int]] = [
+        (get_pawn_edges,        (1, 0),  0),
+        (get_knight_neighbors,  (0, 0),  1),
+        (get_bishop_neighbors,  (0, 1),  2), # Dark and light bishops have same connection type.
+        (get_bishop_neighbors,  (0, 0),  2), # No dark or light squares will be connected to each other, though.
+        (get_rook_neighbors,    (0, 0),  3),
+        (get_queen_neighbors,   (0, 0),  4),
+        (get_king_neighbors,    (0, 0),  5),
+        (get_en_passant_edges,  (3, 0),  6)
     ]
 
     # Go through the structure, calling each piece function and updating edges_list and edge_types_list
-    for edge_function, piece_type in pieces_list:
-        # Get the list of new edges that are specific to this piece_type
-        new_edges: List[Tuple[int, int]] = edge_function()
+    for neighbor_function, start_square, piece_type in pieces_list:
+        # Pawn edges are hard coded and don't use DFS
+        if piece_type == 0:
+            new_edges: List[Tuple[int, int]] = get_pawn_edges()
+        # En Passant edges are hard coded and don't use DFS
+        elif piece_type == 6:
+            new_edges: List[Tuple[int, int]] = get_en_passant_edges()
+        else:
+            # Get the list of new edges that are specific to this piece_type
+            new_edges: List[Tuple[int, int]] = depth_first_recursive(visited=[False for _ in range(64)],
+                                                                     current_coordinates=start_square,
+                                                                     edges=[],
+                                                                     get_neighbors=neighbor_function)
+
         # Extend the edges_list to contain all of the newly gotten edges
         edges_list.extend(new_edges)
         # Extend the edge_types_list to tell us the piece_type for all the new edges that were just added
@@ -77,182 +88,101 @@ def get_pawn_edges() -> List[Tuple[int, int]]:
     return edges
 
 
-def get_knight_edges() -> List[Tuple[int, int]]:
+def get_knight_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
     """
-    Deterministically find all paths where knights can move.
-    :return: A list of edge pairs that show where all knight moves may be possible.
+    Gets the list of all possible knight moves from this position if the board were infinite.
+    :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
+    :return: A lit of coordinates of where the knight could move from the start given an infinite board.
     """
-    def get_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Gets the list of all possible knight moves from this position if the board were infinite.
-        :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
-        :return: A lit of coordinates of where the knight could move from the start given an infinite board.
-        """
-        row: int
-        column: int
-        row, column = start_coordinates
+    row: int
+    column: int
+    row, column = start_coordinates
 
-        return remove_invalid_coordinates([(row + 2, column + 1), # Two up, one over
-                                           (row + 2, column - 1),
-                                           (row + 1, column + 2), # Two over, one up
-                                           (row + 1, column - 2),
-                                           (row - 1, column + 2), # Two over, one down
-                                           (row - 1, column - 2),
-                                           (row - 2, column + 1), # Two down, one over
-                                           (row - 2, column - 1)])
-
-    return depth_first_recursive(visited=[False for _ in range(64)],
-                                 current_coordinates=(0, 0),
-                                 edges=[],
-                                 get_neighbors=get_neighbors)
+    return remove_invalid_coordinates([(row + 2, column + 1), # Two up, one over
+                                       (row + 2, column - 1),
+                                       (row + 1, column + 2), # Two over, one up
+                                       (row + 1, column - 2),
+                                       (row - 1, column + 2), # Two over, one down
+                                       (row - 1, column - 2),
+                                       (row - 2, column + 1), # Two down, one over
+                                       (row - 2, column - 1)])
 
 
-def get_light_bishop_edges() -> List[Tuple[int, int]]:
+def get_bishop_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
     """
-    Deterministically find all paths where light bishops can move.
-    :return: A list of edge pairs that show where all light bishop moves may be possible.
+    Gets the list of all possible light bishop moves from this position.
+    :param start_coordinates: The coordinates that the light bishop starts on in the format [row, column].
+    :return: A lit of coordinates of where the light bishop could move from the start.
     """
-    def get_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Gets the list of all possible light bishop moves from this position.
-        :param start_coordinates: The coordinates that the light bishop starts on in the format [row, column].
-        :return: A lit of coordinates of where the light bishop could move from the start.
-        """
-        row: int
-        column: int
-        row, column = start_coordinates
+    row: int
+    column: int
+    row, column = start_coordinates
 
-        neighbors: List[Tuple[int, int]] = []
-        for count in range(1, 8):
-            neighbors.extend([(row + count, column + count),  # NE Direction
-                              (row - count, column + count),  # SE
-                              (row - count, column - count),  # SW
-                              (row + count, column - count)]) # NW
+    neighbors: List[Tuple[int, int]] = []
+    for count in range(1, 8):
+        neighbors.extend([(row + count, column + count),  # NE Direction
+                          (row - count, column + count),  # SE
+                          (row - count, column - count),  # SW
+                          (row + count, column - count)]) # NW
 
-        return remove_invalid_coordinates(neighbors)
-
-    return depth_first_recursive(visited=[False for _ in range(64)],
-                                 current_coordinates=(0, 1),
-                                 edges=[],
-                                 get_neighbors=get_neighbors)
+    return remove_invalid_coordinates(neighbors)
 
 
-def get_dark_bishop_edges() -> List[Tuple[int, int]]:
+def get_rook_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
     """
-    Deterministically find all paths where dark bishops can move.
-    :return: A list of edge pairs that show where all dark bishop moves may be possible.
+    Gets the list of all possible rook moves from this position.
+    :param start_coordinates: The coordinates that the rook starts on in the format [row, column].
+    :return: A lit of coordinates of where the rook could move from the start.
     """
-    def get_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Gets the list of all possible dark bishop moves from this position.
-        :param start_coordinates: The coordinates that the dark bishop starts on in the format [row, column].
-        :return: A lit of coordinates of where the dark bishop could move from the start.
-        """
-        row: int
-        column: int
-        row, column = start_coordinates
+    row: int
+    column: int
+    row, column = start_coordinates
 
-        return []
-
-    return depth_first_recursive(visited=[False for _ in range(64)],
-                                 current_coordinates=(0, 0),
-                                 edges=[],
-                                 get_neighbors=get_neighbors)
+    return []
 
 
-def get_rook_edges() -> List[Tuple[int, int]]:
+def get_queen_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
     """
-    Deterministically find all paths where rooks can move.
-    :return: A list of edge pairs that show where all rook moves may be possible.
+    Gets the list of all possible knight moves from this position if the board were infinite.
+    :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
+    :return: A lit of coordinates of where the knight could move from the start given an infinite board.
     """
-    def get_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Gets the list of all possible rook moves from this position.
-        :param start_coordinates: The coordinates that the rook starts on in the format [row, column].
-        :return: A lit of coordinates of where the rook could move from the start.
-        """
-        row: int
-        column: int
-        row, column = start_coordinates
+    row: int
+    column: int
+    row, column = start_coordinates
 
-        return []
+    # Should this just call the rook and bishop functions?
 
-    return depth_first_recursive(visited=[False for _ in range(64)],
-                                 current_coordinates=(0, 0),
-                                 edges=[],
-                                 get_neighbors=get_neighbors)
+    return []
 
 
-def get_queen_edges() -> List[Tuple[int, int]]:
+def get_king_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
     """
-    Deterministically find all paths where queens can move.
-    :return: A list of edge pairs that show where all queen moves may be possible.
+    Gets the list of all possible knight moves from this position if the board were infinite.
+    :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
+    :return: A lit of coordinates of where the knight could move from the start given an infinite board.
     """
-    def get_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Gets the list of all possible knight moves from this position if the board were infinite.
-        :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
-        :return: A lit of coordinates of where the knight could move from the start given an infinite board.
-        """
-        row: int
-        column: int
-        row, column = start_coordinates
+    row: int
+    column: int
+    row, column = start_coordinates
 
-        return []
-
-    return depth_first_recursive(visited=[False for _ in range(64)],
-                                 current_coordinates=(0, 0),
-                                 edges=[],
-                                 get_neighbors=get_neighbors)
+    return []
 
 
-def get_king_edges() -> List[Tuple[int, int]]:
+def get_en_passant_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
     """
-    Deterministically find all paths where kings can move.
-    :return: A list of edge pairs that show where all king moves may be possible.
+    Gets the list of all possible knight moves from this position if the board were infinite.
+    :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
+    :return: A lit of coordinates of where the knight could move from the start given an infinite board.
     """
-    def get_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Gets the list of all possible knight moves from this position if the board were infinite.
-        :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
-        :return: A lit of coordinates of where the knight could move from the start given an infinite board.
-        """
-        row: int
-        column: int
-        row, column = start_coordinates
+    row: int
+    column: int
+    row, column = start_coordinates
 
-        return []
-
-    return depth_first_recursive(visited=[False for _ in range(64)],
-                                 current_coordinates=(0, 0),
-                                 edges=[],
-                                 get_neighbors=get_neighbors)
+    return []
 
 
-def get_en_passant_edges() -> List[Tuple[int, int]]:
-    """
-    Deterministically find all paths where en passant can happen.
-    :return: A list of edge pairs that show where all en passant moves may be possible.
-    """
-    def get_neighbors(start_coordinates: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Gets the list of all possible knight moves from this position if the board were infinite.
-        :param start_coordinates: The coordinates that the knight starts on in the format [row, column].
-        :return: A lit of coordinates of where the knight could move from the start given an infinite board.
-        """
-        row: int
-        column: int
-        row, column = start_coordinates
-
-        return []
-
-    return depth_first_recursive(visited=[False for _ in range(64)],
-                                 current_coordinates=(0, 0),
-                                 edges=[],
-                                 get_neighbors=get_neighbors)
-
-
-def get_castling_edges(board_vector: List[int]) -> List[Tuple[int, int]]:
+def get_castling_neighbors(board_vector: List[int]) -> List[Tuple[int, int]]:
     """
     This is a helper function to add castling edges to the graph. It needs to be done after the blank graph has
     been made and after the piece placement has been decided
@@ -308,10 +238,10 @@ def depth_first_recursive(visited: List[bool],
     visited[coordinates_to_index(current_coordinates)] = True
 
     # For each destination square in the set of valid neighbors
-    for destination in get_neighbors(current_square):
+    for destination in get_neighbors(current_coordinates):
         # Create bidirectional connections from the current square to the destination
-        edge_to: Tuple[int, int] = (coordinates_to_index(current_square), coordinates_to_index(destination))
-        edge_from: Tuple[int, int] = (coordinates_to_index(destination), coordinates_to_index(current_square))
+        edge_to: Tuple[int, int] = (coordinates_to_index(current_coordinates), coordinates_to_index(destination))
+        edge_from: Tuple[int, int] = (coordinates_to_index(destination), coordinates_to_index(current_coordinates))
         # If we haven't recorded these connections before, append them
         if edge_to not in edges:
             edges.append(edge_to)
