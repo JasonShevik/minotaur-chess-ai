@@ -2,37 +2,38 @@ import itertools
 import pandas as pd
 import csv
 import os
+from typing import List, Dict
 
 
 # Takes in a FEN string and returns a list of 64 numbers
 # https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation
-def fen_to_vector(fen):
-    piece_values = {"p": 1,
-                    "n": 2,
-                    "b": 3,
-                    "r": 4,
-                    "q": 5,
-                    "k": 6}
+def fen_to_vector(fen: str) -> List[int]:
+    piece_values: Dict[str, int] = {"p": 1,
+                                    "n": 2,
+                                    "b": 3,
+                                    "r": 4,
+                                    "q": 5,
+                                    "k": 6}
 
     # Split the fen by spaces
-    fen_parts = fen.split(" ")
+    fen_parts: List[str] = fen.split(" ")
 
     # The first part is the board portion. Split it by '/' to get each row
-    row_strings = fen_parts[0].split("/")
+    row_strings: List[str] = fen_parts[0].split("/")
 
     # Initialize some variables for constructing the vector
-    vector_version = [0 for _ in range(64)]
-    index_buffer_num_rows = 0
+    vector_version: List[int] = [0 for _ in range(64)]
+    index_buffer_num_rows: int = 0
 
     # Vectors go a1, b1, ... a2, b2, ..., so if we're white then we need to go through the strings in reverse order
     if fen_parts[1] == "w":
-        row_strings = reversed(row_strings)
+        row_strings = list(reversed(row_strings))
 
     # If playing as black, then we want to go through the strings in the current order
     # BUT we need to reverse all of the individual strings like we're rotating the board
     elif fen_parts[1] == "b":
         for index, _ in enumerate(row_strings):
-            row_strings[index] = reversed(row_strings[index])
+            row_strings[index] = str(reversed(row_strings[index]))
 
     # This value can only be 'w' or 'b'
     else:
@@ -40,10 +41,13 @@ def fen_to_vector(fen):
         return False
 
     # Iterate over the rows backwards (start from row 1 and go up)
+    current_row: str
     for current_row in row_strings:
-        index_buffer_this_row = 0
+        index_buffer_this_row: int = 0
 
         # Loop through each character in this row of the chess board
+        index: int
+        character: str
         for index, character in enumerate(current_row):
             # If the character is numerical...
             if character.isdigit():
@@ -51,6 +55,7 @@ def fen_to_vector(fen):
                 index_buffer_this_row += int(character) - 1
 
                 # For each of the empty squares
+                index_to_zero: int
                 for index_to_zero in range(int(character)):
                     # Set that index of the vector_version to zero
                     # (index_buffer_num_rows * 8) because we need to offset by the number of rows we've already done
@@ -62,7 +67,7 @@ def fen_to_vector(fen):
             # If the character is alphabetical...
             else:
                 # Set the value in the vector to the piece value
-                true_index = index + (index_buffer_num_rows * 8) + index_buffer_this_row
+                true_index: int = index + (index_buffer_num_rows * 8) + index_buffer_this_row
                 vector_version[true_index] = piece_values[character.lower()]
 
                 # If the piece is black
@@ -91,11 +96,11 @@ def fen_to_vector(fen):
 
     # Establish what side we're on so that we know if the king is a positive or negative number
     if fen_parts[1] == "w":
-        white_mod = 1
-        black_mod = -1
+        white_mod: int = 1
+        black_mod: int = -1
     else:
-        white_mod = -1
-        black_mod = 1
+        white_mod: int = -1
+        black_mod: int = 1
 
     # Since we may modify kings multiple times in a row...
     # Doing this work on separate list using indices of the old list so .index() works properly
@@ -138,17 +143,18 @@ def fen_to_vector(fen):
 
 
 # Take all of the results files in a directory and merge them into a single file with vectorized fen
-def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
+def merge_and_vectorize(directory: str, pretraining: bool = False, filter_mates: bool = False) -> bool:
     # Collect the list of files to merge from the directory (iff they have "results_" in the name)
-    files_to_merge = [file_name for file_name in os.listdir(directory) if ("results_" in file_name or pretraining is True)]
+    files_to_merge: List[str] = [file_name for file_name in os.listdir(directory) if ("results_" in file_name or pretraining is True)]
     if not files_to_merge:
         print("No files to merge!")
         return False
 
     # Create a dataframe out of the first file, and remove that file from the list
-    merged_df = pd.read_csv(directory + files_to_merge.pop(0))
+    merged_df: pd.DataFrame = pd.read_csv(directory + files_to_merge.pop(0))
 
     # Iterate over the remaining files
+    filename: str
     for filename in files_to_merge:
         # Concat each next file to the end of the merged_df
         merged_df = pd.concat([merged_df, pd.read_csv(filename)], ignore_index=True)
@@ -159,13 +165,13 @@ def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
         merged_df = remove_checkmates(merged_df)
 
     # Use list comprehensions to create a list of every combination of a1 through h8
-    letters = ["a", "b", "c", "d", "e", "f", "g", "h"]
-    numbers = [str(x + 1) for x in range(8)]
-    df_column_names = [a + x for x in numbers for a in letters]
+    letters: List[str] = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    numbers: List[str] = [str(x + 1) for x in range(8)]
+    df_column_names: List[str] = [a + x for x in numbers for a in letters]
 
     # Use a list comprehension to get the list of lists for the dataframe
-    list_of_vectors = [fen_to_vector(fen) for fen in merged_df["Position"]]
-    converted_positions_df = pd.DataFrame(list_of_vectors, columns=df_column_names)
+    list_of_vectors: List[List[int]] = [fen_to_vector(fen) for fen in merged_df["Position"]]
+    converted_positions_df: pd.DataFrame = pd.DataFrame(list_of_vectors, columns=df_column_names)
 
     # Add the FEN column to the beginning of the dataframe so that we know what FEN the vector refers to
     converted_positions_df.insert(0, "FEN", merged_df["Position"])
@@ -175,16 +181,17 @@ def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
         converted_positions_df.to_csv(f"{directory}merged_for_training.csv", index=False)
     else:
         # Make a dictionary to quickly look up values for move columns/rows
-        character_values = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8,
-                            "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8}
+        character_values: Dict[str, int] = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8,
+                                            "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8}
 
         # Create a list to hold all of our data labels
-        label_list = []
+        label_list: List[List[int]] = []
 
         # Go through each row of the input file
         for i in range(len(merged_df.index)):
             # Go through each character in the labeled move string
-            columns_and_rows = []
+            columns_and_rows: List[int] = []
+            character: str
             for character in merged_df.iloc[i]["Move"]:
                 # Add the value of that
                 columns_and_rows.append(character_values[character])
@@ -193,28 +200,32 @@ def merge_and_vectorize(directory, pretraining=False, filter_mates=False):
             label_list.append(columns_and_rows)
 
         # Use list comprehensions to grab the right elements of each label to create a list for each of the columns
+        index: int
+        name: str
         for index, name in enumerate(["s_row", "s_column", "f_row", "f_column"]):
             converted_positions_df[name] = [these_labels[index] for these_labels in label_list]
 
         # Print the result with 64 input columns and 4 label columns to a csv
         converted_positions_df.to_csv(f"{directory}merged_for_training.csv", index=False)
 
+    return True
+
 
 # Take in a filepath, remove all forced checkmate rows, save the filtered file, return checkmates dataframe
-def remove_checkmates(input_df):
-    save_path = "training-supervised-checkmates/"
+def remove_checkmates(input_df: pd.DataFrame) -> pd.DataFrame:
+    save_path: str = "training-supervised-checkmates/"
 
-    checkmates_df = input_df[input_df["Score"].str.contains("#")]
+    checkmates_df: pd.DataFrame = input_df[input_df["Score"].str.contains("#")]
     checkmates_df.to_csv(f"{save_path}results_merged_filtered.csv", index=False)
 
-    non_checkmates_df = input_df[~input_df["Score"].str.contains("#")]
+    non_checkmates_df: pd.DataFrame = input_df[~input_df["Score"].str.contains("#")]
     return non_checkmates_df
 
 
 # Prepares the data for the supervised training phase (including the depth breaks and checkmates data)
-def prepare_training_files():
-    depth_breaks_dir = "training-supervised-engines/"
-    checkmates_dir = "training-supervised-checkmates/"
+def prepare_training_files() -> None:
+    depth_breaks_dir: str = "training-supervised-engines/"
+    checkmates_dir: str = "training-supervised-checkmates/"
 
     # Merge the depth breaks files with filter_mates as true
     merge_and_vectorize(depth_breaks_dir, pretraining=False, filter_mates=True)
@@ -224,8 +235,8 @@ def prepare_training_files():
 
 
 # Prepares the data for the pretraining phase
-def prepare_pretraining_files():
-    pretraining_data_dir = "training-pretraining/"
+def prepare_pretraining_files() -> None:
+    pretraining_data_dir: str = "training-pretraining/"
 
     merge_and_vectorize(pretraining_data_dir, pretraining=True)
 
