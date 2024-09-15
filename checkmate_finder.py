@@ -5,15 +5,16 @@ import threading
 import keyboard
 import logging
 import csv
+from typing import Dict, Any
 
 
 # ---------- ---------- ----------
 #   Collect initial positions
 
-def finder_stop_conditions(info, data_dict):
+def finder_stop_conditions(info: Dict[str, Any], data_dict: Dict[str, Any]) -> bool:
     # Get the important stuff from info
-    depth = info.get("depth")
-    score = str(info.get('score').pov(True))
+    depth: int = info.get("depth")
+    score: str = str(info.get('score').pov(True))
 
     # By default, we assume the position is not a checkmate.
     data_dict["is_checkmate"] = False
@@ -35,7 +36,7 @@ def finder_stop_conditions(info, data_dict):
     # If we've reached a depth of 15, then lets check if it's worth continuing
     elif 15 <= depth < 25:
         # Retrieve the absolute value of the score
-        score = abs(int(score))
+        score:int  = abs(int(score))
         # If a side is winning by more than this much, then it's worth continuing
         if score >= 300:
             return False
@@ -47,7 +48,7 @@ def finder_stop_conditions(info, data_dict):
         return True
 
 
-def finder_write_results(position, info, data_dict):
+def finder_write_results(position: str, info: Dict[str, Any], data_dict: Dict[str, Any]) -> None:
     if data_dict["is_checkmate"]:
         with open(data_dict["Output Path"], "a") as output_file:
             # FEN, Score, Best Move
@@ -87,11 +88,13 @@ stockfish_engine = hu.initialize_engine("stockfish", stockfish_config)
 # This implements the finding stuff
 
 # Initialize the relevant filepaths
-progress_filepath = "training-supervised-checkmates/progress_part_5_stockfish.csv"
-output_filepath = "training-supervised-checkmates/results_part_5_stockfish.csv"
-data_filepath = "lichess-positions/lichess_positions_part_5.txt"
+progress_filepath: str = "training-supervised-checkmates/progress_part_5_stockfish.csv"
+output_filepath: str = "training-supervised-checkmates/results_part_5_stockfish.csv"
+data_filepath: str = "lichess-positions/lichess_positions_part_5.txt"
 
 # Process the files to find our current progress
+progress_dict: Dict[str, int]
+current_row: int
 [progress_dict, current_row] = hu.process_progress_file(progress_filepath, data_filepath)
 
 # Initialize all of the wrapped up data that will go to the engine_loop
