@@ -5,16 +5,16 @@ import pandas as pd
 import threading
 import random
 import chess
+from typing import List
 
 
 # ##### ##### ##### ##### #####
 # Functions
 
-
 #
 def analyze_distribution(method="uniform"):
 
-    generated_points = []
+    generated_points:  = []
 
     # REDO THIS using lambda functions
     if method == "uniform":
