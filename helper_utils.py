@@ -3,29 +3,30 @@ import chess
 import itertools
 import csv
 import os
+from typing import List, Tuple, Dict, Any, Callable
 
 
-#
+# An interface for the Minotaur classes to conform to
 class TrainingPhaseInterface:
-    def forward(self):
+    def forward(self) -> None:
         pass
 
-    def train(self):
+    def train(self) -> None:
         pass
 
-    def save(self):
+    def save(self) -> None:
         pass
 
 
 # This function creates and returns a chess engine object according to the configuration settings
-def initialize_engine(which_engine, configure_options):
+def initialize_engine(which_engine: str, configure_options: Dict[str, Any]) -> chess.engine.SimpleEngine:
     if which_engine == "leela":
-        engine_dir = "lc0-v0.30.0-windows-gpu-nvidia-cuda/lc0.exe"
+        engine_dir: str = "lc0-v0.31.1-windows-gpu-nvidia-cuda/lc0.exe"
     elif which_engine == "stockfish":
-        engine_dir = "stockfish/stockfish-windows-x86-64-avx2.exe"
+        engine_dir: str = "stockfish/stockfish-windows-x86-64-avx2.exe"
     else:
         print("Invalid Engine Choice")
-        engine_dir = ""
+        engine_dir: str = ""
 
     this_engine = chess.engine.SimpleEngine.popen_uci(engine_dir)
     this_engine.configure(configure_options)
@@ -33,8 +34,8 @@ def initialize_engine(which_engine, configure_options):
 
 
 # This function opens the progress file (which has the lookup info) and the positions file (the key for row value)
-def process_progress_file(progress_filepath, positions_filepath):
-    progress_dict = {}
+def process_progress_file(progress_filepath: str, positions_filepath: str) -> Tuple[Dict[str, int], int]:
+    progress_dict: Dict[str, int] = {}
 
     # Check for a progress file
     if os.path.exists(progress_filepath):
@@ -45,6 +46,7 @@ def process_progress_file(progress_filepath, positions_filepath):
             next(progress_reader, None)
 
             # Read every row of the progress file into a dictionary
+            row: List[str, int]
             for row in progress_reader:
                 progress_dict[row[0]] = int(row[1])
 
@@ -73,10 +75,11 @@ def process_progress_file(progress_filepath, positions_filepath):
             # Set the starting row for the positions_filepath file for analysis.
             current_row = -1
 
-    return [progress_dict, current_row]
+    return progress_dict, current_row
 
 
-def engine_loop(engine, functions_dict, data_dict):
+# A configurable function to continuously analyze positions
+def engine_loop(engine: chess.engine.SimpleEngine, functions_dict: Dict[str, Callable], data_dict: Dict[str, Any]) -> None:
     """
     This is a flexible function to continuously analyze positions with user-specified conditions.
 
@@ -106,6 +109,7 @@ def engine_loop(engine, functions_dict, data_dict):
 
     with open(data_dict["Source"], "r") as source_file:
         # Loop through each position in the source file starting at the current row
+        position: str
         for position in itertools.islice(source_file, data_dict["Row"], None):
             if not data_dict["Stop"].is_set():
 
@@ -114,24 +118,26 @@ def engine_loop(engine, functions_dict, data_dict):
                 print(f"{data_dict["Name"]}: {data_dict["Row"]}")
 
                 # Parse the position and make an object
-                board = chess.Board(position)
+                board: chess.Board = chess.Board(position)
 
                 # Set the index that we use with data_dict["Breaks"] to determine depth based on a score threshold
                 data_dict["Threshold Index"] = 0
 
                 # Begin the analysis of this board position
+                analysis: chess.engine.SimpleAnalysisResult
                 with engine.analysis(board) as analysis:
                     # Number of nodes explored is 0 at the start of the analysis
                     data_dict["Nodes"] = 0
                     # Analyze continuously, depth by depth, until we meet a break condition
+                    info: Dict[str, Any]
                     for info in analysis:
                         # Get the current depth
-                        depth = info.get("depth")
+                        depth: int = info.get("depth")
                         if depth is None:
                             continue
 
                         # Get the current score
-                        score = info.get("score")
+                        score: chess.engine.Score = info.get("score")
                         # Score can be None when Stockfish looks at sidelines - Skip those iterations
                         if score is None:
                             continue
@@ -150,8 +156,6 @@ def engine_loop(engine, functions_dict, data_dict):
                 engine.quit()
                 print(f"{data_dict["Name"]} done!")
                 break
-
-
 
 
 
