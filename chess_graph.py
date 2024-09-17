@@ -36,7 +36,6 @@ def create_blank_chess_graph() -> Tuple[torch.tensor, torch.tensor, torch.tensor
 
     # Go through the structure, calling each piece function and updating edges_list and edge_types_list
     for neighbor_function, start_square, piece_type in pieces_list:
-        print(f'Piece type: {piece_type}')
         # Pawn edges are hard coded and don't use DFS
         if piece_type == 0:
             new_edges: set[Tuple[int, int]] = get_pawn_edges()
@@ -51,12 +50,21 @@ def create_blank_chess_graph() -> Tuple[torch.tensor, torch.tensor, torch.tensor
                                                                     get_neighbors=neighbor_function)
 
         # Extend the edges_list to contain all of the newly gotten edges
+        new_edges = set(t + (piece_type,) for t in new_edges)
         edges_list.update(new_edges)
         # Extend the edge_types_list to tell us the piece_type for all the new edges that were just added
         edge_types_list.extend([piece_type] * len(new_edges))
 
-    edge_index = torch.tensor(list(edges_list), dtype=torch.long).t().contiguous()
-    edge_type = torch.tensor(edge_types_list, dtype=torch.long)
+    x_list: List[int] = []
+    y_list: List[int] = []
+    z_list: List[int] = []
+    for x, y, z in edges_list:
+        x_list.append(x)
+        y_list.append(y)
+        z_list.append(z)
+
+    edge_index = torch.tensor(data=[x_list, y_list], dtype=torch.long)
+    edge_type = torch.tensor(data=z_list, dtype=torch.long)
     node_features = torch.tensor([0 for _ in range(64)], dtype=torch.float)
 
     # The blank chess graph will not include castling because that depends on the square that the king starts on.
@@ -305,13 +313,41 @@ def depth_first_recursive(visited: List[bool],
 # ##### ##### ##### ##### #####
 #       Helper functions
 
-def visualize_graph(edge_index: torch.tensor, edge_type: torch.tensor, node_features: torch.tensor):
-    G = to_networkx(edge_index, to_undirected=False)
+def visualize_graph(edge_index: torch.tensor, edge_type: torch.tensor, node_features: torch.tensor, selected_edge_types: List[int] = None):
+    board_dict: Dict[int, Tuple[int, int]] = {i: (i % 8, i // 8) for i in range(64)}
 
-    pos = {i: (i % 8, 8 - 1 - i // 8) for i in range(64)}
+    # Create a graph
+    g: nx.DiGraph = nx.DiGraph()
 
+    # Add the nodes
+    for i in range(64):
+        g.add_node(i, feature=node_features[i])
+    # Add the edges
+    for i in range(edge_index.shape[1]):
+        src, dst = edge_index[:, i].tolist()  # Convert to list for indexing
+        g.add_edge(src, dst, edge_type=edge_type[i].item())  # Use .item() for scalar tensor
 
-    pass
+    # Draw nodes
+    nx.draw_networkx_nodes(g, board_dict, node_color='lightblue', node_size=500)
+    nx.draw_networkx_labels(g, board_dict, {i: str(i) for i in range(len(node_features))})
+
+    # If no edge types were selected, plot all of them
+    if selected_edge_types is None:
+        selected_edge_types: List[int] = list(range(7))
+
+    # Create a consistent list for edge colors
+    edge_colors: List[str] = ['r', 'g', 'b', 'c', 'm', 'y', 'k']
+    # Loop through the edges to plot
+    for i in selected_edge_types:
+        # Get the correct edges for this iteration
+        edges = [(u, v) for (u, v, d) in g.edges(data=True) if d['edge_type'] == i]
+        # Plot them
+        nx.draw_networkx_edges(g, board_dict, edgelist=edges, edge_color=edge_colors[i],
+                               arrows=True, arrowsize=20, width=1.5, label=f'Type {i}')
+
+    plt.title("Directed Graph Visualization")
+    plt.axis('off')
+    plt.show()
 
 
 # ##### ##### ##### ##### #####
@@ -322,10 +358,10 @@ if __name__ == "__main__":
     computed_graph = create_blank_chess_graph()
 
     # Save it
-    torch.save(computed_graph, 'blank_graph.pt')
+    #torch.save(computed_graph, 'blank_graph.pt')
 
     # Visualize the graph
-    #visualize_graph(*computed_graph)
+    visualize_graph(*computed_graph, selected_edge_types=[2])
 
 
 
