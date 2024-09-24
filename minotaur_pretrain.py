@@ -1,7 +1,7 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import helper_utils as hu
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+from torch_geometric.data import Data
 import pandas as pd
 import threading
 import random
@@ -11,25 +11,63 @@ from typing import Dict, List
 
 # ##### ##### ##### ##### #####
 # Class
-class MinotaurPretrain(hu.TrainingPhaseInterface):
-    def __init__(self):
-        super(Minotaur, self).__init__()
-        self.input_layer =
+class MinotaurPretrain(torch.nn.Module):
+    def __init__(self, in_channels: int = 1, hidden_channels: int = 32, out_channels: int = 4, num_edge_types: int = 7, num_heads: int = 4, dropout: float = 0.6):
+        super(MinotaurPretrain, self).__init__()
+
+        # Prepare some values
+        self.dropout: float = dropout
+        gat_hidden_num: int = hidden_channels * num_heads
+        linear_hidden_num: int = 128
+        num_gat_layers: int = 3
+        num_lin_layers: int = 10
+
+        # Initialize the layer_list, and add the first GATConv layer
+        self.gat_layers: torch.nn.ModuleList = torch.nn.ModuleList([GATConv(in_channels, hidden_channels, heads=num_heads, edge_dim=num_edge_types, dropout=dropout)])
+        # Add all of the subsequent GatConv layers
+        for _ in range(num_gat_layers - 1):
+            self.gat_layers.append(GATConv(gat_hidden_num, gat_hidden_num, heads=num_heads, edge_dim=num_edge_types, dropout=dropout))
+
+        # Initialize the linear_list, and add the first Linear layer
+        self.linear_layers: torch.nn.ModuleList = torch.nn.ModuleList([torch.nn.Linear(gat_hidden_num, linear_hidden_num)])
+        # Add all of the subsequent Linear layers
+        for _ in range(num_lin_layers - 1):
+            self.linear_layers.append(torch.nn.Linear(linear_hidden_num, linear_hidden_num))
+
+        # PReLU layers (added PReLU activations for each layer)
+        self.gat_prelu: torch.nn.ModuleList = torch.nn.ModuleList([torch.nn.PReLU() for _ in range(len(self.gat_layers))])
+        self.linear_prelu: torch.nn.ModuleList = torch.nn.ModuleList([torch.nn.PReLU() for _ in range(len(self.linear_layers))])
+
+        # Add output layer
+        self.output = torch.nn.Linear(linear_hidden_num, out_channels)
 
 
-    def forward(self, x: List[int]) -> List[int]:
+    def forward(self, x, edge_index, edge_type):
+        # Apply GAT layers
+        i: int
+        layer: nn.Module
+        for i, layer in enumerate(self.gat_layers):
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = layer(x, edge_index, edge_type)
+            x = self.gat_prelu[i](x)
 
-        # Old way (fully connected neural network)
-        #x = torch.relu(self.input_layer(x))
-        #for layer in self.hidden_layers:
-        #    x = torch.relu(layer(x))
-        x = torch.tanh(self.output_layer(x))
+        # Apply Linear layers
+        i: int
+        layer: nn.Module
+        for i, layer in enumerate(self.linear_layers):
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = layer(x)
+            x = self.linear_prelu[i](x)
 
-
-
+        # Output layer
+        x = torch.tanh(self.output(x))
         x = (x + 1) * 3.5 + 1  # Transforms: [-1, 1] -> [1, 8]
+
         return x.round().tolist()
 
+
+    # -------------------------------------------------------------
+    # This train method will probably have to be totally rewritten
 
     def train(self, position_vector_df, batch_size, stop_event):
         is_fork = multiprocessing.get_start_method() == "fork"
