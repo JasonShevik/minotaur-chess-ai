@@ -1,7 +1,7 @@
 # minotaur-chess-ai
-This is a chess AI that I am developing to utilize a neural network classifier to evaluate the board and determine the best next move. This AI does not use a search function to look multiple moves ahead, rather using only a single forward pass.
+This is a chess AI that I am developing for a neural network classifier to evaluate the board and determine the best next move. This AI does not use a search function to look multiple moves ahead, rather using only a single forward pass.
 
-It will have 4 output nodes (starting row and column, ending row and column) and 64 inputs (the squares).
+It will have 4 output nodes (starting row and column, ending row and column) and a graph input.
 
 ## Table of Contents
 
@@ -12,21 +12,19 @@ It will have 4 output nodes (starting row and column, ending row and column) and
    * Supervised learning
    * Reinforcement learning
    * Adversarial model
-* Reinforcement Learning Details
-   * Evolutionary AI
-   * Hyperspheres and randomness
+* Encoder / Embedding
 
 ## In Progress:
 * Write the pre-training function and pre-train the model
+* Move all labeled data to a SQLite database, and modify the labeler files. Threads will write to a single queue that a write thread handles.
+* Finish chess graph code, including a function for adding the node feature vectors, and the visualizations.
 
 ## Architecture:
-The model is currently programmed to simply use a densly connected neural network. I've also considered using a convolutional neural network, but haven't implemented that. These are very simple and standard ways to create a chess AI.
+The model is utilizes a homogeneous [message passing graph](https://pytorch-geometric.readthedocs.io/en/latest/tutorial/create_gnn.html) implemented via a [Graph Attention Network (GAN)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network).
 
-Recently, however, I've considered switching to a [Graph neural network (GNN)](https://en.wikipedia.org/wiki/Graph_neural_network) such as a [Graph Convolutional Network (GCN)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_convolutional_network) or a [Graph Attention Network (GAN)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network).
+The input to the network is a graph with 64 nodes and multiple different edge types for piece movement types. The node features are 13 dimensional vectors holding a one-hot encoding of the different piece types, plus en passant.
 
-Rather than the input to the network being a vector of 64 values for the squares, it could be a graph with 64 nodes and 6 different edge types for each piece type which show where pieces can move. The nodes would still hold integer values from -6 to 6 showing which piece, if any, is on each square, but the AI would directly see how squares connect to each other.
-
-There should possibly be a 7th edge type that represents en passant and castling.
+There will be 2 or 3 graph attention layers, each with multiple attention heads, followed by a series of linear layers.
 
 ## Training plan
 #### Pre-training (RL)
@@ -54,15 +52,7 @@ After using the previous methods (either supervised + self-play fine-tuning, or 
 This process will then be repeated.
 
 
-### Reinforcement learning details
-#### Evolutionary AI
-As an experiment, after a base version of the AI has been trained, I will use an [evolutionary algorithm](https://en.wikipedia.org/wiki/Evolutionary_algorithm) to train the model further. The model's weights represent a specific point in a parameter space. We define a hypersphere around the point, and instantiate a number of other models in that region of the parameter space. Those models will then compete in a large tournament, or other evaluation step, and the model with the best score will be kept. We then repeat the process of defining a hypersphere and choosing additional points within the resulting. The quality of the evaluation step is critical to avoid regressing at some skills.
+## Encoder / Embedding
+A separate AI encoder model will eventually be made using [Deep Graph Infomax](https://arxiv.org/abs/1809.10341), a form of [Contrastive Self-Supervised Learning](https://en.wikipedia.org/wiki/Self-supervised_learning#Contrastive_self-supervised_learning). This model will take the graph representation of chess positions as input, and output a vector in a higher dimensional place where spacial relationships between vectors correspond to meaningful similarities between positions. Most other methods, like GraphCL, organize positions based on if the boards appear visually similar, but this method should organize them based on deeper meanings and patterns.
 
-#### Hyperspheres and Randomness
-Choosing random points within a hypersphere more complicated than it sounds. The method of choosing can affect the distribution of the sample, similar to the [Bertrand Paradox](https://en.wikipedia.org/wiki/Bertrand_paradox_(probability)) where three different methods of choosing random lines in a circle result in three different distributions of points, such as biasing toward or against the center.
-
-Luckily, [there are known ways to get a uniform distribution](https://mathworld.wolfram.com/HyperspherePointPicking.html). We can use Gaussian random variables to determine a random point on the surface of the hypersphere and then scale it inward toward the center. However, it needs to be noted that the [volume of a hypersphere](https://en.wikipedia.org/wiki/Volume_of_an_n-ball) is concentrated toward the edges, so the scaling needs to be weighted to account for this.
-
-Other methods, like randomly generating polar coordinates, or randomly choosing points on the surface of the hypersphere by doing random transformations to a unit vector before scaling inward, or much different methods, like choosing two random points on the surface, and choosing a random point on the connecting line, do not yield uniform distributions.
-
-I would like to explore the effect that these different uniform vs non-uniform distributions have on the training process and the convergence of the model.
+The purpose of this model is not to serve as part of the final AI. Its only purpose is to create the embedding, so that I can use the embedding to ensure maximum data diversity in training data sets. I will select positions to label and train off of based on their spacial distribution within the embedding space to maximize spread. Balancing the data according to this metric will be significantly better than traditional balancing—such as by opening, middle game, and endgame—because those traditional methods are biased by human ideas of game phases.
