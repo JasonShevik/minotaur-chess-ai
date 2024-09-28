@@ -20,7 +20,7 @@ It will have 4 output nodes (starting row and column, ending row and column) and
 * Finish chess graph code, including a function for adding the node feature vectors, and the visualizations.
 
 ## Architecture:
-The model is utilizes a homogeneous [message passing graph](https://pytorch-geometric.readthedocs.io/en/latest/tutorial/create_gnn.html) implemented via a [Graph Attention Network (GAN)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network).
+The model is utilizes a homogeneous [message passing graph](https://pytorch-geometric.readthedocs.io/en/latest/tutorial/create_gnn.html) implemented via a [Graph Attention Network (GAT)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network).
 
 The input to the network is a graph with 64 nodes and multiple different edge types for piece movement types. The node features are 13 dimensional vectors holding a one-hot encoding of the different piece types, plus en passant.
 
