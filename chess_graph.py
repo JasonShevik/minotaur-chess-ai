@@ -24,24 +24,22 @@ def create_blank_chess_graph() -> Tuple[torch.tensor, torch.tensor, torch.tensor
                                       set[Tuple[int, int]]],
                             Tuple[int, int],
                             int]] = [
-        (get_pawn_edges,        (1, 0),  0),
-        (get_knight_neighbors,  (0, 0),  1),
-        (get_bishop_neighbors,  (0, 1),  2),  # Dark and light bishops have same connection type.
-        (get_bishop_neighbors,  (0, 0),  2),  # No dark or light squares will be connected to each other, though.
-        (get_rook_neighbors,    (0, 0),  3),
-        (get_queen_neighbors,   (0, 0),  4),
-        (get_king_neighbors,    (0, 0),  5),
-        (get_en_passant_edges,  (3, 0),  6)
+        (get_pawn_move_edges,   (1, 0),  0),
+        (get_pawn_attack_edges, (1, 0),  1),
+        (get_knight_neighbors,  (0, 0),  2),
+        (get_bishop_neighbors,  (0, 1),  3),  # Dark and light bishops have same connection type.
+        (get_bishop_neighbors,  (0, 0),  3),  # No dark or light squares will be connected to each other, though.
+        (get_rook_neighbors,    (0, 0),  4),
+        (get_king_neighbors,    (0, 0),  5)
     ]
 
     # Go through the structure, calling each piece function and updating edges_list and edge_types_list
     for neighbor_function, start_square, piece_type in pieces_list:
         # Pawn edges are hard coded and don't use DFS
         if piece_type == 0:
-            new_edges: set[Tuple[int, int]] = get_pawn_edges()
-        # En Passant edges are hard coded and don't use DFS
-        elif piece_type == 6:
-            new_edges: set[Tuple[int, int]] = get_en_passant_edges()
+            new_edges: set[Tuple[int, int]] = get_pawn_move_edges()
+        elif piece_type == 1:
+            new_edges: set[Tuple[int, int]] = get_pawn_attack_edges()
         else:
             # Get the list of new edges that are specific to this piece_type
             new_edges: set[Tuple[int, int]] = depth_first_recursive(visited=[False for _ in range(64)],
@@ -76,7 +74,7 @@ def create_blank_chess_graph() -> Tuple[torch.tensor, torch.tensor, torch.tensor
 # ##### ##### ##### ##### #####
 #   Piece connection getters
 
-def get_pawn_edges() -> set[Tuple[int, int]]:
+def get_pawn_move_edges() -> set[Tuple[int, int]]:
     """
     Deterministically find all paths where pawns can move.
     :return: A list of edges that show where all pawn moves may be possible.
@@ -99,6 +97,46 @@ def get_pawn_edges() -> set[Tuple[int, int]]:
     edges: set[Tuple[int, int]] = set()
     for column in range(8):
         edges.update(add_column(column))
+
+    return edges
+
+
+def get_pawn_attack_edges() -> set[Tuple[int, int]]:
+    """
+
+    :return:
+    """
+    # Front perspective
+    spot: int
+    row: int
+    for row in range(1, 7, 1):
+        spot = row * 8
+        edges.add((spot, spot + 9))
+
+        column: int
+        for column in range(1, 7, 1):
+            spot = (row * 8) + column
+            edges.add((spot, spot + 7))
+            edges.add((spot, spot + 9))
+
+        spot = (row * 8) + 7
+        edges.add((spot, spot + 7))
+
+    # Back perspective
+    spot: int
+    row: int
+    for row in range(6, 0, -1):
+        spot = row * 8
+        edges.add((spot, spot - 7))
+
+        column: int
+        for column in range(1, 7, 1):
+            spot = (row * 8) + column
+            edges.add((spot, spot - 7))
+            edges.add((spot, spot - 9))
+
+        spot = (row * 8) + 7
+        edges.add((spot, spot - 9))
 
     return edges
 
@@ -163,15 +201,6 @@ def get_rook_neighbors(start_coordinates: Tuple[int, int]) -> set[Tuple[int, int
     return remove_invalid_coordinates(neighbors)
 
 
-def get_queen_neighbors(start_coordinates: Tuple[int, int]) -> set[Tuple[int, int]]:
-    """
-    Gets the list of all possible queen moves from this position.
-    :param start_coordinates: The coordinates that the queen starts on in the format [row, column].
-    :return: A lit of coordinates of where the queen could move from the start.
-    """
-    return get_bishop_neighbors(start_coordinates) | get_rook_neighbors(start_coordinates)
-
-
 def get_king_neighbors(start_coordinates: Tuple[int, int]) -> set[Tuple[int, int]]:
     """
     Gets the list of all possible king moves from this position.
@@ -188,41 +217,6 @@ def get_king_neighbors(start_coordinates: Tuple[int, int]) -> set[Tuple[int, int
                                         if not (row_offset == 0 and column_offset == 0)})
 
 
-def get_en_passant_edges() -> set[Tuple[int, int]]:
-    """
-    Gets the list of all possible en passant moves.
-    :return: A list of edges that show where all en passant moves may be possible.
-    """
-    def get_diagonal_left_and_right(start: int) -> set[Tuple[int, int]]:
-        """
-        Gets the en passant edges for a specific square
-        :param start: The index of the start square
-        :return: A list of all of the en passant edges stemming from the start square
-        """
-        # Determine if we're going toward rank 6 or rank 3
-        if start >= 32:
-            spot: int = start + 8
-        else:
-            spot: int = start - 8
-
-        # Add all of the (correct) edges to the list
-        piece_edges: set[Tuple[int, int]] = set()
-        for destination in [x for x in [spot + 1, spot - 1] if (x != 39 and x != 24)]:
-            piece_edges.add((start, destination))
-
-        return piece_edges
-
-    edges: set[Tuple[int, int]] = set()
-
-    # For every square on the fifth rank
-    for square in range(32, 39, 1): # (your perspective)
-        edges.update(get_diagonal_left_and_right(start=square))
-    for square in range(24, 31, 1): # (opponent's perspective)
-        edges.update(get_diagonal_left_and_right(start=square))
-
-    return edges
-
-
 def get_castling_edges(board_vector: List[float]) -> set[Tuple[int, int]]:
     """
     This is a helper function to add castling edges to the graph. It needs to be done after the blank graph has
@@ -232,7 +226,6 @@ def get_castling_edges(board_vector: List[float]) -> set[Tuple[int, int]]:
     :return: A list of edge pairs that show where castling may be possible.
     """
     edges: set[Tuple[int, int]] = set()
-
 
     for c in [1, -1]:
         # Find the square with the king
@@ -350,6 +343,21 @@ def visualize_graph(edge_index: torch.tensor, edge_type: torch.tensor, node_feat
     plt.show()
 
 
+#
+def perturb_graph():
+    # Randomly choose between 1 and X piece perturbations
+
+    # Randomly choose to either perturb by legal moves or proximal squares for each piece perturbation
+    # Randomly choose a magnitude for each piece perturbation
+    # (?) Randomly decide to either swap or take resulting square (?)
+
+    # Randomly step through each piece perturbation according to parameters
+
+    # Return perturbed graph
+
+    pass
+
+
 # ##### ##### ##### ##### #####
 #       Program Body
 
@@ -361,10 +369,11 @@ if __name__ == "__main__":
     #torch.save(computed_graph, 'blank_graph.pt')
 
     # Visualize the graph
-    visualize_graph(*computed_graph, selected_edge_types=[2])
+    visualize_graph(*computed_graph, selected_edge_types=[3])
 
-
-
+    # Pawn looks totally wrong
+    # Bishop looks close, but missing edges
+    # Rook looks close, but missing edges
 
 
 
