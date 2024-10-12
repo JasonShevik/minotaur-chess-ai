@@ -11,21 +11,23 @@ from typing import Dict, List
 
 # ##### ##### ##### ##### #####
 # Class
-class MinotaurPretrain(torch.nn.Module):
-    def __init__(self, in_channels: int = 1, hidden_channels: int = 32, out_channels: int = 4, num_edge_types: int = 7, num_heads: int = 4, dropout: float = 0.6):
-        super(MinotaurPretrain, self).__init__()
+class Minotaur(torch.nn.Module):
+    def __init__(self, in_channels: int = 13, hidden_channels: int = 16, out_channels: int = 4, num_heads: int = 4, dropout: float = 0.6):
+        super(Minotaur, self).__init__()
 
         # Prepare some values
         self.dropout: float = dropout
-        gat_hidden_num: int = hidden_channels * num_heads
-        linear_hidden_num: int = 128
         num_gat_layers: int = 3
         num_lin_layers: int = 10
+        gat_hidden_num: int = hidden_channels
+        linear_hidden_num: int = 256
+        num_edge_types: int = 6
 
         # Initialize the layer_list, and add the first GATConv layer
-        self.gat_layers: torch.nn.ModuleList = torch.nn.ModuleList([GATConv(in_channels, hidden_channels, heads=num_heads, edge_dim=num_edge_types, dropout=dropout)])
+        self.gat_layers: torch.nn.ModuleList = torch.nn.ModuleList([GATConv(in_channels, gat_hidden_num, heads=num_heads, edge_dim=num_edge_types, dropout=dropout)])
         # Add all of the subsequent GatConv layers
         for _ in range(num_gat_layers - 1):
+            gat_hidden_num = gat_hidden_num * num_heads
             self.gat_layers.append(GATConv(gat_hidden_num, gat_hidden_num, heads=num_heads, edge_dim=num_edge_types, dropout=dropout))
 
         # Initialize the linear_list, and add the first Linear layer
@@ -34,11 +36,11 @@ class MinotaurPretrain(torch.nn.Module):
         for _ in range(num_lin_layers - 1):
             self.linear_layers.append(torch.nn.Linear(linear_hidden_num, linear_hidden_num))
 
-        # PReLU layers (added PReLU activations for each layer)
+        # PReLU activations for each layer
         self.gat_prelu: torch.nn.ModuleList = torch.nn.ModuleList([torch.nn.PReLU() for _ in range(len(self.gat_layers))])
         self.linear_prelu: torch.nn.ModuleList = torch.nn.ModuleList([torch.nn.PReLU() for _ in range(len(self.linear_layers))])
 
-        # Add output layer
+        # Output layer
         self.output = torch.nn.Linear(linear_hidden_num, out_channels)
 
 
@@ -68,7 +70,7 @@ class MinotaurPretrain(torch.nn.Module):
 
     # -------------------------------------------------------------
     # This train method will probably have to be totally rewritten
-
+    """
     def train(self, position_vector_df, batch_size, stop_event):
         is_fork = multiprocessing.get_start_method() == "fork"
         device = (
@@ -138,10 +140,10 @@ class MinotaurPretrain(torch.nn.Module):
         # We've made predictions on one full batch
 
         pass
+    """
 
     def save(self) -> None:
         pass
-
 
 
 # ##### ##### ##### ##### #####
@@ -244,7 +246,6 @@ def _get_num_invalid_moves(fen: str, moves: List[str]) -> int:
 
 #
 def get_legal_moves_strings(fen: str) -> List[str]:
-    #
     return [board.parse_san(move).uci() for move in list(chess.Board(fen).legal_moves)]
 
 
