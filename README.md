@@ -14,7 +14,6 @@ This is a new chess AI that I am developing. It will have a innovative and uncon
    * Adversarial model
 
 ## In Progress:
-* Modify the labeling programs to interface with the SQLite database.
 * Finish chess graph code, including a function for adding the node feature vectors, and the visualizations.
 * Update the data prep file so each square is a vector rather than a scalar.
 * Update the architecture, start working on encoder.
