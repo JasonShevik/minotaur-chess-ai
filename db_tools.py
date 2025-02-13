@@ -1,13 +1,14 @@
 import pandas as pd
 import sqlite3
+import random
 from os.path import exists
-from typing import List, Callable
+from typing import List, Tuple, Callable
 
 
-def create_db(name: str) -> None:
+def create_db(db_name: str) -> None:
     # Connect to the database
-    conn = sqlite3.connect(f"{name}.db")
-    cursor = conn.cursor()
+    conn: sqlite3.Connection = sqlite3.connect(f"{db_name}.db")
+    cursor: sqlite3.Cursor = conn.cursor()
 
     # Create table with minor improvements
     cursor.execute('''
@@ -27,16 +28,16 @@ def create_db(name: str) -> None:
     conn.close()
 
 
-def add_positions(name: str, filepaths: List[str]) -> None:
+def add_positions(db_name: str, filepaths: List[str]) -> None:
     # Connect to the database
-    conn = sqlite3.connect(f"{name}.db")
-    cursor = conn.cursor()
+    conn: sqlite3.Connection = sqlite3.connect(f"{db_name}.db")
+    cursor: sqlite3.Cursor = conn.cursor()
 
     filepath: str
     for filepath in filepaths:
         print(f"Adding from {filepath}")
         with open(filepath, 'r') as f:
-            fen_list = [(line.strip(),) for line in f]
+            fen_list: List[Tuple[str]] = [(line.strip(),) for line in f]
 
         cursor.executemany('''
                 INSERT INTO "960_position_data" (fen, is_analyzed)
@@ -47,18 +48,18 @@ def add_positions(name: str, filepaths: List[str]) -> None:
     conn.close()
 
 
-def add_historical_labels(name: str, filepaths: List[str]) -> None:
+def add_historical_labels(db_name: str, filepaths: List[str]) -> None:
     # Connect to the database
-    conn = sqlite3.connect(f"{name}.db")
-    cursor = conn.cursor()
+    conn: sqlite3.Connection = sqlite3.connect(f"{db_name}.db")
+    cursor: sqlite3.Cursor = conn.cursor()
 
-    BATCH_SIZE = 1000  # Commit after a fixed number of updates
-    current_batch = 0
+    BATCH_SIZE: int = 1000  # Commit after a fixed number of updates
+    current_batch: int = 0
 
     filepath: str
     for filepath in filepaths:
         print(f"Labeling from {filepath}")
-        df = pd.read_csv(filepath)
+        df: pd.DataFrame = pd.read_csv(filepath)
 
         for index, (_, row) in enumerate(df.iterrows(), start=1):
             # Identify what engine version I was using based on past commits
@@ -80,12 +81,12 @@ def add_historical_labels(name: str, filepaths: List[str]) -> None:
             elif "results_part_5_stockfish" in filepath:
                 engine_name = "Stockfish 16.1"
 
-            fen = row["Position"]
-            is_analyzed = 1
-            depth = 25 if "results_part_5_stockfish" in filepath else row["Depth"]
-            score = str(row["Score"])
-            is_forced_checkmate = 1 if "#" in score else 0
-            best_move = str(row["Move"])
+            fen: str = row["Position"]
+            is_analyzed: int = 1
+            depth: int = 25 if "results_part_5_stockfish" in filepath else row["Depth"]
+            score: str = str(row["Score"])
+            is_forced_checkmate: int = 1 if "#" in score else 0
+            best_move: str = str(row["Move"])
 
             # Update the database
             cursor.execute('''
@@ -114,10 +115,10 @@ def add_historical_labels(name: str, filepaths: List[str]) -> None:
     conn.close()
 
 
-def check_db(name: str) -> None:
+def check_db(db_name: str) -> None:
     # Connect to the database
-    conn = sqlite3.connect(f"{name}.db")
-    cursor = conn.cursor()
+    conn: sqlite3.Connection = sqlite3.connect(f"{db_name}.db")
+    cursor: sqlite3.Cursor = conn.cursor()
 
     print("=== Random Analyzed Positions ===")
     cursor.execute('''
@@ -182,8 +183,8 @@ def check_db(name: str) -> None:
 
 def export_analyzed_positions(source_db: str, target_db: str) -> None:
     # Connect to the target database
-    target_conn = sqlite3.connect(f"{target_db}.db")
-    target_cursor = target_conn.cursor()
+    target_conn: sqlite3.Connection = sqlite3.connect(f"{target_db}.db")
+    target_cursor: sqlite3.Cursor = target_conn.cursor()
 
     # Create the same table structure in the target database
     target_cursor.execute('''
@@ -220,8 +221,26 @@ def export_analyzed_positions(source_db: str, target_db: str) -> None:
     target_conn.close()
 
 
+def get_slices(db_name: str, num_slices: int) -> List[List[str]]:
+    # Connect to the database
+    with sqlite3.connect(f"{db_name}.db") as conn:
+        cursor: sqlite3.Cursor = conn.cursor()
+        cursor.execute('''
+            SELECT fen FROM "960_position_data"
+            WHERE is_analyzed = 0
+        ''')
+        fen_list: List[str] = [fen[0] for fen in cursor.fetchall()]
+
+    random.shuffle(fen_list)
+    slice_length = len(fen_list) // num_slices
+
+    return [fen_list[ i * slice_length : (i+1) * slice_length] for i in range(num_slices)]
+
+
 # Program Body
 if __name__ == "__main__":
+    check_db("minotaur_data")
+
     # Old: Used to create the database and add labels
     #db_name = "minotaur_data"
     #print("Creating...")

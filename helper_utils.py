@@ -1,21 +1,13 @@
+import threading
 import chess.engine
 import chess
 import itertools
+import sqlite3
+import queue
+import time
 import csv
 import os
 from typing import List, Tuple, Dict, Any, Callable
-
-
-# An interface for the Minotaur classes to conform to
-class TrainingPhaseInterface:
-    def forward(self) -> None:
-        pass
-
-    def train(self) -> None:
-        pass
-
-    def save(self) -> None:
-        pass
 
 
 # This function creates and returns a chess engine object according to the configuration settings
@@ -33,129 +25,123 @@ def initialize_engine(which_engine: str, configure_options: Dict[str, Any]) -> c
     return this_engine
 
 
-# This function opens the progress file (which has the lookup info) and the positions file (the key for row value)
-def process_progress_file(progress_filepath: str, positions_filepath: str) -> Tuple[Dict[str, int], int]:
-    progress_dict: Dict[str, int] = {}
+# Function to write analysis results to the database
+def db_writer_loop(db_name: str, write_queue: queue.Queue, thread_list: List[threading.Thread]) -> None:
+    """
+    A function to indefinitely write updates to the database as they are added to a queue for thread safety.
 
-    # Check for a progress file
-    if os.path.exists(progress_filepath):
-        # Open the progress file we found
-        with open(progress_filepath, "r") as progress_file:
-            progress_reader = csv.reader(progress_file)
-            # Skip the header row
-            next(progress_reader, None)
+    :param db_name: The filename of the database to write to
+    :param write_queue: The queue object that the analysis thread(s) are adding to. This function updates the database
+        as entries get added to the queue
+    :param thread_list: A list of the analysis threads. This writer only keeps writing while those threads are alive
+    """
+    # Connect to the database
+    with sqlite3.connect(f"{db_name}.db") as conn:
+        cursor: sqlite3.Cursor = conn.cursor()
 
-            # Read every row of the progress file into a dictionary
-            row: List[str, int]
-            for row in progress_reader:
-                progress_dict[row[0]] = int(row[1])
+        count: int = 0
+        # Will only terminate when both stop_event is set, and when write_queue is empty
+        # If something is added to queue after stop event due to race condition, this will still write everything
+        while any(thread.is_alive() for thread in thread_list) or not write_queue.empty():
+            try:
+                # Get the next item in the queue
+                # Timeout is necessary because if stop_event happens while waiting for get, the thread will hang forever
+                data = write_queue.get(timeout=5)
 
-            # Check if the progress file included the positions_filepath
-            if positions_filepath in progress_dict:
-                # Find the starting row that corresponds to the positions_filepath file for analysis
-                current_row = progress_dict[positions_filepath] - 1
-            else:
-                # Create an empty line for this positions_filepath file
-                progress_file.write(f"{positions_filepath},0\n")
+                # Get the info object first, because it is used to derive the variables to write
+                info: Dict[str, Any] = data[0]
 
-                # Add this positions file to the dictionary
-                progress_dict[positions_filepath] = 0
-                # Set the starting row for the positions_filepath file for analysis
-                current_row = -1
-    else:
-        # Create a new progress file
-        with open(progress_filepath, "a") as progress_file:
-            # Write the header
-            progress_file.write("File,Row\n")
-            # Make note that we have made no progress yet on our current file
-            progress_file.write(f"{positions_filepath},0\n")
+                # Assign each of the variables that will be updated, using data from the queue
+                engine_name: str = data[2]
+                depth: int = int(info.get("depth"))
+                score: str = str(info.get("score").pov(True))
+                is_forced_checkmate: int = 1 if "#" in score else 0
+                best_move: str = str(info.get("pv")[0])
+                fen: str = data[1]
 
-            # Add this positions file to the dictionary
-            progress_dict[positions_filepath] = 0
-            # Set the starting row for the positions_filepath file for analysis.
-            current_row = -1
+                cursor.execute('''
+                                UPDATE "960_position_data" 
+                                SET is_analyzed = 1, 
+                                    engine_name = ?, 
+                                    depth = ?, 
+                                    score = ?, 
+                                    is_forced_checkmate = ?, 
+                                    best_move = ?
+                                WHERE fen = ?
+                                ''',
+                               (engine_name, depth, score, is_forced_checkmate, best_move, fen))
+                conn.commit()
+                count += 1
+                print(f"Wrote: {count}")
 
-    return progress_dict, current_row
+            # If it times out, just continue
+            # Continuing allows us to check for stop_event.is_set() on the next loop to see if we should stop or not
+            except queue.Empty:
+                pass
+
+    print("Writer done!")
 
 
 # A configurable function to continuously analyze positions
-def engine_loop(engine: chess.engine.SimpleEngine, functions_dict: Dict[str, Callable], data_dict: Dict[str, Any]) -> None:
+def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], name: str, data_dict: Dict[str, Any],
+                stop_event: threading.Event, stop_conditions: Callable, write_queue: queue.Queue) -> None:
     """
-    This is a flexible function to continuously analyze positions with user-specified conditions.
+    A customizable function that continuously analyzes chess positions until a user-specified stop condition is met
+    depending on the specific application.
 
-    :param engine: The chess.engine object that conducts the analysis.
-    :param functions_dict:
-        A dictionary with values that are higher-order functions which this function uses.
-
-        Required functions:
-        Stop: A function that returns True if the engine_loop should stop and False if it should continue.
-        Output: A function that saves the results of the analysis.
-    :param data_dict:
-        A dictionary containing data used by either this function or those in the functions_dict.
-        User can optionally store additional information in this dictionary from within the functions_dict functions.
-
-        User created:
-        Name: The name of the engine. Used by functions_dict functions.
-        Source: The filepath of the source file (the file containing the FEN codes to analyze).
-        Row: The row to start on from the source file.
-
-        Breaks: Not required, but can be used by the Stop function to determine what depth to break at
-
-        Function created:
-        Nodes: Number of nodes explored.
-        Threshold Index: The index for which depth threshold to use in the optional Breaks value.
-            This function only initializes the index. The Stop function may be required to maintain it.
+    :param engine: The chess engine object
+    :param position_list: The list of chess positions that this function will loop through to analyze
+    :param name: The name and version of the chess engine analyzing positions
+    :param data_dict: The breakdowns of what depth to analyze to based on the score of the position
+    :param stop_event: A threading event that, when set to true, indicates that the loop should wrap up and finish
+    :param stop_conditions: A function that checks whether the engine should stop its current analysis or continue
+        - info: The dictionary with analysis statistics
+        - data_dict: A dictionary that holds any data needed for the specific stop_conditions implementation
+    :param write_queue: A queue object which this thread adds to for a writer thread to utilize for writing results
     """
+    count: int = 0
 
-    with open(data_dict["Source"], "r") as source_file:
-        # Loop through each position in the source file starting at the current row
-        position: str
-        for position in itertools.islice(source_file, data_dict["Row"], None):
-            if not data_dict["Stop"].is_set():
+    # Loop through each position in the source file starting at the current row
+    position: str
+    for position in position_list:
+        if not stop_event.is_set():
+            # Print the progress
+            count += 1
+            print(f"{name}: {count}")
 
-                # Update the row number and give the user an update
-                data_dict["Row"] += 1
-                print(f"{data_dict["Name"]}: {data_dict["Row"]}")
+            # Parse the position and make an object
+            board: chess.Board = chess.Board(position)
 
-                # Parse the position and make an object
-                board: chess.Board = chess.Board(position)
+            # Begin the analysis of this board position
+            analysis: chess.engine.SimpleAnalysisResult
 
-                # Set the index that we use with data_dict["Breaks"] to determine depth based on a score threshold
-                data_dict["Threshold Index"] = 0
+            # Start the analysis
+            with engine.analysis(board) as analysis:
+                # Analyze continuously, depth by depth, until we meet a break condition
+                info: Dict[str, Any]
+                for info in analysis:
+                    # Get the current depth
+                    depth: int = info.get("depth")
+                    if depth is None:
+                        continue
 
-                # Begin the analysis of this board position
-                analysis: chess.engine.SimpleAnalysisResult
-                with engine.analysis(board) as analysis:
-                    # Number of nodes explored is 0 at the start of the analysis
-                    data_dict["Nodes"] = 0
-                    # Analyze continuously, depth by depth, until we meet a break condition
-                    info: Dict[str, Any]
-                    for info in analysis:
-                        # Get the current depth
-                        depth: int = info.get("depth")
-                        if depth is None:
-                            continue
+                    # Get the current score
+                    score: chess.engine.Score = info.get("score")
+                    # Score can be None when Stockfish looks at sidelines - Skip those iterations
+                    if score is None:
+                        continue
 
-                        # Get the current score
-                        score: chess.engine.Score = info.get("score")
-                        # Score can be None when Stockfish looks at sidelines - Skip those iterations
-                        if score is None:
-                            continue
+                    # If the user-specified stop conditions are met
+                    if stop_conditions(info, data_dict):
+                        # Add to queue
+                        write_queue.put([info, position, name])
+                        break
 
-                        # If the user-specified stop conditions are met
-                        if functions_dict["Stop"](info, data_dict):
-                            # Save the results and clean up the environment
-                            functions_dict["Output"](position, info, data_dict)
-                            break
-
-                        # Update the number of explored nodes
-                        data_dict["Nodes"] = info.get("nodes")
-
-            # If the stop_event was set
-            else:
-                engine.quit()
-                print(f"{data_dict["Name"]} done!")
-                break
+        # If the stop_event was set
+        else:
+            engine.quit()
+            print(f"{name} done!")
+            break
 
 
 
