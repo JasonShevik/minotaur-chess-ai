@@ -83,7 +83,7 @@ def db_writer_loop(db_name: str, write_queue: queue.Queue, thread_list: List[thr
 
 
 # A configurable function to continuously analyze positions
-def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], name: str, data_dict: Dict[str, Any],
+def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], data_dict: Dict[str, Any],
                 stop_event: threading.Event, stop_conditions: Callable, write_queue: queue.Queue) -> None:
     """
     A customizable function that continuously analyzes chess positions until a user-specified stop condition is met
@@ -91,12 +91,12 @@ def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], nam
 
     :param engine: The chess engine object
     :param position_list: The list of chess positions that this function will loop through to analyze
-    :param name: The name and version of the chess engine analyzing positions
     :param data_dict: The breakdowns of what depth to analyze to based on the score of the position
     :param stop_event: A threading event that, when set to true, indicates that the loop should wrap up and finish
     :param stop_conditions: A function that checks whether the engine should stop its current analysis or continue
         - info: The dictionary with analysis statistics
         - data_dict: A dictionary that holds any data needed for the specific stop_conditions implementation
+        - returns: A Tuple of two booleans that say whether it should_stop and should_write the result
     :param write_queue: A queue object which this thread adds to for a writer thread to utilize for writing results
     """
     count: int = 0
@@ -107,7 +107,7 @@ def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], nam
         if not stop_event.is_set():
             # Print the progress
             count += 1
-            print(f"{name}: {count}")
+            print(f"{data_dict["Name"]}: {count}")
 
             # Parse the position and make an object
             board: chess.Board = chess.Board(position)
@@ -132,15 +132,17 @@ def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], nam
                         continue
 
                     # If the user-specified stop conditions are met
-                    if stop_conditions(info, data_dict):
-                        # Add to queue
-                        write_queue.put([info, position, name])
+                    should_stop, should_write = stop_conditions(info, data_dict)
+                    if should_stop:
+                        if should_write:
+                            # Add to queue
+                            write_queue.put([info, position, data_dict["Name"]])
                         break
 
         # If the stop_event was set
         else:
             engine.quit()
-            print(f"{name} done!")
+            print(f"{data_dict["Name"]} done!")
             break
 
 

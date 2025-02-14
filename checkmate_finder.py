@@ -1,72 +1,95 @@
 import chess.engine
 import chess
 import helper_utils as hu
+import db_tools as dbt
 import threading
 import keyboard
 import logging
+import queue
 import csv
-from typing import Dict, Any
+from typing import Dict, Tuple, Any
 
 
 # ---------- ---------- ----------
 #   Collect initial positions
 
-def finder_stop_conditions(info: Dict[str, Any], data_dict: Dict[str, Any]) -> bool:
+def stop_conditions(info: Dict[str, Any], data_dict: Dict[str, Any]) -> Tuple[bool, bool]:
     # Get the important stuff from info
     depth: int = info.get("depth")
     score: str = str(info.get('score').pov(True))
 
-    # By default, we assume the position is not a checkmate.
-    data_dict["is_checkmate"] = False
-
     # Check to see if there is a forced checkmate
     if "#" in score:
-        # Make a note that this is a checkmate so that when we get to the write_results function, we'll know
-        data_dict["is_checkmate"] = True
-        # Tell the engine_loop to stop
-        return True
+        # Stop and write
+        return True, True
+
+    # Set the thresholds for how deep to look for checkmates depending on the engine
+    if "leela" in data_dict["Name"].lower():
+        first_thresh = 6
+        second_thresh = 8
+    elif "stockfish" in data_dict["Name"].lower():
+        first_thresh = 15
+        second_thresh = 25
+    else:
+        first_thresh = 15
+        second_thresh = 25
 
     # If we haven't explored any new nodes, then we're not making progress and should stop
     if data_dict["Nodes"] >= info.get("nodes"):
-        return True
+        # Stop and write
+        # Even though it's not a checkmate, this should be maximally analyzed and therefore worth writing
+        return True, True
     # We're making progress, but...
     # If we haven't reached a depth of 15 yet, then lets keep analyzing
-    elif depth < 15:
-        return False
+    elif depth < first_thresh:
+        # Don't stop, don't write
+        return False, False
     # If we've reached a depth of 15, then lets check if it's worth continuing
-    elif 15 <= depth < 25:
+    elif first_thresh <= depth < second_thresh:
         # Retrieve the absolute value of the score
-        score:int  = abs(int(score))
+        score: int = abs(int(score))
+
         # If a side is winning by more than this much, then it's worth continuing
         if score >= 300:
-            return False
+            # Don't stop, don't write
+            return False, False
         # Otherwise, lets stop
         else:
-            return True
+            # Stop but don't write
+            return True, False
     # If we're at depth 25, and it's not a forced checkmate, then lets stop
     else:
-        return True
+        # Stop but don't write
+        return True, False
 
 
-def finder_write_results(position: str, info: Dict[str, Any], data_dict: Dict[str, Any]) -> None:
-    if data_dict["is_checkmate"]:
-        with open(data_dict["Output Path"], "a") as output_file:
-            # FEN, Score, Best Move
-            output_file.write(f"{position.rstrip()},{str(info.get('score').pov(True))},{info.get("pv")[0]}\n")
+# ----- -----
+# Stockfish
 
-    # Update our progress. We're adding to the counter associated with this source file.
-    data_dict["Progress Dict"][data_dict["Source"]] += 1
+# Initialize and configure the engine
+stockfish_config = {"Threads": 4,
+                    "Hash": 20000}
 
-    # Create a new progress file to save our new progress
-    with open(data_dict["Progress Path"], "w") as new_progress_file:
-        # Write the header of the new progress file
-        new_progress_file.write("File,Row\n")
+stockfish_dict = {"Nodes": 0,
+                  "Name": "Stockfish 17"}
 
-        # Iterate over the keys in the progress dictionary
-        for key in data_dict["Progress Dict"]:
-            # Write the current dictionary entry to the new progress file
-            new_progress_file.write(f"{key},{data_dict["Progress Dict"][key]}\n")
+# ----- -----
+# Leela
 
+# Initialize and configure the engine
+leela_config = {"Threads": 2,
+                "NNCacheSize": 1000000,
+                "MinibatchSize": 1024,
+                #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
+                "RamLimitMb": 20000}
+
+leela_dict = {"Nodes": 0,
+              "Name": "Leela 0.31.1"}
+
+# ----- ----- -----
+
+stockfish_yes = True
+leela_yes = True
 
 # Start the log
 logging.basicConfig(filename="checkmate_finder_log.log",
@@ -76,46 +99,27 @@ logging.basicConfig(filename="checkmate_finder_log.log",
 # Create a stop event object, so that we can end the analysis on demand
 stop_event = threading.Event()
 
-# Initialize and configure the engine
-stockfish_config = {"Threads": 2,
-                    "Hash": 40000,
-                    "UCI_Elo": 3190}
-
 # Initialize the engine using the helper function
-stockfish_engine = hu.initialize_engine("stockfish", stockfish_config)
+stockfish_engine = hu.initialize_engine("stockfish", stockfish_config) if stockfish_yes else None
+leela_engine = hu.initialize_engine("leela", leela_config) if leela_yes else None
 
-# ---------- ---------- ----------
-# This implements the finding stuff
+position_lists = dbt.get_slices(db_name="minotaur_data", num_slices=2)
 
-# Initialize the relevant filepaths
-progress_filepath: str = "training-supervised-checkmates/progress_part_5_stockfish.csv"
-output_filepath: str = "training-supervised-checkmates/results_part_5_stockfish.csv"
-data_filepath: str = "lichess-positions/lichess_positions_part_5.txt"
+write_queue = queue.Queue()
 
-# Process the files to find our current progress
-progress_dict: Dict[str, int]
-current_row: int
-[progress_dict, current_row] = hu.process_progress_file(progress_filepath, data_filepath)
+# Create the threads
+stockfish_thread = threading.Thread(target=hu.engine_loop, args=(stockfish_engine, position_lists[0], stockfish_dict, stop_event, stop_conditions, write_queue)) if stockfish_yes else None
+leela_thread = threading.Thread(target=hu.engine_loop, args=(leela_engine, position_lists[1], leela_dict, stop_event, stop_conditions, write_queue)) if leela_yes else None
 
-# Initialize all of the wrapped up data that will go to the engine_loop
-stockfish_dict = {"Name": "Stockfish",
-                  "Source": data_filepath,
-                  "Row": current_row,
-                  "Stop": stop_event,
+thread_list = []
+thread_list.append(stockfish_thread) if stockfish_yes else None
+thread_list.append(leela_thread) if leela_yes else None
+writer_thread = threading.Thread(target=hu.db_writer_loop, args=("minotaur_data", write_queue, thread_list))
 
-                  "Progress Dict": progress_dict,
-                  "Progress Path": progress_filepath,
-                  "Output Path": output_filepath}
-
-# These are the finder
-functions_dict = {"Stop": finder_stop_conditions,
-                  "Output": finder_write_results}
-
-# Create the thread
-checkmate_thread = threading.Thread(target=hu.engine_loop, args=(stockfish_engine, functions_dict, stockfish_dict))
-
-# Start the thread
-checkmate_thread.start()
+# Start the threads
+stockfish_thread.start() if stockfish_yes else None
+leela_thread.start() if leela_yes else None
+writer_thread.start()
 
 # Wait for the user to press the key
 keyboard.wait("q")
@@ -127,8 +131,16 @@ print()
 print("Stop key detected!")
 print("Finishing final calculations...\n")
 
-checkmate_thread.join()
-stockfish_engine.quit()
+# Join the threads
+stockfish_thread.join() if stockfish_yes else None
+leela_thread.join() if leela_yes else None
+writer_thread.join()
+
+print(dbt.check_db("minotaur_data"))
+
+# Quit the engines
+stockfish_engine.quit() if stockfish_yes else None
+leela_engine.quit() if leela_yes else None
 
 
 

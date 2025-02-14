@@ -11,7 +11,7 @@ from typing import List, Tuple, Callable, Dict, Any
 
 
 # A function that returns True if the engine_loop should stop and False if it should continue.
-def stop_conditions(info: Dict[str, Any], data_dict: Dict[str, Any]) -> bool:
+def stop_conditions(info: Dict[str, Any], data_dict: Dict[str, Any]) -> Tuple[bool, bool]:
     # Get the important stuff from info
     depth: int = info.get("depth")
     score: str = str(info.get('score').pov(True))
@@ -20,12 +20,12 @@ def stop_conditions(info: Dict[str, Any], data_dict: Dict[str, Any]) -> bool:
     if "#" in score:
         data_dict["Threshold Index"] = 0
         data_dict["Nodes"] = 0
-        return True
+        return True, True
     # If we haven't explored any new nodes, then we're not making progress and should stop
     if data_dict["Nodes"] >= info.get("nodes"):
         data_dict["Threshold Index"] = 0
         data_dict["Nodes"] = 0
-        return True
+        return True, True
 
     # Retrieve the absolute value of the score
     score: int = abs(int(score))
@@ -36,13 +36,13 @@ def stop_conditions(info: Dict[str, Any], data_dict: Dict[str, Any]) -> bool:
         if score > data_dict["Breaks"][data_dict["Threshold Index"]][1]:
             data_dict["Threshold Index"] = 0
             data_dict["Nodes"] = 0
-            return True
+            return True, True
         else:
             # The evaluation is close enough that we want to analyze deeper
             data_dict["Threshold Index"] += 1
 
     data_dict["Nodes"] = info.get("nodes")
-    return False
+    return False, False
 
 
 # ----- -----
@@ -60,7 +60,8 @@ stockfish_breaks = [[20, 400],
 stockfish_config = {"Threads": 4,
                     "Hash": 20000}
 
-stockfish_dict = {"Breaks": stockfish_breaks,
+stockfish_dict = {"Name": "Stockfish 17",
+                  "Breaks": stockfish_breaks,
                   "Threshold Index": 0,
                   "Nodes": 0}
 
@@ -78,7 +79,8 @@ leela_config = {"Threads": 2,
                 #"WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
                 "RamLimitMb": 20000}
 
-leela_dict = {"Breaks": leela_breaks,
+leela_dict = {"Name": "Leela 0.31.1",
+              "Breaks": leela_breaks,
               "Threshold Index": 0,
               "Nodes": 0}
 # ----- ----- -----
@@ -102,8 +104,8 @@ position_lists = dbt.get_slices(db_name="minotaur_data", num_slices=2)
 write_queue = queue.Queue()
 
 # Create the threads
-stockfish_thread = threading.Thread(target=hu.engine_loop, args=(stockfish_engine, position_lists[0], "Stockfish 17", stockfish_dict, stop_event, stop_conditions, write_queue)) if stockfish_yes else None
-leela_thread = threading.Thread(target=hu.engine_loop, args=(leela_engine, position_lists[1], "Leela 0.31.1", leela_dict, stop_event, stop_conditions, write_queue)) if leela_yes else None
+stockfish_thread = threading.Thread(target=hu.engine_loop, args=(stockfish_engine, position_lists[0], stockfish_dict, stop_event, stop_conditions, write_queue)) if stockfish_yes else None
+leela_thread = threading.Thread(target=hu.engine_loop, args=(leela_engine, position_lists[1], leela_dict, stop_event, stop_conditions, write_queue)) if leela_yes else None
 
 thread_list = []
 thread_list.append(stockfish_thread) if stockfish_yes else None
@@ -118,8 +120,6 @@ writer_thread.start()
 
 # Wait for the user to press the key
 keyboard.wait("q")
-
-print(write_queue.qsize())
 
 # Indicate that the stop condition has been met, so the engine loop should finish up
 stop_event.set()
