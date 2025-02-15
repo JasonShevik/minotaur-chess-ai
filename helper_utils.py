@@ -13,7 +13,7 @@ from typing import List, Tuple, Dict, Any, Callable
 # This function creates and returns a chess engine object according to the configuration settings
 def initialize_engine(which_engine: str, configure_options: Dict[str, Any]) -> chess.engine.SimpleEngine:
     if which_engine == "leela":
-        engine_dir: str = "lc0-v0.31.1-windows-gpu-nvidia-cuda/lc0.exe"
+        engine_dir: str = "lc0-v0.31.2-windows-gpu-nvidia-cuda/lc0.exe"
     elif which_engine == "stockfish":
         engine_dir: str = "stockfish/stockfish-windows-x86-64-avx2.exe"
     else:
@@ -109,6 +109,9 @@ def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], dat
             count += 1
             print(f"{data_dict["Name"]}: {count}")
 
+            # No nodes have been visited yet
+            data_dict["Nodes"] = 0
+
             # Parse the position and make an object
             board: chess.Board = chess.Board(position)
 
@@ -138,6 +141,9 @@ def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], dat
                             # Add to queue
                             write_queue.put([info, position, data_dict["Name"]])
                         break
+
+                    # Update the number of explored nodes
+                    data_dict["Nodes"] = info.get("nodes")
 
         # If the stop_event was set
         else:
