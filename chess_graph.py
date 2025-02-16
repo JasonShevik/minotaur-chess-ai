@@ -8,67 +8,73 @@ from torch_geometric.data import Data
 from typing import List, Tuple, Callable
 
 
-def create_blank_chess_graph() -> Tuple[torch.tensor, torch.tensor, torch.tensor]:
+def create_blank_chess_graphs() -> List[Tuple[torch.tensor, torch.tensor]]:
     """
-    Used to create a graph of a chess board that shows where moves may be possible not including piece locations.
-    :return: A tuple of edge_index and edge_type which are used to create a homogenous graph in PyTorch Geometric.
+
+    :return: List of tuples of tensors, which are a tensor for all of the edges for that lists type, and a tensor
+     to contain the blank node features
     """
-    # This list defines the connections that exist
-    edges_list: set[Tuple[int, int]] = set()
-    # This list defines the type that each connection in edges_list is
-    edge_types_list: List[int] = []
 
     # This holds all of the different information for each piece type
     # A function that returns a list for edges_list, and the corresponding value for edge_types_list
-    pieces_list: List[Tuple[Callable[[Tuple[int, int]],
-                                      set[Tuple[int, int]]],
-                            Tuple[int, int],
-                            int]] = [
-        (get_pawn_move_edges,   (1, 0),  0),
-        (get_pawn_attack_edges, (1, 0),  1),
-        (get_knight_neighbors,  (0, 0),  2),
-        (get_bishop_neighbors,  (0, 1),  3),  # Dark and light bishops have same connection type.
-        (get_bishop_neighbors,  (0, 0),  3),  # No dark or light squares will be connected to each other, though.
-        (get_rook_neighbors,    (0, 0),  4),
-        (get_king_neighbors,    (0, 0),  5)
+    pieces_list: List[Callable[Tuple[int, int],
+                                     set[Tuple[int, int]]]] = [
+        get_knight_neighbors,
+        get_bishop_neighbors,
+        get_rook_neighbors,
+        get_king_neighbors
     ]
 
+    # A list of lists of pairwise edges between chessboard squares 0 through 63
+    edges_list: List[set[Tuple[int, int]]] = [get_pawn_move_edges(),    # 0 Pawn move
+                                              get_pawn_attack_edges(),  # 1 Pawn attack
+                                              (),                       # 2 Knight move
+                                              (),                       # 3 Bishop move
+                                              (),                       # 4 Rook move
+                                              (),                       # 5 King move
+                                              (),                       # 6 Queen move
+                                              ()]                       # 7 Castle
+
+    edges_index: int = 2
     # Go through the structure, calling each piece function and updating edges_list and edge_types_list
-    for neighbor_function, start_square, piece_type in pieces_list:
-        # Pawn edges are hard coded and don't use DFS
-        if piece_type == 0:
-            new_edges: set[Tuple[int, int]] = get_pawn_move_edges()
-        elif piece_type == 1:
-            new_edges: set[Tuple[int, int]] = get_pawn_attack_edges()
-        else:
-            # Get the list of new edges that are specific to this piece_type
-            new_edges: set[Tuple[int, int]] = depth_first_recursive(visited=[False for _ in range(64)],
-                                                                    current_coordinates=start_square,
-                                                                    edges=set(),
-                                                                    get_neighbors=neighbor_function)
+    for neighbor_function in pieces_list:
+        # Get the list of new edges that are specific to this piece_type
+        edges_list[edges_index] = depth_first_recursive(visited=[False for _ in range(64)],
+                                                        current_coordinates=(0, 0),
+                                                        edges=set(),
+                                                        get_neighbors=neighbor_function)
+        # If this is the bishop, we need to perform another search for the light squares
+        if edges_index == 3:
+            edges_list[edges_index].update(depth_first_recursive(visited=[False for _ in range(64)],
+                                                                 current_coordinates=(0, 1),
+                                                                 edges=set(),
+                                                                 get_neighbors=neighbor_function))
+        edges_index += 1
 
-        # Extend the edges_list to contain all of the newly gotten edges
-        new_edges = set(t + (piece_type,) for t in new_edges)
-        edges_list.update(new_edges)
-        # Extend the edge_types_list to tell us the piece_type for all the new edges that were just added
-        edge_types_list.extend([piece_type] * len(new_edges))
+    # Queen move edges are the union of bishop and rook moves
+    edges_list[6] = edges_list[3].union(edges_list[4])
 
-    x_list: List[int] = []
-    y_list: List[int] = []
-    z_list: List[int] = []
-    for x, y, z in edges_list:
-        x_list.append(x)
-        y_list.append(y)
-        z_list.append(z)
+    # Don't add any castling edges because their existence depends on the position
 
-    edge_index = torch.tensor(data=[x_list, y_list], dtype=torch.long)
-    edge_type = torch.tensor(data=z_list, dtype=torch.long)
-    node_features = torch.tensor([0 for _ in range(64)], dtype=torch.float)
+    # This will be the return
+    # List of tuples of tensors, which are the edges tensor and blank node features tensors
+    empty_graphs: List[Tuple[torch.tensor, torch.tensor]] = [(0, 0) for _ in range(len(edges_list))]
 
-    # The blank chess graph will not include castling because that depends on the square that the king starts on.
-    # A helper function get_castling_edges() should be called after adding piece placement to the graph.
+    # Create the empty node features tensor: 64x13
+    node_features = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] for _ in range(64)], dtype=torch.float)
 
-    return edge_index, edge_type, node_features
+    # Convert the pairwise edges to two lists for source and destination for compatibility with pytorch
+    for index, this_type_edges in enumerate(edges_list):
+        x_list: List[int] = []
+        y_list: List[int] = []
+        for x, y in this_type_edges:
+            x_list.append(x)
+            y_list.append(y)
+
+        # Set this graph tuple
+        empty_graphs[index] = (torch.tensor(data=[x_list, y_list], dtype=torch.long), node_features)
+
+    return empty_graphs
 
 
 # ##### ##### ##### ##### #####
@@ -77,28 +83,29 @@ def create_blank_chess_graph() -> Tuple[torch.tensor, torch.tensor, torch.tensor
 def get_pawn_move_edges() -> set[Tuple[int, int]]:
     """
     Deterministically find all paths where pawns can move.
-    :return: A list of edges that show where all pawn moves may be possible.
+    :return: A list of edges (tuples of start and end squares) that show where all pawn moves may be possible.
     """
-    def add_column(col_num: int) -> set[Tuple[int, int]]:
-        # Can move 2 squares on first move
-        # Front and back perspective
-        pawn_column: set[Tuple[int, int]] = {(col_num + (8 * 1), col_num + (8 * 3)),
-                                             (col_num + (8 * 6), col_num + (8 * 4))}
+    # Create the empty set of edges
+    pawn_edges: set[Tuple[int, int]] = set()
 
-        # All single square moves
-        for row_num in range(1, 7, 1):  # From the front perspective
-            pawn_column.add((col_num + (8 * row_num), col_num + (8 * (row_num + 1))))
-        for row_num in range(6, 0, -1):  # From the back perspective
-            pawn_column.add((col_num + (8 * row_num), col_num + (8 * (row_num - 1))))
+    # Light square 2 square moves
+    pawn_edges.update([(x, x + 16) for x in range(8, 16)])
+    # Dark square 2 square moves
+    pawn_edges.update([(x, x - 16) for x in range(48, 56)])
 
-        return pawn_column
+    # Light square 1 square moves
+    for row_start in range(8, 49, 8):
+        for column_offset in range(0, 8):
+            origin_square = row_start + column_offset
+            pawn_edges.update([(origin_square, origin_square + 8)])
 
-    # Go through A through H for both sides.
-    edges: set[Tuple[int, int]] = set()
-    for column in range(8):
-        edges.update(add_column(column))
+    # Dark square 1 square moves
+    for row_start in range(48, 7, -8):
+        for column_offset in range(0, 8):
+            origin_square = row_start + column_offset
+            pawn_edges.update([(origin_square, origin_square - 8)])
 
-    return edges
+    return pawn_edges
 
 
 def get_pawn_attack_edges() -> set[Tuple[int, int]]:
@@ -106,6 +113,8 @@ def get_pawn_attack_edges() -> set[Tuple[int, int]]:
 
     :return:
     """
+    # Go through A through H for both sides.
+    edges: set[Tuple[int, int]] = set()
     # Front perspective
     spot: int
     row: int
@@ -223,7 +232,7 @@ def get_castling_edges(board_vector: List[float]) -> set[Tuple[int, int]]:
     been made and after the piece placement has been decided
     :param board_vector: A vector with values -6.3 to 6.3 representing the pieces on the board, plus
     castling and en passant.
-    :return: A list of edge pairs that show where castling may be possible.
+    :return: A list of edge pairs that show where castling may be possible. (king g1,g8,c1,c8 and rook f1,f8,d1,d8)
     """
     edges: set[Tuple[int, int]] = set()
 
@@ -306,40 +315,27 @@ def depth_first_recursive(visited: List[bool],
 # ##### ##### ##### ##### #####
 #       Helper functions
 
-def visualize_graph(edge_index: torch.tensor, edge_type: torch.tensor, node_features: torch.tensor, selected_edge_types: List[int] = None):
-    board_dict: Dict[int, Tuple[int, int]] = {i: (i % 8, i // 8) for i in range(64)}
+def visualize_graph(tensor):
+    # Extract edges from the tensor
+    x_list, y_list = tensor.tolist()
 
-    # Create a graph
-    g: nx.DiGraph = nx.DiGraph()
+    # Create a directed graph
+    G = nx.DiGraph()
 
-    # Add the nodes
-    for i in range(64):
-        g.add_node(i, feature=node_features[i])
-    # Add the edges
-    for i in range(edge_index.shape[1]):
-        src, dst = edge_index[:, i].tolist()  # Convert to list for indexing
-        g.add_edge(src, dst, edge_type=edge_type[i].item())  # Use .item() for scalar tensor
+    # Define positions for 8x8 grid
+    pos = {i: (i % 8, i // 8) for i in range(64)}
 
-    # Draw nodes
-    nx.draw_networkx_nodes(g, board_dict, node_color='lightblue', node_size=500)
-    nx.draw_networkx_labels(g, board_dict, {i: str(i) for i in range(len(node_features))})
+    # Add nodes and edges
+    G.add_nodes_from(range(64))
+    edges = list(zip(x_list, y_list))
+    G.add_edges_from(edges)
 
-    # If no edge types were selected, plot all of them
-    if selected_edge_types is None:
-        selected_edge_types: List[int] = list(range(7))
+    # Draw the graph
+    plt.figure(figsize=(8, 8))
+    nx.draw(G, pos, with_labels=True, node_size=500, node_color='lightblue', edge_color='black', arrows=True,
+            font_size=8)
 
-    # Create a consistent list for edge colors
-    edge_colors: List[str] = ['r', 'g', 'b', 'c', 'm', 'y', 'k']
-    # Loop through the edges to plot
-    for i in selected_edge_types:
-        # Get the correct edges for this iteration
-        edges = [(u, v) for (u, v, d) in g.edges(data=True) if d['edge_type'] == i]
-        # Plot them
-        nx.draw_networkx_edges(g, board_dict, edgelist=edges, edge_color=edge_colors[i],
-                               arrows=True, arrowsize=20, width=1.5, label=f'Type {i}')
-
-    plt.title("Directed Graph Visualization")
-    plt.axis('off')
+    # Show the visualization
     plt.show()
 
 
@@ -363,17 +359,30 @@ def perturb_graph():
 
 if __name__ == "__main__":
     # Compute the graph
-    computed_graph = create_blank_chess_graph()
+    computed_graph = create_blank_chess_graphs()
 
     # Save it
     #torch.save(computed_graph, 'blank_graph.pt')
 
     # Visualize the graph
-    visualize_graph(*computed_graph, selected_edge_types=[3])
+    # 0 Pawn move
+    # 1 Pawn attack
+    # 2 Knight move
+    # 3 Bishop move
+    # 4 Rook move
+    # 5 King move
+    # 6 Queen move
+    # 7 Castle
+    visualize_graph(computed_graph[5][0])
 
-    # Pawn looks totally wrong
-    # Bishop looks close, but missing edges
-    # Rook looks close, but missing edges
+    # Confirmed correct:
+    # Pawn move edges
+    # Pawn attack edges
+    # Knight edges
+
+    # Bishop move
+    # Rook move
+    # King move
 
 
 
