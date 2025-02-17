@@ -7,7 +7,7 @@ from typing import List, Dict
 
 # Takes in a FEN string and returns a list of 64 numbers
 # https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation
-def fen_to_vector(fen: str) -> List[int]:
+def fen_to_vector(fen: str) -> List[float]:
     piece_values: Dict[str, int] = {"p": 1,
                                     "n": 2,
                                     "b": 3,
@@ -22,7 +22,7 @@ def fen_to_vector(fen: str) -> List[int]:
     row_strings: List[str] = fen_parts[0].split("/")
 
     # Initialize some variables for constructing the vector
-    vector_version: List[int] = [0 for _ in range(64)]
+    vector_version: List[float] = [0 for _ in range(64)]
     index_buffer_num_rows: int = 0
 
     # Vectors go a1, b1, ... a2, b2, ..., so if we're white then we need to go through the strings in reverse order
@@ -211,35 +211,6 @@ def merge_and_vectorize(directory: str, pretraining: bool = False, filter_mates:
     return True
 
 
-# Take in a filepath, remove all forced checkmate rows, save the filtered file, return checkmates dataframe
-def remove_checkmates(input_df: pd.DataFrame) -> pd.DataFrame:
-    save_path: str = "training-supervised-checkmates/"
-
-    checkmates_df: pd.DataFrame = input_df[input_df["Score"].str.contains("#")]
-    checkmates_df.to_csv(f"{save_path}results_merged_filtered.csv", index=False)
-
-    non_checkmates_df: pd.DataFrame = input_df[~input_df["Score"].str.contains("#")]
-    return non_checkmates_df
 
 
-# Prepares the data for the supervised training phase (including the depth breaks and checkmates data)
-def prepare_training_files() -> None:
-    depth_breaks_dir: str = "training-supervised-engines/"
-    checkmates_dir: str = "training-supervised-checkmates/"
-
-    # Merge the depth breaks files with filter_mates as true
-    merge_and_vectorize(depth_breaks_dir, pretraining=False, filter_mates=True)
-
-    # Merge the checkmates files which now includes those that were filtered from depth breaks
-    merge_and_vectorize(checkmates_dir, pretraining=False, filter_mates=False)
-
-
-# Prepares the data for the pretraining phase
-def prepare_pretraining_files() -> None:
-    pretraining_data_dir: str = "training-pretraining/"
-
-    merge_and_vectorize(pretraining_data_dir, pretraining=True)
-
-
-prepare_pretraining_files()
 
