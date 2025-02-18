@@ -1,6 +1,8 @@
 import chess.engine
 import chess
 import torch
+import math
+import data_prep
 import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils import to_networkx
@@ -8,17 +10,17 @@ from torch_geometric.data import Data
 from typing import List, Tuple, Callable
 
 
-def create_blank_chess_graphs() -> List[Tuple[torch.tensor, torch.tensor]]:
+# ##### ##### ##### ##### #####
+#       Core functions
+
+def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     """
 
-    :return: List of tuples of tensors, which are a tensor for all of the edges for that lists type, and a tensor
-     to contain the blank node features
+    :return:
     """
-
-    # This holds all of the different information for each piece type
-    # A function that returns a list for edges_list, and the corresponding value for edge_types_list
+    # Neighborhood functions for different pieces, used for depth first search to get edges
     pieces_list: List[Callable[Tuple[int, int],
-                                     set[Tuple[int, int]]]] = [
+                               set[Tuple[int, int]]]] = [
         get_knight_neighbors,
         get_bishop_neighbors,
         get_rook_neighbors,
@@ -56,15 +58,95 @@ def create_blank_chess_graphs() -> List[Tuple[torch.tensor, torch.tensor]]:
 
     # Don't add any castling edges because their existence depends on the position
 
-    # This will be the return
-    # List of tuples of tensors, which are the edges tensor and blank node features tensors
-    empty_graphs: List[Tuple[torch.tensor, torch.tensor]] = [(0, 0) for _ in range(len(edges_list))]
+    return edges_list
 
-    # Create the empty node features tensor: 64x13
-    node_features = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] for _ in range(64)], dtype=torch.float)
+
+def perturb_graph(original_graph: List[Tuple[torch.tensor, torch.tensor]]) -> List[Tuple[torch.tensor, torch.tensor]]:
+    """
+
+    :param original_graph:
+    :return:
+    """
+    # Randomly choose between 1 and X piece perturbations
+
+    # Randomly choose to either perturb by legal moves or proximal squares for each piece perturbation
+    # Randomly choose a magnitude for each piece perturbation
+    # (?) Randomly decide to either swap or take resulting square (?)
+
+    # Randomly step through each piece perturbation according to parameters
+
+    # Return perturbed graph
+
+
+
+
+    pass
+
+
+def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.tensor], torch.tensor]:
+    """
+`   A function to get the graph representations of all piece interactions for a specified chess position.
+    :param fen: The string that identifies the position to make graphs for.
+    :return: A tuple with the information needed for all of the graph networks. The first value in the tuple is
+        a list of edge index tensors, one for a graph for each piece movement type. The second value in the tuple
+        is the tensor with all of the node features, which includes piece locations and en passant information.
+    """
+    # Initialize the working variables that I will eventually return
+    edges_lists: List[set[Tuple[int, int]]] = get_chess_graph_edges()
+    node_features: List[List[int]] = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] for _ in range(64)]
+
+
+
+    # Create a list of 64 floats that contains the information from the fen
+    position_vector: List[float] = data_prep.fen_to_vector(fen)
+
+    # Check for the existence of an en passant square
+    if -0.5 in position_vector:
+        #
+        node_features[position_vector.index(-0.5)][12] = 1
+
+
+
+
+
+
+    # !!! You'll have to add new edges to the edges_list
+    # Utilize get_castling_edges()
+    # Do castling
+
+
+
+
+
+
+
+    # Remove the decimals so that the integers can be used for indexing
+    position_vector: List[int] = list(map(math.floor, position_vector))
+
+    # Loop through each of the 64 squares to set each node feature vector the correct piece vector
+    square: int
+    for square in range(64):
+        # If there is no piece on this square, continue
+        if position_vector[square] == 0:
+            continue
+
+        # We are going to shift the values: [-6, 6] -> [0, 12]
+        # But since we ignore 0, range should be 12 not 13, so offset negative values by an additional 1
+        offset: int = 0
+        if position_vector[square] < 0:
+            offset = 1
+        # Assign the index of the piece by performing the shift: [-6, 6] -> [0, 12]
+        piece_index = position_vector[square] + 5 + offset
+
+        # Set the value of this square to a list with the value at the index of this piece at 1
+        node_features[square][piece_index] = 1
+
+    # Initialize the list of edge tensors that will eventually be returned
+    edges_tensors: List[torch.tensor] = []
 
     # Convert the pairwise edges to two lists for source and destination for compatibility with pytorch
-    for index, this_type_edges in enumerate(edges_list):
+    this_type_edges: set[Tuple[int, int]]
+    for this_type_edges in edges_lists:
         x_list: List[int] = []
         y_list: List[int] = []
         for x, y in this_type_edges:
@@ -72,13 +154,25 @@ def create_blank_chess_graphs() -> List[Tuple[torch.tensor, torch.tensor]]:
             y_list.append(y)
 
         # Set this graph tuple
-        empty_graphs[index] = (torch.tensor(data=[x_list, y_list], dtype=torch.long), node_features)
+        edges_tensors.append(torch.tensor(data=[x_list, y_list], dtype=torch.int64))
 
-    return empty_graphs
+    # Create the node_features_tensor using the node_features list of lists
+    node_features_tensor: torch.tensor = torch.tensor(node_features, dtype=torch.int64)
+
+
+
+
+
+
+
+
+
+    return edges_tensors, node_features_tensor
 
 
 # ##### ##### ##### ##### #####
 #   Piece connection getters
+
 
 def get_pawn_move_edges() -> set[Tuple[int, int]]:
     """
@@ -249,8 +343,19 @@ def get_castling_edges(board_vector: List[float]) -> set[Tuple[int, int]]:
                 # Connect king to the relevant side...
                 # If I need to check what decimal is to know what rook to connect to, then maybe I should remove the loop
 
+
+
+
                 # What if someone gets a pawn to the other side, chooses a rook, and moves it to their back rank?
                 # Can I distinguish between the original rook??
+
+
+
+
+
+
+
+
 
     return edges
 
@@ -312,13 +417,7 @@ def depth_first_recursive(visited: List[bool],
     return edges
 
 
-# ##### ##### ##### ##### #####
-#       Helper functions
-
-def visualize_graph(tensor):
-    # Extract edges from the tensor
-    x_list, y_list = tensor.tolist()
-
+def visualize_graph(edge_list: List[Tuple[int, int]]) -> None:
     # Create a directed graph
     G = nx.DiGraph()
 
@@ -327,8 +426,7 @@ def visualize_graph(tensor):
 
     # Add nodes and edges
     G.add_nodes_from(range(64))
-    edges = list(zip(x_list, y_list))
-    G.add_edges_from(edges)
+    G.add_edges_from(edge_list)
 
     # Draw the graph
     plt.figure(figsize=(8, 8))
@@ -337,21 +435,6 @@ def visualize_graph(tensor):
 
     # Show the visualization
     plt.show()
-
-
-#
-def perturb_graph():
-    # Randomly choose between 1 and X piece perturbations
-
-    # Randomly choose to either perturb by legal moves or proximal squares for each piece perturbation
-    # Randomly choose a magnitude for each piece perturbation
-    # (?) Randomly decide to either swap or take resulting square (?)
-
-    # Randomly step through each piece perturbation according to parameters
-
-    # Return perturbed graph
-
-    pass
 
 
 # ##### ##### ##### ##### #####
@@ -373,7 +456,7 @@ if __name__ == "__main__":
     # 5 King move
     # 6 Queen move
     # 7 Castle
-    visualize_graph(computed_graph[5][0])
+    visualize_graph(computed_graph[0][6])
 
     # Confirmed correct:
     # Pawn move edges
