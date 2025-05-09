@@ -2,7 +2,7 @@ import chess.engine
 import chess
 import torch
 import math
-import data_prep
+import helper_utils as hu
 import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils import to_networkx
@@ -94,7 +94,7 @@ def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.tensor], torch.tens
         is the tensor with all of the node features, which includes piece locations and en passant information.
     """
     # Create a list of 64 floats that contains the information from the fen
-    position_vector: List[float] = data_prep.fen_to_vector(fen)
+    position_vector: List[float] = hu.fen_to_vector(fen)
 
     # Initialize the working variables that I will eventually return
     edges_lists: List[set[Tuple[int, int]]] = get_chess_graph_edges()
