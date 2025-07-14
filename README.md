@@ -14,7 +14,8 @@ This is a new chess AI that I am developing. It will have a innovative and uncon
    * Adversarial model
 
 ## In Progress:
-* Finish chess graph code, including a function for adding the node feature vectors, and the visualizations.
+* Finish castling edges for the chess graph code.
+  * There is a flaw in FEN where if two rooks are on one side of the king in a Fischer random game, then it is unclear which one is the castling rook without knowing the rook starting squares. Instead of going on a wild goose chase to find this info for all of my data, I will probably default to randomly choosing the castling rook.
 * Update the data prep file so each square is a vector rather than a scalar.
 * Update the architecture, start working on encoder.
 
