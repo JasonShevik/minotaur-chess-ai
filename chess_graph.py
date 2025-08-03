@@ -2,6 +2,7 @@ import chess.engine
 import chess
 import torch
 import math
+import random
 import helper_utils as hu
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -61,13 +62,16 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     return edges_lists
 
 
-def perturb_graph(original_graph: List[Tuple[torch.tensor, torch.tensor]]) -> List[Tuple[torch.tensor, torch.tensor]]:
+def perturb_graph(original_graph: List[Tuple[torch.tensor, torch.tensor]],
+                  piece_perturb_num: int = 1,
+                  magnitude_limit: int = 1) -> List[Tuple[torch.tensor, torch.tensor]]:
     """
 
     :param original_graph:
+    :param piece_perturb_num:
+    :param magnitude_limit:
     :return:
     """
-    # Randomly choose between 1 and X piece perturbations
 
     # Randomly choose to either perturb by legal moves or proximal squares for each piece perturbation
     # Randomly choose a magnitude for each piece perturbation
@@ -311,39 +315,52 @@ def get_king_neighbors(start_coordinates: Tuple[int, int]) -> set[Tuple[int, int
 def get_castling_edges(board_vector: List[float]) -> set[Tuple[int, int]]:
     """
     This is a helper function to add castling edges to the graph. It needs to be done after the blank graph has
-    been made and after the piece placement has been decided
+    been made and after the piece placement has been decided.
+
+    6.1: May castle king-side
+    6.2: May castle queen-side
+    6.3: May castle either side
     :param board_vector: A vector with values -6.3 to 6.3 representing the pieces on the board, plus
     castling and en passant.
     :return: A list of edge pairs that show where castling may be possible. (king g1,g8,c1,c8 and rook f1,f8,d1,d8)
     """
     edges: set[Tuple[int, int]] = set()
 
-    for c in [1, -1]:
-        # Find the square with the king
-        for decimal in [0.1, 0.2, 0.3]:
-            num = board_vector.index((6 + decimal) * c)
-            if num :
-                # If it returns an index, connect that to the rooks
+    # ----- Enemy -----
+    castleable_king = [i for i, piece_value in enumerate(board_vector) if int(piece_value) == -6 and piece_value % 1]
+    if castleable_king:
+        rooks = [i for i, piece_value in enumerate(board_vector) if piece_value == -4]
+        rooks = [x for x in rooks if x > 55]
 
-                # Will this give me a list of indices?
-                rook = board_vector.index(4 * c)
+        # Queen Side
+        if board_vector[castleable_king[0]] == -6.3 or board_vector[castleable_king[0]] == -6.2:
+            the_rook = random.choice([rook for rook in rooks if rook < castleable_king[0]])
+            edges.add((castleable_king[0], 58))
+            edges.add((the_rook, 59))
 
-                # Connect king to the relevant side...
-                # If I need to check what decimal is to know what rook to connect to, then maybe I should remove the loop
+        # King side
+        if board_vector[castleable_king[0]] == -6.3 or board_vector[castleable_king[0]] == -6.1:
+            the_rook = random.choice([rook for rook in rooks if rook > castleable_king[0]])
+            edges.add((castleable_king[0], 62))
+            edges.add((the_rook, 61))
 
+    # ----- Ally -----
+    castleable_king = [i for i, piece_value in enumerate(board_vector) if int(piece_value) == 6 and piece_value % 1]
+    if castleable_king:
+        rooks = [i for i, piece_value in enumerate(board_vector) if piece_value == 4]
+        rooks = [x for x in rooks if x < 8]
 
+        # Queen Side
+        if board_vector[castleable_king[0]] == 6.3 or board_vector[castleable_king[0]] == 6.2:
+            the_rook = random.choice([rook for rook in rooks if rook < castleable_king[0]])
+            edges.add((castleable_king[0], 2))
+            edges.add((the_rook, 3))
 
-
-                # What if someone gets a pawn to the other side, chooses a rook, and moves it to their back rank?
-                # Can I distinguish between the original rook??
-
-
-
-
-
-
-
-
+        # King side
+        if board_vector[castleable_king[0]] == 6.3 or board_vector[castleable_king[0]] == 6.1:
+            the_rook = random.choice([rook for rook in rooks if rook > castleable_king[0]])
+            edges.add((castleable_king[0], 6))
+            edges.add((the_rook, 5))
 
     return edges
 
@@ -443,8 +460,9 @@ if __name__ == "__main__":
     # 4 Rook move
     # 5 King move
     # 6 Queen move
-    # 7 Castle
-    visualize_graph(get_chess_graph_edges()[2])
+
+    #visualize_graph(get_chess_graph_edges()[2])
+    visualize_graph(get_castling_edges(hu.fen_to_vector("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")))
 
     # Confirmed correct:
     # Pawn move edges
