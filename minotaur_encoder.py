@@ -1,3 +1,4 @@
+import guo_et_al_unpooling as unpool
 import chess_graph as cg
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ class NodeEncoder(nn.Module):
 
         # ----- First Parallel GAT Layer -----
         self.gat_layers1 = nn.ModuleList([
-            GATConv(in_channels, gat_out_channels, heads=num_gat_heads, concat=False)
+            GATConv(in_channels, gat_out_channels, heads=num_gat_heads, concat=False, dropout=0.1)
             for _ in range(self.num_parallel_gats)
         ])
         gat_output_dim1 = gat_out_channels
@@ -32,7 +33,7 @@ class NodeEncoder(nn.Module):
         # ----- Second Parallel GAT Layer -----
         gat_output_dim2 = (mlp_out_dim1 * 2) # 64
         self.gat_layers2 = nn.ModuleList([
-            GATConv(mlp_out_dim1, gat_output_dim2, heads=num_gat_heads, concat=False)
+            GATConv(mlp_out_dim1, gat_output_dim2, heads=num_gat_heads, concat=False, dropout=0.1)
             for _ in range(self.num_parallel_gats)
         ])
 
@@ -49,7 +50,7 @@ class NodeEncoder(nn.Module):
         # ----- Third Parallel GAT Layer -----
         gat_output_dim3 = (mlp_out_dim2 * 2)  # 256
         self.gat_layers3 = nn.ModuleList([
-            GATConv(mlp_out_dim2, gat_output_dim3, heads=num_gat_heads, concat=False)
+            GATConv(mlp_out_dim2, gat_output_dim3, heads=num_gat_heads, concat=False, dropout=0.1)
             for _ in range(self.num_parallel_gats)
         ])
 
@@ -63,17 +64,37 @@ class NodeEncoder(nn.Module):
             nn.Linear(mlp_hidden_dim3, mlp_out_dim3)
         )
 
-    def forward(self):
-        pass
+    def forward(self, x, edge_index_list):
+        # --- First hop ---
+        h = [self.activation(gat(x, edge_index_list[i])) for i, gat in enumerate(self.gat_layers1)]
+        h = self.activation(self.mlp1(torch.cat(h, dim=-1)))
 
+        # --- Second hop ---
+        h = [self.activation(gat(h, edge_index_list[i])) for i, gat in enumerate(self.gat_layers2)]
+        h = self.activation(self.mlp2(torch.cat(h, dim=-1)))
 
-    def get_nodes(self, ) -> List[List[float]]:
-        pass
+        # --- Third hop ---
+        h = [self.activation(gat(h, edge_index_list[i])) for i, gat in enumerate(self.gat_layers3)]
+        h = self.mlp3(torch.cat(h, dim=-1))  # <- final activation already inside mlp3
+
+        return h  # shape: [64, 512]
 
 
 class GlobalSummarizer(nn.Module):
     def __init__(self):
-        pass
+        super(GlobalSummarizer, self).__init__()
+
+        self.gat_layers1 = nn.ModuleList([
+            GATConv(
+                in_channels=8,  # your per-square feature length
+                out_channels=8,  # 8
+                heads=8,  # 8 heads
+                concat=True,  # ✱ important for 64-d output
+                dropout=0.1
+            ) for _ in range(8)  # one per edge-type
+        ])
+
+
 
     def forward(self):
         pass
@@ -81,7 +102,7 @@ class GlobalSummarizer(nn.Module):
 
 class Discriminator(nn.Module):
     def __init__(self):
-        pass
+        super(Discriminator, self).__init__()
 
     def forward(self):
         pass
