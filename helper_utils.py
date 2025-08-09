@@ -5,6 +5,7 @@ import itertools
 import sqlite3
 import queue
 import time
+import math
 import csv
 import os
 from typing import List, Tuple, Dict, Any, Callable
@@ -180,7 +181,7 @@ def fen_to_vector(fen: str) -> List[float]:
     # BUT we need to reverse all of the individual strings like we're rotating the board
     elif fen_parts[1] == "b":
         for index, _ in enumerate(row_strings):
-            row_strings[index] = str(reversed(row_strings[index]))
+            row_strings[index] = row_strings[index][::-1]
 
     # This value can only be 'w' or 'b'
     else:
@@ -275,13 +276,10 @@ def fen_to_vector(fen: str) -> List[float]:
     if fen_parts[3][0] == "-":
         return vector_version
 
-    # Based on if the AI's perspective is white or black, define character_values for board orientation
-    if white_mod == 1:
-        character_values = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7}
-        en_passant_square = (character_values[fen_parts[3][0]] * 8) + int(fen_parts[3][1])
-    else:
-        character_values = {"a": 7, "b": 6, "c": 5, "d": 4, "e": 3, "f": 2, "g": 1, "h": 0}
-        en_passant_square = (character_values[fen_parts[3][0]] * 8) + (8 - int(fen_parts[3][1]))
+    character_values = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7}
+    en_passant_square = ((int(fen_parts[3][1]) - 1) * 8) + character_values[fen_parts[3][0]]
+    if black_mod == 1:
+        en_passant_square = 63 - en_passant_square
 
     # noinspection PyTypeChecker
     vector_version[en_passant_square] = -0.5
