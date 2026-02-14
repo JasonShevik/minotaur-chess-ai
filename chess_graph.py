@@ -8,7 +8,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils import to_networkx
 from torch_geometric.data import Data
-from typing import List, Tuple, Callable
+from typing import List, Tuple, Callable, Dict, Any, Optional, Union
 
 
 # ##### ##### ##### ##### #####
@@ -62,36 +62,105 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     return edges_lists
 
 
-def perturb_graph(original_graph: List[Tuple[torch.tensor, torch.tensor]],
-                  piece_perturb_num: int = 1,
-                  magnitude_limit: int = 1) -> List[Tuple[torch.tensor, torch.tensor]]:
+def perturb_position(
+    fen: str,
+    perturb_type: Optional[int] = None,
+    perturb_num: int = 1,
+    magnitude_limit: int = 1,
+    type_distribution: Optional[Union[torch.Tensor, Callable[[], int]]] = None,
+    rng: Optional[random.Random] = None,
+) -> str:
+    """
+    Return a perturbed position as a new FEN string.
+
+    Perturbation is implemented on the FEN/board so we can use the chess library
+    for legal moves, piece lists, etc. Call create_filled_chess_graphs(perturbed_fen)
+    to get the graph representation for the encoder.
+
+    :param fen: FEN string of the position to perturb.
+    :param perturb_type: Which perturbation to apply (0..7). If None, one is chosen
+        from type_distribution or uniformly at random.
+    :param perturb_num: Number of perturbations to apply (magnitude).
+    :param magnitude_limit: Interpretation depends on perturb_type.
+    :param type_distribution: When perturb_type is None, how to choose the type.
+        - If a 1D tensor of shape (num_types,): treated as probabilities (or logits
+          if any > 1), sample type from torch.multinomial(type_distribution, 1).
+        - If a callable: call with no args to get an int in [0, num_types-1].
+    :param rng: Optional random.Random for reproducible sampling when using
+        type_distribution tensor.
+    :return: Perturbed position as a FEN string.
     """
 
-    :param original_graph:
-    :param piece_perturb_num:
-    :param magnitude_limit:
-    :return:
+    def perturb_fen_piece_move_legal(fen_str: str) -> str:
+        # TODO: use chess.Board(fen_str), list(board.legal_moves), pick one, board.push(move), return board.fen()
+        return fen_str
+
+    def perturb_fen_piece_move_illegal(fen_str: str) -> str:
+        # TODO: move a piece to a square it can reach (neighbor) but that is not legal (blocked, check, etc.)
+        return fen_str
+
+    def perturb_fen_piece_deletion(fen_str: str) -> str:
+        # TODO: remove one or more pieces
+        return fen_str
+
+    def perturb_fen_piece_addition(fen_str: str) -> str:
+        # TODO: add a piece on an empty square
+        return fen_str
+
+    def perturb_fen_piece_swap(fen_str: str) -> str:
+        # TODO: swap two pieces
+        return fen_str
+
+    def perturb_fen_piece_change(fen_str: str) -> str:
+        # TODO: change piece type (e.g. knight -> bishop)
+        return fen_str
+
+    def perturb_fen_piece_color_change(fen_str: str) -> str:
+        # TODO: flip color of a piece
+        return fen_str
+
+    def perturb_fen_castling_rights_change(fen_str: str) -> str:
+        # TODO: change castling rights
+        return fen_str
+
+    perturbation_dispatch_table: Dict[int, Callable[[str], str]] = {
+        0: perturb_fen_piece_move_legal,
+        1: perturb_fen_piece_move_illegal,
+        2: perturb_fen_piece_deletion,
+        3: perturb_fen_piece_addition,
+        4: perturb_fen_piece_swap,
+        5: perturb_fen_piece_change,
+        6: perturb_fen_piece_color_change,
+        7: perturb_fen_castling_rights_change,
+    }
+
+    num_types = len(perturbation_dispatch_table)
+
+    # Choose perturbation type if not specified
+    if perturb_type is None:
+        if type_distribution is None:
+            perturb_type = random.randint(0, num_types - 1) if rng is None else rng.randint(0, num_types - 1)
+        elif callable(type_distribution):
+            perturb_type = type_distribution()
+        else:
+            probs = type_distribution.to(torch.float64)
+            if probs.dim() == 1 and probs.size(0) == num_types:
+                if (probs < 0).any() or (probs > 1).any():
+                    probs = torch.softmax(probs, dim=0)
+                gen = torch.Generator(device=probs.device)
+                if rng is not None:
+                    gen.manual_seed(rng.randint(0, 2**31 - 1))
+                perturb_type = int(torch.multinomial(probs, 1, generator=gen).item())
+            else:
+                perturb_type = random.randint(0, num_types - 1) if rng is None else rng.randint(0, num_types - 1)
+    perturb_type = int(perturb_type) % num_types
+
+    return perturbation_dispatch_table[perturb_type](fen)
+
+
+def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
     """
-
-    # Randomly choose to either perturb by legal moves or proximal squares for each piece perturbation
-    # Randomly choose a magnitude for each piece perturbation
-    # (?) Randomly decide to either swap or take resulting square (?)
-
-    # Randomly step through each piece perturbation according to parameters
-
-    # Check if perturbations affect castling edges
-
-    # Return perturbed graph
-
-
-
-
-    pass
-
-
-def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.tensor], torch.tensor]:
-    """
-`   A function to get the graph representations of all piece interactions for a specified chess position.
+    A function to get the graph representations of all piece interactions for a specified chess position.
     :param fen: The string that identifies the position to make graphs for.
     :return: A tuple with the information needed for all of the graph networks. The first value in the tuple is
         a list of edge index tensors, one for a graph for each piece movement type. The second value in the tuple
@@ -142,7 +211,7 @@ def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.tensor], torch.tens
         node_features[square][abs(position_vector[square])] = 1
 
     # Initialize the list of edge tensors that will eventually be returned
-    edges_tensors: List[torch.tensor] = []
+    edges_tensors: List[torch.Tensor] = []
 
     # Convert the pairwise edges to two lists for source and destination for compatibility with pytorch
     this_type_edges: set[Tuple[int, int]]
@@ -157,7 +226,7 @@ def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.tensor], torch.tens
         edges_tensors.append(torch.tensor(data=[x_list, y_list], dtype=torch.int64))
 
     # Create the node_features_tensor using the node_features list of lists
-    node_features_tensor: torch.tensor = torch.tensor(node_features, dtype=torch.int64)
+    node_features_tensor: torch.Tensor = torch.tensor(node_features, dtype=torch.float32)
 
     return edges_tensors, node_features_tensor
 
@@ -461,8 +530,8 @@ if __name__ == "__main__":
     # 5 King move
     # 6 Queen move
 
-    #visualize_graph(get_chess_graph_edges()[2])
-    visualize_graph(get_castling_edges(hu.fen_to_vector("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")))
+    visualize_graph(get_chess_graph_edges()[2])
+    #visualize_graph(get_castling_edges(hu.fen_to_vector("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")))
 
     # Confirmed correct:
     # Pawn move edges
