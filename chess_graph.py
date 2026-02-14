@@ -65,26 +65,21 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
 def perturb_position(
     fen: str,
     perturb_type: Optional[int] = None,
-    perturb_num: int = 1,
-    magnitude_limit: int = 1,
+    magnitude: int = 1,
     type_distribution: Optional[Union[torch.Tensor, Callable[[], int]]] = None,
     rng: Optional[random.Random] = None,
 ) -> str:
     """
     Return a perturbed position as a new FEN string.
 
-    Perturbation is implemented on the FEN/board so we can use the chess library
-    for legal moves, piece lists, etc. Call create_filled_chess_graphs(perturbed_fen)
-    to get the graph representation for the encoder.
-
     :param fen: FEN string of the position to perturb.
     :param perturb_type: Which perturbation to apply (0..7). If None, one is chosen
         from type_distribution or uniformly at random.
-    :param perturb_num: Number of perturbations to apply (magnitude).
-    :param magnitude_limit: Interpretation depends on perturb_type.
+    :param magnitude: Interpretation depends on perturb_type.
     :param type_distribution: When perturb_type is None, how to choose the type.
-        - If a 1D tensor of shape (num_types,): treated as probabilities (or logits
-          if any > 1), sample type from torch.multinomial(type_distribution, 1).
+        - If a 1D tensor of shape (num_types,): if all values are in [0, 1], treated
+          as probabilities (normalized by sum); otherwise treated as logits (softmax).
+          Sampled via torch.multinomial.
         - If a callable: call with no args to get an int in [0, num_types-1].
     :param rng: Optional random.Random for reproducible sampling when using
         type_distribution tensor.
@@ -92,7 +87,56 @@ def perturb_position(
     """
 
     def perturb_fen_piece_move_legal(fen_str: str) -> str:
-        # TODO: use chess.Board(fen_str), list(board.legal_moves), pick one, board.push(move), return board.fen()
+        # Do 'magnitude' legal moves of the same piece in a row (same side to move after each).
+        # Exclude moves that transpose back to a square the piece has already visited.
+        rand = rng if rng is not None else random
+        n = max(1, int(magnitude))
+        board = chess.Board(fen_str)
+        turn_white = board.turn
+        color = chess.WHITE if turn_white else chess.BLACK
+        order = [s for s in chess.SQUARES if board.piece_at(s) is not None and board.color_at(s) == color] # List of all of our squares
+        rand.shuffle(order)
+
+        def try_complete_moves(
+            current: chess.Board,
+            piece_square: chess.Square,
+            visited: set[chess.Square],
+            moves_done: int,
+            target: int,
+        ) -> Optional[str]:
+            """Try to complete exactly `target` moves; at each step try all candidates (shuffled)."""
+            if moves_done == target:
+                return current.fen()
+            candidates = [
+                m for m in current.legal_moves
+                if m.from_square == piece_square and m.to_square not in visited and m.promotion is None
+            ]
+            if not candidates:
+                return None
+            rand.shuffle(candidates)
+            for move in candidates:
+                next_board = current.copy()
+                next_board.push(move)
+                new_sq = move.to_square
+                new_visited = visited | {new_sq}
+                if moves_done + 1 == target:
+                    return next_board.fen()
+                next_board.turn = turn_white
+                result = try_complete_moves(next_board, new_sq, new_visited, moves_done + 1, target)
+                if result is not None:
+                    return result
+            return None
+
+        for start_square in order:
+            result = try_complete_moves(board.copy(), start_square, {start_square}, 0, n)
+            if result is not None:
+                return result
+        # No piece could do n moves; try fewer (n-1, ..., 1).
+        for target in range(n - 1, 0, -1):
+            for start_square in order:
+                result = try_complete_moves(board.copy(), start_square, {start_square}, 0, target)
+                if result is not None:
+                    return result
         return fen_str
 
     def perturb_fen_piece_move_illegal(fen_str: str) -> str:
@@ -145,7 +189,12 @@ def perturb_position(
         else:
             probs = type_distribution.to(torch.float64)
             if probs.dim() == 1 and probs.size(0) == num_types:
-                if (probs < 0).any() or (probs > 1).any():
+                # Treat as logits (softmax) if any value is outside [0, 1]; otherwise treat as
+                # probabilities (possibly unnormalized) and normalize by sum.
+                in_unit_interval = (probs >= 0).all().item() and (probs <= 1).all().item()
+                if in_unit_interval and probs.sum().item() > 0:
+                    probs = probs / probs.sum()
+                else:
                     probs = torch.softmax(probs, dim=0)
                 gen = torch.Generator(device=probs.device)
                 if rng is not None:
