@@ -8,7 +8,9 @@ import torch.nn.functional as F
 from collections import defaultdict
 from torch.optim import Adam
 from torch_geometric.utils import coalesce
-from typing import Optional, Dict, Tuple, List, Set
+from torch_geometric.data import Batch
+from torch_scatter import scatter_softmax, scatter_sum, scatter_max
+from typing import Optional, Dict, Tuple, List, Set, Any
 from dataclasses import dataclass, field
 
 
@@ -41,7 +43,7 @@ class GuoUnpool(nn.Module):
 
         # PS1/PS2 projection indices (d' = floor(dx/2) + floor(dx/4))
         ds = dx // 2
-        D = dx // 4
+        D  = dx // 4
         self.register_buffer("_ps1_idx", torch.tensor(list(range(ds)) + list(range(ds, ds + D)), dtype=torch.long))
         self.register_buffer("_ps2_idx", torch.tensor(list(range(ds)) + list(range(ds + D, ds + 2 * D)), dtype=torch.long))
         d_prime = ds + D
@@ -85,6 +87,27 @@ class GuoUnpool(nn.Module):
         a = int(i) if torch.is_tensor(i) else i
         b = int(j) if torch.is_tensor(j) else j
         return (a, b) if a < b else (b, a)
+
+    # ---- helper: interlink probabilities (batched) ----
+    def _p12_both_batched(self, y1s, y2s, w_ij, x_other):
+        # inputs: [K, dy], [K, dy], [K, dw], [K, dx]
+        if self.use_preference:
+            hs1 = self.mlp_ie1(torch.cat([y1s, w_ij, x_other], dim=1))  # [K,1]
+            hs2 = self.mlp_ie1(torch.cat([y2s, w_ij, x_other], dim=1))
+            hb  = self.mlp_ie2(torch.cat([self.agg(y1s, y2s), w_ij, x_other], dim=1))
+            h0s = self.mlp_zero_s(y1s)                                  # [K,1]
+            h0b = self.mlp_zero_b(x_other)                              # [K,1]
+            logits = torch.cat([hs1, hs2, hb, h0s + h0b], dim=1)        # [K,4]
+            Z = F.softmax(logits, dim=1)
+            p1, p2, pB = Z[:, 0], Z[:, 1], Z[:, 2]
+        else:
+            s1 = self.mlp_ie1(torch.cat([y1s, w_ij, x_other], dim=1))
+            s2 = self.mlp_ie1(torch.cat([y2s, w_ij, x_other], dim=1))
+            sb = self.mlp_ie2(torch.cat([self.agg(y1s, y2s), w_ij, x_other], dim=1))
+            logits = torch.cat([s1, s2, sb], dim=1)                     # [K,3]
+            Z = F.softmax(logits, dim=1)
+            p1, p2, pB = Z[:, 0], Z[:, 1], Z[:, 2]
+        return p1, p2, pB, Z  # Z is [K,3 or 4]
 
     def forward(
         self,
@@ -138,7 +161,7 @@ class GuoUnpool(nn.Module):
         logP = x.new_zeros(())
         total_entropy = x.new_zeros(())
 
-        pr = self.mlp_r(x[I_r]).squeeze(-1)
+        pr = self.mlp_r(x[I_r]).squeeze(-1)  # [|I_r|]
         if replay_mode:
             choose_unpool = actions_to_replay['step1a_unpool'][0]
         else:
@@ -149,12 +172,11 @@ class GuoUnpool(nn.Module):
         Iu = torch.cat([I_u, I_r[choose_unpool]], dim=0)
         Is = torch.cat([I_s, I_r[~choose_unpool]], dim=0)
 
-        logP = logP + torch.sum(torch.log(pr + 1e-9)[choose_unpool]) \
-                    + torch.sum(torch.log(1 - pr + 1e-9)[~choose_unpool])
+        logP = logP + torch.sum(torch.log(pr.clamp_min(1e-9))[choose_unpool]) \
+                    + torch.sum(torch.log((1 - pr).clamp_min(1e-9))[~choose_unpool])
 
         pr_stable = pr.clamp(1e-9, 1.0 - 1e-9)
-        entropy_r = -(pr_stable * torch.log(pr_stable) + (1 - pr_stable) * torch.log(1 - pr_stable))
-        total_entropy = total_entropy + entropy_r.sum()
+        total_entropy = total_entropy + (-(pr_stable * pr_stable.log() + (1 - pr_stable) * (1 - pr_stable).log())).sum()
 
         # ========== Step 1b: node features / packing ==========
         PS1, PS2 = self._project(x)
@@ -163,16 +185,13 @@ class GuoUnpool(nn.Module):
             actions_recorded["__Is_order__"] = [int(i) for i in Is.tolist()]
             actions_recorded["__Iu_order__"] = [int(i) for i in Iu.tolist()]
         else:
-            Is_rec = actions_to_replay.get("__Is_order__")
-            Iu_rec = actions_to_replay.get("__Iu_order__")
-            assert Is_rec is not None and Iu_rec is not None, "Missing recorded Is/Iu ordering"
-            Is = torch.tensor(Is_rec, dtype=torch.long, device=device)
-            Iu = torch.tensor(Iu_rec, dtype=torch.long, device=device)
+            Is = torch.tensor(actions_to_replay["__Is_order__"], dtype=torch.long, device=device)
+            Iu = torch.tensor(actions_to_replay["__Iu_order__"], dtype=torch.long, device=device)
 
         x_static = self.mlp_y(PS1[Is])
-        x_c1 = self.mlp_y(PS1[Iu])
-        x_c2 = self.mlp_y(PS2[Iu])
-        x_out = torch.cat([x_static, x_c1, x_c2], dim=0)
+        x_c1     = self.mlp_y(PS1[Iu])
+        x_c2     = self.mlp_y(PS2[Iu])
+        x_out    = torch.cat([x_static, x_c1, x_c2], dim=0)
 
         f_map  = {int(i): idx for idx, i in enumerate(Is.tolist())}
         base_c1 = len(Is)
@@ -184,7 +203,7 @@ class GuoUnpool(nn.Module):
         if len(Iu) > 0:
             y1 = x_out[torch.arange(len(Iu), device=device) + base_c1]
             y2 = x_out[torch.arange(len(Iu), device=device) + base_c2]
-            p_intra = self.mlp_ia(self.agg(y1, y2)).squeeze(-1)
+            p_intra = self.mlp_ia(self.agg(y1, y2)).squeeze(-1)  # [|Iu|]
 
             if replay_mode:
                 Vc_mask = actions_to_replay['step2a_intra'][0]
@@ -194,83 +213,114 @@ class GuoUnpool(nn.Module):
                 actions_recorded['step2a_intra'].append(Vc_mask)
 
             Vc = Iu[Vc_mask]
-            logP = logP + torch.sum(torch.log(p_intra + 1e-9)[Vc_mask]) \
-                        + torch.sum(torch.log(1 - p_intra + 1e-9)[~Vc_mask])
+            logP = logP + torch.sum(torch.log(p_intra.clamp_min(1e-9))[Vc_mask]) \
+                        + torch.sum(torch.log((1 - p_intra).clamp_min(1e-9))[~Vc_mask])
 
-            p_intra_stable = p_intra.clamp(1e-9, 1.0 - 1e-9)
-            entropy_ia = -(p_intra_stable * torch.log(p_intra_stable) + (1 - p_intra_stable) * torch.log(1 - p_intra_stable))
-            total_entropy = total_entropy + entropy_ia.sum()
+            p_intra_stable = p_intra.clamp(1e-9, 1.0 - 1.0e-9)
+            total_entropy  = total_entropy + (-(p_intra_stable * p_intra_stable.log()
+                                               + (1 - p_intra_stable) * (1 - p_intra_stable).log())).sum()
         else:
             Vc_mask = torch.tensor([], dtype=torch.bool, device=device)
             Vc = Iu
 
-        # Build adjacency (deterministic by earlier sort) for neighbors and 2b
-        src, dst = edge_index[0].tolist(), edge_index[1].tolist()
-        M = len(src)
-        adj = [[] for _ in range(N)]
-        for k in range(M):
-            i, j = src[k], dst[k]
-            adj[i].append((j, k))
-            adj[j].append((i, k))
-        for u_idx in range(N):
-            adj[u_idx].sort(key=lambda t: t[0])
+        # ========== Build adjacency (lexsorted) and neighbor lists ==========
+        src = edge_index[0]
+        dst = edge_index[1]
+        M   = edge_index.size(1)
 
-        # Ensure replay has 2b picks for all needed parents
-        if replay_mode:
-            needed = set(int(u) for u in Iu[~Vc_mask].tolist())
-            have   = set(int(k) for k in actions_to_replay.get("step2b_pick", {}).keys())
-            missing = needed - have
-            assert not missing, f"Replay missing step2b picks for parents: {sorted(missing)}"
-
-        # ========== Step 2b: pick b_j for parents without intra-link ==========
+        # Fast vectorized representation of neighbors: for each parent u in Iu_no_intra,
+        # we gather its neighbor indices and ek row indices. We’ll build flat lists
+        # then compute scores in one MLP call, and finally sample 1 choice per parent.
         iu_no_intra = Iu[~Vc_mask]
+        new_edges = []
+
+        # ------- Step 2b: vectorized neighbor scoring -------
         bj_choice: Dict[int, int] = {}
-        for parent in iu_no_intra.tolist():
-            nbrs = adj[parent]
-            if not nbrs:
-                continue
+        if iu_no_intra.numel() > 0:
+            # For each parent, find positions where it appears as src or dst (neighbors in either direction)
+            # We keep the same neighbor set you used (undirected adjacency): adj[parent] contains (nei, ek)
+            # Build a compact list of all (parent, nei, ek) rows.
+            # First find mask of rows where parent appears either as src or dst.
+            # We'll do a two-pass: one python loop to collect tensors of indices (cheap),
+            # but the heavy scoring is batched.
+            parent_rows = []
+            parent_ptrs = [0]  # prefix to segment rows by parent
+            all_neis = []
+            all_eks  = []
+            for p in iu_no_intra.tolist():
+                # neighbors: any edge touching p → neighbor is the other endpoint
+                mask_src = (src == p)
+                mask_dst = (dst == p)
+                idx_src  = torch.nonzero(mask_src, as_tuple=False).flatten()
+                idx_dst  = torch.nonzero(mask_dst, as_tuple=False).flatten()
+                neis_src = dst[idx_src]  # edges p->nei
+                neis_dst = src[idx_dst]  # edges nei->p
+                neis     = torch.cat([neis_src, neis_dst], dim=0)
+                eks      = torch.cat([idx_src, idx_dst], dim=0)
 
-            y1p = x_out[f1_map[parent]]
-            y2p = x_out[f2_map[parent]]
+                # keep lexicographic order already provided by _lexsort_edges
+                parent_rows.append((p, neis, eks))
+                all_neis.append(neis)
+                all_eks.append(eks)
+                parent_ptrs.append(parent_ptrs[-1] + neis.numel())
 
-            # score each neighbor (match original: add batch dim for Linear)
-            scores = []
-            for (nei, ek) in nbrs:
-                w = edge_attr[ek]
-                x_nei = x[nei]
-                s = self.mlp_c(torch.cat([self.agg(y1p, y2p), w, x_nei], dim=0).unsqueeze(0)).squeeze(0)
-                scores.append(s)
-            scores = torch.stack(scores, dim=0).squeeze(-1)
-            probs = F.softmax(scores, dim=0)
+            if parent_ptrs[-1] > 0:
+                all_neis_cat = torch.cat(all_neis, dim=0)  # [K_total]
+                all_eks_cat  = torch.cat(all_eks,  dim=0)  # [K_total]
 
-            if replay_mode:
-                rec = actions_to_replay['step2b_pick'].get(int(parent), None)
-                pick = None
-                if rec is not None:
-                    # Prefer matching by ek (robust to duplicate neighbors / ordering)
-                    if isinstance(rec, dict) and "ek" in rec:
-                        ek_id = int(rec["ek"])
-                        for i_n, (_n, _ek) in enumerate(nbrs):
-                            if int(_ek) == ek_id:
-                                pick = i_n
-                                break
-                if pick is None:
-                    raise RuntimeError(
-                        f"Step 2b replay failed for parent {parent}. "
-                        f"Could not find recorded action: {rec}. "
-                        f"Available neighbors (nei, ek): {[(int(n), int(ek)) for n, ek in nbrs]}"
-                    )
-            else:
-                pick = torch.multinomial(probs, 1, generator=rng).item()
-                actions_recorded['step2b_pick'][int(parent)] = {
-                    "nei": int(nbrs[pick][0]),
-                    "ek":  int(nbrs[pick][1]),
-                }
+                # Build Φ_2b rows: [agg(y1p,y2p), w, x_nei]
+                # For each row we need y1p/y2p of its parent → we’ll expand per segment
+                # Prepare parent embedding tensors aligned with concatenated rows
+                y1p_list, y2p_list = [], []
+                for (p, neis, eks) in parent_rows:
+                    if neis.numel() == 0:
+                        continue
+                    y1p_list.append(x_out[f1_map[p]].unsqueeze(0).repeat(neis.numel(), 1))
+                    y2p_list.append(x_out[f2_map[p]].unsqueeze(0).repeat(neis.numel(), 1))
+                y1p_cat = torch.cat(y1p_list, dim=0) if y1p_list else x_out.new_zeros((0, self.dy))
+                y2p_cat = torch.cat(y2p_list, dim=0) if y2p_list else x_out.new_zeros((0, self.dy))
 
-            bj_choice[parent] = nbrs[pick][0]
-            logP = logP + torch.log(probs[pick].clamp(min=1e-9))
-            entropy_bj = -(probs.clamp(min=1e-9) * torch.log(probs.clamp(min=1e-9))).sum()
-            total_entropy = total_entropy + entropy_bj
+                w_cat   = edge_attr[all_eks_cat]                # [K_total, dw]
+                xnei_cat= x[all_neis_cat]                       # [K_total, dx]
+                agg_y   = self.agg(y1p_cat, y2p_cat)            # [K_total, dy]
+                scores  = self.mlp_c(torch.cat([agg_y, w_cat, xnei_cat], dim=1)).squeeze(-1)  # [K_total]
+
+                # For each parent segment, softmax over its rows, then sample 1 index
+                # We’ll do sampling per segment in a light python loop (K segments), probs computed batched.
+                start = 0
+                for seg_idx, (p, neis, eks) in enumerate(parent_rows):
+                    L = neis.numel()
+                    if L == 0:
+                        continue
+                    seg_scores = scores[start:start+L]
+                    probs = F.softmax(seg_scores, dim=0)
+
+                    if replay_mode:
+                        rec = actions_to_replay['step2b_pick'].get(int(p), None)
+                        pick = None
+                        if rec is not None and isinstance(rec, dict) and "ek" in rec:
+                            ek_id = int(rec["ek"])
+                            # find matching ek
+                            match = (eks == ek_id).nonzero(as_tuple=False)
+                            if match.numel() > 0:
+                                pick = int(match[0].item())
+                        if pick is None:
+                            raise RuntimeError(
+                                f"Step 2b replay failed for parent {p}. "
+                                f"Could not find recorded action: {rec}. "
+                                f"Available neighbors (nei, ek): {[(int(n), int(e)) for n, e in zip(neis.tolist(), eks.tolist())]}"
+                            )
+                    else:
+                        pick = torch.multinomial(probs, 1, generator=rng).item()
+                        actions_recorded['step2b_pick'][int(p)] = {"nei": int(neis[pick].item()),
+                                                                   "ek":  int(eks[pick].item())}
+
+                    bj_choice[p] = int(neis[pick].item())
+                    # logP & entropy
+                    logP = logP + torch.log(probs[pick].clamp_min(1e-9))
+                    ent  = -(probs.clamp_min(1e-9) * torch.log(probs.clamp_min(1e-9))).sum()
+                    total_entropy = total_entropy + ent
+                    start += L
 
         if not replay_mode:
             actions_recorded["__bj_choice__"] = {int(k): int(v) for k, v in bj_choice.items()}
@@ -279,142 +329,209 @@ class GuoUnpool(nn.Module):
             assert {int(k): int(v) for k, v in bj_choice.items()} == rec_bj, \
                 f"Replay diverged in 2b bj_choice.\nrecord={rec_bj}\nreplay={bj_choice}"
 
-        # ---- helper: interlink probabilities (with optional preference scores)
-        def get_p12_both(y1s, y2s, w_ij, x_other):
-            if self.use_preference:
-                hs1 = self.mlp_ie1(torch.cat([y1s, w_ij, x_other], dim=0).unsqueeze(0)).squeeze(0)
-                hs2 = self.mlp_ie1(torch.cat([y2s, w_ij, x_other], dim=0).unsqueeze(0)).squeeze(0)
-                hb  = self.mlp_ie2(torch.cat([self.agg(y1s, y2s), w_ij, x_other], dim=0).unsqueeze(0)).squeeze(0)
-                h0s = self.mlp_zero_s(y1s.unsqueeze(0)).squeeze(0)
-                h0b = self.mlp_zero_b(x_other.unsqueeze(0)).squeeze(0)
-                Z_probs = F.softmax(torch.stack([hs1, hs2, hb, h0s + h0b], dim=0).squeeze(-1), dim=0)
-                p1, p2, p_both = Z_probs[0], Z_probs[1], Z_probs[2]
-            else:
-                s1 = self.mlp_ie1(torch.cat([y1s, w_ij, x_other], dim=0).unsqueeze(0)).squeeze(0)
-                s2 = self.mlp_ie1(torch.cat([y2s, w_ij, x_other], dim=0).unsqueeze(0)).squeeze(0)
-                sb = self.mlp_ie2(torch.cat([self.agg(y1s, y2s), w_ij, x_other], dim=0).unsqueeze(0)).squeeze(0)
-                logits = torch.cat([s1, s2, sb], dim=-1).squeeze(0)
-                Z_probs = F.softmax(logits, dim=-1)
-                p1, p2, p_both = Z_probs[0], Z_probs[1], Z_probs[2]
-            return p1, p2, p_both, Z_probs
+        # ---- batched 2c probabilities for all directed edges ----
+        # For each original directed edge (i->j) we might need probabilities for i’s split to j (i->j)
+        # and for j’s split to i (j->i). We compute both directions in two batched calls.
+        # Prepare masks for which endpoints are static (mapped) vs unpooled.
+        # ---- batched 2c probabilities for all directed edges ----
+        # We must EXCLUDE edges that were satisfied by the 2b "both-children" pick.
+        is_static = torch.zeros(N, dtype=torch.bool, device=device)
+        is_static[Is] = True
 
-        # ========== Step 2c: expand edges per direction (occurrence-indexed) ==========
-        new_edges = []
+        src = edge_index[0]
+        dst = edge_index[1]
+        M   = edge_index.size(1)
+
+        # masks: which endpoints are unpooled (need 2c), per edge
+        i_unp_mask = ~is_static[src]  # i->j direction needs 2c if True
+        j_unp_mask = ~is_static[dst]  # j->i direction needs 2c if True
+
+        # Build masks for edges that are the special 2b neighbor (we SKIP 2c there)
+        bj_edge_mask_ij = torch.zeros(M, dtype=torch.bool, device=device)  # for i->j direction
+        bj_edge_mask_ji = torch.zeros(M, dtype=torch.bool, device=device)  # for j->i direction
+        if bj_choice:
+            # mark edges where (src==i and dst==bj_choice[i]) and where (dst==j and src==bj_choice[j])
+            # do in a tiny loop over parents (cheap); avoids big O(N^2) compare
+            for pi, pj in bj_choice.items():
+                # i->j mask
+                hits_ij = (src == pi) & (dst == pj)
+                if hits_ij.any():
+                    bj_edge_mask_ij |= hits_ij
+                # j->i mask
+                hits_ji = (dst == pi) & (src == pj)
+                if hits_ji.any():
+                    bj_edge_mask_ji |= hits_ji
+
+        # 2c really needs probs only for:
+        prob_mask_ij = i_unp_mask & ~bj_edge_mask_ij
+        prob_mask_ji = j_unp_mask & ~bj_edge_mask_ji
+
+        idx_ij = torch.nonzero(prob_mask_ij, as_tuple=False).flatten()  # rows needing i->j probs
+        idx_ji = torch.nonzero(prob_mask_ji, as_tuple=False).flatten()  # rows needing j->i probs
+
+        # Build position lookups so we don't rely on pointer equality with k
+        pos_ij = torch.full((M,), -1, dtype=torch.long, device=device)
+        pos_ji = torch.full((M,), -1, dtype=torch.long, device=device)
+        if idx_ij.numel() > 0:
+            pos_ij[idx_ij] = torch.arange(idx_ij.numel(), device=device)
+        if idx_ji.numel() > 0:
+            pos_ji[idx_ji] = torch.arange(idx_ji.numel(), device=device)
+
+        # === i->j batched evaluation ===
+        p1_i = p2_i = pB_i = None
+        Z_i  = None
+        if idx_ij.numel() > 0:
+            i_nodes = src[idx_ij]
+            j_nodes = dst[idx_ij]
+            y1s = x_out[torch.tensor([f1_map[int(v)] for v in i_nodes.tolist()], device=device)]
+            y2s = x_out[torch.tensor([f2_map[int(v)] for v in i_nodes.tolist()], device=device)]
+            w_ij = edge_attr[idx_ij]
+            x_j  = x[j_nodes]
+            p1_i, p2_i, pB_i, Z_i = self._p12_both_batched(y1s, y2s, w_ij, x_j)  # [Kij]
+
+        # === j->i batched evaluation ===
+        p1_j = p2_j = pB_j = None
+        Z_j  = None
+        if idx_ji.numel() > 0:
+            j_nodes = dst[idx_ji]
+            i_nodes = src[idx_ji]
+            y1s = x_out[torch.tensor([f1_map[int(v)] for v in j_nodes.tolist()], device=device)]
+            y2s = x_out[torch.tensor([f2_map[int(v)] for v in j_nodes.tolist()], device=device)]
+            w_ij = edge_attr[idx_ji]
+            x_i  = x[i_nodes]
+            p1_j, p2_j, pB_j, Z_j = self._p12_both_batched(y1s, y2s, w_ij, x_i)  # [Kji]
+
+        # Occurrence-indexed recording
+        occ_counter = defaultdict(int)
         dir_p12: Dict[Tuple[int,int], Tuple[torch.Tensor, torch.Tensor]] = {}
 
-        def step2c_key_occ(i, j, counter: Dict[Tuple[int,int], int]):
-            k = counter[(int(i), int(j))]
-            counter[(int(i), int(j))] += 1
-            return f"{int(i)}->{int(j)}#{k}"
-
-        occ_counter = defaultdict(int)
-
+        # We loop once over edges only to (a) form occurrence keys,
+        # (b) materialize final child sets using the batched probs we computed,
+        # (c) accumulate logP/entropy.
+        new_edges_2c = []
+        ptr_ij = ptr_ji = 0  # cursors into the batched arrays
         for k in range(M):
-            i, j = src[k], dst[k]
-            w_ij = edge_attr[k]
+            i = int(src[k]); j = int(dst[k])
+            w = edge_attr[k]
 
-            if replay_mode:
-                key_ij = step2c_key_occ(i, j, occ_counter)
-                key_ji = step2c_key_occ(j, i, occ_counter)
-                S_ij = set(int(s) for s in actions_to_replay["step2c_sets"][key_ij])
-                S_ji = set(int(s) for s in actions_to_replay["step2c_sets"][key_ji])
-                assert len(S_ij) in (1, 2), f"Bad step2c_sets[{key_ij}]"
-                assert len(S_ji) in (1, 2), f"Bad step2c_sets[{key_ji}]"
-
-                # compute lp/entropy using recorded choices (no RNG)
-                if i in f_map:
-                    lp_i = x.new_tensor(0.); ent_i = x.new_tensor(0.); p12_i = None
-                else:
-                    y1s_i = x_out[f1_map[i]]; y2s_i = x_out[f2_map[i]]
-                    p1_i, p2_i, pB_i, Z_i = get_p12_both(y1s_i, y2s_i, w_ij, x[j])
-                    has1 = (f1_map[i] in S_ij); has2 = (f2_map[i] in S_ij)
-                    choice_i = 0 if (has1 and not has2) else 1 if (has2 and not has1) else 2
-                    lp_i = torch.log((p1_i if choice_i == 0 else p2_i if choice_i == 1 else pB_i).clamp_min(1e-9))
-                    Zs = Z_i.clamp(1e-9, 1.0); ent_i = -(Zs * torch.log(Zs)).sum()
-                    p12_i = (p1_i, p2_i)
-
-                if j in f_map:
-                    lp_j = x.new_tensor(0.); ent_j = x.new_tensor(0.); p12_j = None
-                else:
-                    y1s_j = x_out[f1_map[j]]; y2s_j = x_out[f2_map[j]]
-                    p1_j, p2_j, pB_j, Z_j = get_p12_both(y1s_j, y2s_j, w_ij, x[i])
-                    has1 = (f1_map[j] in S_ji); has2 = (f2_map[j] in S_ji)
-                    choice_j = 0 if (has1 and not has2) else 1 if (has2 and not has1) else 2
-                    lp_j = torch.log((p1_j if choice_j == 0 else p2_j if choice_j == 1 else pB_j).clamp_min(1e-9))
-                    Zs = Z_j.clamp(1e-9, 1.0); ent_j = -(Zs * torch.log(Zs)).sum()
-                    p12_j = (p1_j, p2_j)
-
-                logP = logP + lp_i + lp_j
-                total_entropy = total_entropy + ent_i + ent_j
-                if p12_i is not None: dir_p12[(j, i)] = p12_i
-                if p12_j is not None: dir_p12[(i, j)] = p12_j
-
-                # materialize edges from recorded sets (directed)
-                for a in S_ij:
-                    for b_ in S_ji:
-                        new_edges.append([int(a), int(b_)])
-
+            # helper to fetch probabilities/logits already computed in batch arrays
+            # for the specific direction if needed
+            # ---- i -> j ----
+            if is_static[i]:
+                S_ij = {f_map[i]}
+                lp_i = x.new_tensor(0.); ent_i = x.new_tensor(0.); p12_i = None
+            elif (i in bj_choice) and (j == bj_choice[i]):
+                S_ij = {f1_map[i], f2_map[i]}
+                lp_i = x.new_tensor(0.); ent_i = x.new_tensor(0.); p12_i = None
             else:
-                # sample for i->j
-                if i in f_map:
-                    S_ij = {f_map[i]}
-                    lp_i = x.new_tensor(0.); ent_i = x.new_tensor(0.); p12_i = None
-                elif (i in bj_choice) and (j == bj_choice[i]):
+                # i is unpooled and this edge is NOT the special 2b neighbor → consume from batched arrays
+                if pos_ij[k] == -1:
+                    # Shouldn't happen; safety check
+                    raise RuntimeError(f"2c: expected i->j probs but pos_ij[{k}] == -1")
+                idx = pos_ij[k]
+                pi1, pi2, piB = p1_i[idx], p2_i[idx], pB_i[idx]
+                Zi = Z_i[idx]
+                if replay_mode:
+                    key_ij = f"{i}->{j}#{occ_counter[(i, j)]}"
+                    occ_counter[(i, j)] += 1
+                    set_rec = set(int(s) for s in actions_to_replay['step2c_sets'][key_ij])
+                    has1 = (f1_map[i] in set_rec)
+                    has2 = (f2_map[i] in set_rec)
+                    choice_i = 0 if (has1 and not has2) else 1 if (has2 and not has1) else 2
+                else:
+                    u = torch.rand((), generator=rng, device=device)
+                    if u < pi1:
+                        choice_i = 0
+                    elif u < (pi1 + pi2):
+                        choice_i = 1
+                    else:
+                        choice_i = 2
+                if choice_i == 0:
+                    S_ij = {f1_map[i]}
+                    lp_i = torch.log(pi1.clamp_min(1e-9))
+                elif choice_i == 1:
+                    S_ij = {f2_map[i]}
+                    lp_i = torch.log(pi2.clamp_min(1e-9))
+                else:
                     S_ij = {f1_map[i], f2_map[i]}
-                    lp_i = x.new_tensor(0.); ent_i = x.new_tensor(0.); p12_i = None
-                else:
-                    y1s_i = x_out[f1_map[i]]; y2s_i = x_out[f2_map[i]]
-                    p1_i, p2_i, pB_i, Z_i = get_p12_both(y1s_i, y2s_i, w_ij, x[j])
-                    u = torch.rand((), generator=rng, device=device)
-                    if u < p1_i:
-                        choice_i = 0; S_ij = {f1_map[i]}; lp_i = torch.log(p1_i.clamp_min(1e-9))
-                    elif u < (p1_i + p2_i):
-                        choice_i = 1; S_ij = {f2_map[i]}; lp_i = torch.log(p2_i.clamp_min(1e-9))
-                    else:
-                        choice_i = 2; S_ij = {f1_map[i], f2_map[i]}; lp_i = torch.log(pB_i.clamp_min(1e-9))
-                    Zs = Z_i.clamp(1e-9, 1.0); ent_i = -(Zs * torch.log(Zs)).sum()
-                    p12_i = (p1_i, p2_i)
+                    lp_i = torch.log(piB.clamp_min(1e-9))
+                Zi_s = Zi.clamp(1e-9, 1.0)
+                ent_i = -(Zi_s * Zi_s.log()).sum()
+                p12_i = (pi1, pi2)
+                if not replay_mode:
+                    key_ij = f"{i}->{j}#{occ_counter[(i, j)]}"
+                    occ_counter[(i, j)] += 1
+                    actions_recorded['step2c_sets'][key_ij] = [int(a) for a in sorted(S_ij)]
 
-                # sample for j->i
-                if j in f_map:
-                    S_ji = {f_map[j]}
-                    lp_j = x.new_tensor(0.); ent_j = x.new_tensor(0.); p12_j = None
-                elif (j in bj_choice) and (i == bj_choice[j]):
+            # ---- j -> i ----
+            if is_static[j]:
+                S_ji = {f_map[j]}
+                lp_j = x.new_tensor(0.); ent_j = x.new_tensor(0.); p12_j = None
+            elif (j in bj_choice) and (i == bj_choice[j]):
+                S_ji = {f1_map[j], f2_map[j]}
+                lp_j = x.new_tensor(0.); ent_j = x.new_tensor(0.); p12_j = None
+            else:
+                if pos_ji[k] == -1:
+                    raise RuntimeError(f"2c: expected j->i probs but pos_ji[{k}] == -1")
+                idx = pos_ji[k]
+                pj1, pj2, pjB = p1_j[idx], p2_j[idx], pB_j[idx]
+                Zj = Z_j[idx]
+                if replay_mode:
+                    key_ji = f"{j}->{i}#{occ_counter[(j, i)]}"
+                    occ_counter[(j, i)] += 1
+                    set_rec = set(int(s) for s in actions_to_replay['step2c_sets'][key_ji])
+                    has1 = (f1_map[j] in set_rec)
+                    has2 = (f2_map[j] in set_rec)
+                    choice_j = 0 if (has1 and not has2) else 1 if (has2 and not has1) else 2
+                else:
+                    u = torch.rand((), generator=rng, device=device)
+                    if u < pj1:
+                        choice_j = 0
+                    elif u < (pj1 + pj2):
+                        choice_j = 1
+                    else:
+                        choice_j = 2
+                if choice_j == 0:
+                    S_ji = {f1_map[j]}
+                    lp_j = torch.log(pj1.clamp_min(1e-9))
+                elif choice_j == 1:
+                    S_ji = {f2_map[j]}
+                    lp_j = torch.log(pj2.clamp_min(1e-9))
+                else:
                     S_ji = {f1_map[j], f2_map[j]}
-                    lp_j = x.new_tensor(0.); ent_j = x.new_tensor(0.); p12_j = None
-                else:
-                    y1s_j = x_out[f1_map[j]]; y2s_j = x_out[f2_map[j]]
-                    p1_j, p2_j, pB_j, Z_j = get_p12_both(y1s_j, y2s_j, w_ij, x[i])
-                    u = torch.rand((), generator=rng, device=device)
-                    if u < p1_j:
-                        choice_j = 0; S_ji = {f1_map[j]}; lp_j = torch.log(p1_j.clamp_min(1e-9))
-                    elif u < (p1_j + p2_j):
-                        choice_j = 1; S_ji = {f2_map[j]}; lp_j = torch.log(p2_j.clamp_min(1e-9))
-                    else:
-                        choice_j = 2; S_ji = {f1_map[j], f2_map[j]}; lp_j = torch.log(pB_j.clamp_min(1e-9))
-                    Zs = Z_j.clamp(1e-9, 1.0); ent_j = -(Zs * torch.log(Zs)).sum()
-                    p12_j = (p1_j, p2_j)
+                    lp_j = torch.log(pjB.clamp_min(1e-9))
+                Zj_s = Zj.clamp(1e-9, 1.0)
+                ent_j = -(Zj_s * Zj_s.log()).sum()
+                p12_j = (pj1, pj2)
+                if not replay_mode:
+                    key_ji = f"{j}->{i}#{occ_counter[(j, i)]}"
+                    occ_counter[(j, i)] += 1
+                    actions_recorded['step2c_sets'][key_ji] = [int(b) for b in sorted(S_ji)]
 
-                # record occurrence-indexed sets
-                key_ij = step2c_key_occ(i, j, occ_counter)
-                key_ji = step2c_key_occ(j, i, occ_counter)
-                actions_recorded['step2c_sets'][key_ij] = [int(a) for a in sorted(S_ij)]
-                actions_recorded['step2c_sets'][key_ji] = [int(b) for b in sorted(S_ji)]
+            # cursor advance if we consumed from batched arrays
+            if not is_static[i] and not (i in bj_choice and j == bj_choice[i]):
+                ptr_ij += 1
+            if not is_static[j] and not (j in bj_choice and i == bj_choice[j]):
+                ptr_ji += 1
 
-                logP = logP + lp_i + lp_j
-                total_entropy = total_entropy + ent_i + ent_j
-                if p12_i is not None: dir_p12[(j, i)] = p12_i
-                if p12_j is not None: dir_p12[(i, j)] = p12_j
+            logP = logP + lp_i + lp_j
+            total_entropy = total_entropy + ent_i + ent_j
+            if p12_i is not None: dir_p12[(j, i)] = p12_i  # store for 2d (note the key)
+            if p12_j is not None: dir_p12[(i, j)] = p12_j
 
-                for a in S_ij:
-                    for b_ in S_ji:
-                        new_edges.append([int(a), int(b_)])
+            # materialize directed edges from sets
+            for a in S_ij:
+                for b_ in S_ji:
+                    new_edges_2c.append([int(a), int(b_)])
+
+        new_edges.extend(new_edges_2c)
 
         # add intra-links
         for idx, parent in enumerate(Iu.tolist()):
             if len(Iu) > 0 and Vc_mask[idx]:
                 new_edges.append([f1_map[parent], f2_map[parent]])
 
+        # For step 2d we need a stable lookup of existing undirected child edges
         stable_edge_set_lookup = set()
         if new_edges:
             for a, b in new_edges:
@@ -424,7 +541,7 @@ class GuoUnpool(nn.Module):
         if len(Iu) > 0:
             Eu = set()
             for k in range(M):
-                i, j = src[k], dst[k]
+                i, j = int(src[k]), int(dst[k])
                 if (i in f1_map) and (j in f1_map):
                     Eu.add(tuple(sorted((i, j))))
             eu_pairs = sorted(list(Eu))
@@ -446,9 +563,10 @@ class GuoUnpool(nn.Module):
 
             for (i, j) in eu_pairs:
                 pair = self._canon_pair(i, j)
+                # locate ek for (i,j) undirected
                 ek = None
                 for kk in range(M):
-                    a, b = src[kk], dst[kk]
+                    a, b = int(src[kk]), int(dst[kk])
                     if {a, b} == {i, j}: ek = kk; break
                 w = edge_attr[ek] if ek is not None else x.new_zeros(self.dw)
 
@@ -461,10 +579,9 @@ class GuoUnpool(nn.Module):
                     chosen = (u1 < pa)
                     actions_recorded["step2d_pa"][pair] = int(chosen)
 
-                logP_A = logP_A + (torch.log(pa + 1e-9) if chosen else torch.log(1 - pa + 1e-9))
+                logP_A = logP_A + (torch.log(pa.clamp_min(1e-9)) if chosen else torch.log((1 - pa).clamp_min(1e-9)))
                 pa_stable = pa.clamp(1e-9, 1.0 - 1e-9)
-                entropy_pa = -(pa_stable * torch.log(pa_stable) + (1 - pa_stable) * torch.log(1 - pa_stable))
-                total_entropy = total_entropy + entropy_pa
+                total_entropy = total_entropy + (-(pa_stable * pa_stable.log() + (1 - pa_stable) * (1 - pa_stable).log()))
 
                 if not chosen:
                     if not replay_mode:
@@ -472,39 +589,35 @@ class GuoUnpool(nn.Module):
                     continue
 
                 n_i, n_j = N_size(i, j), N_size(j, i)
-
                 if replay_mode:
                     side_tag, pick_idx = actions_to_replay["step2d_rij"][pair]
                     if side_tag in ("pick_j", "pick_i"):
                         assert self._canon_pair(i, j) in actions_to_replay.get("step2d_edges", {}), \
                             f"Missing step2d_edges for pair {self._canon_pair(i, j)}"
                     if side_tag == "pick_j":
-                        key = (i, j)  # p12 for node_self=j stored under (i,j)
+                        key = (i, j)
                         p1, p2 = dir_p12.get(key, (x.new_tensor(0.5), x.new_tensor(0.5)))
                         denom = (p1 + p2 + 1e-9)
                         pick_j = int(pick_idx)
                         ci, cj = actions_to_replay["step2d_edges"][self._canon_pair(i, j)]
                         added_edges_2d.append([int(ci), int(cj)])
-                        logP_A = logP_A + torch.log((p1 if pick_j == 1 else p2).div(denom).clamp(min=1e-9))
+                        logP_A = logP_A + torch.log((p1 if pick_j == 1 else p2).div(denom).clamp_min(1e-9))
                         prob_pick1 = (p1 / denom).clamp(1e-9, 1 - 1e-9)
-                        entropy_rij = -(prob_pick1 * prob_pick1.log() + (1 - prob_pick1) * (1 - prob_pick1).log())
-                        total_entropy = total_entropy + entropy_rij
-
+                        total_entropy = total_entropy + (-(prob_pick1 * prob_pick1.log()
+                                                          + (1 - prob_pick1) * (1 - prob_pick1).log()))
                     elif side_tag == "pick_i":
-                        key = (j, i)  # p12 for node_self=i stored under (j,i)
+                        key = (j, i)
                         p1, p2 = dir_p12.get(key, (x.new_tensor(0.5), x.new_tensor(0.5)))
                         denom = (p1 + p2 + 1e-9)
                         pick_i = int(pick_idx)
                         ci, cj = actions_to_replay["step2d_edges"][self._canon_pair(i, j)]
                         added_edges_2d.append([int(ci), int(cj)])
-                        logP_A = logP_A + torch.log((p1 if pick_i == 1 else p2).div(denom).clamp(min=1e-9))
+                        logP_A = logP_A + torch.log((p1 if pick_i == 1 else p2).div(denom).clamp_min(1e-9))
                         prob_pick1 = (p1 / denom).clamp(1e-9, 1 - 1e-9)
-                        entropy_rij = -(prob_pick1 * prob_pick1.log() + (1 - prob_pick1) * (1 - prob_pick1).log())
-                        total_entropy = total_entropy + entropy_rij
-
+                        total_entropy = total_entropy + (-(prob_pick1 * prob_pick1.log()
+                                                          + (1 - prob_pick1) * (1 - prob_pick1).log()))
                     else:
-                        pass  # "none"
-
+                        pass
                 else:
                     if (n_i + n_j) == 3:
                         if n_i == 1 and n_j == 2:
@@ -512,44 +625,36 @@ class GuoUnpool(nn.Module):
                             p1, p2 = dir_p12.get(key, (torch.tensor(0.5, device=device), torch.tensor(0.5, device=device)))
                             denom = (p1 + p2 + 1e-9)
                             prob_pick1 = (p1 / denom).clamp(1e-9, 1 - 1e-9)
-
                             u2 = torch.rand((), generator=rng, device=device)
                             pick_j = 1 if u2 < prob_pick1 else 2
                             actions_recorded["step2d_rij"][pair] = ("pick_j", int(pick_j))
-
-                            logP_A = logP_A + torch.log((p1 if pick_j == 1 else p2).div(denom).clamp(min=1e-9))
+                            logP_A = logP_A + torch.log((p1 if pick_j == 1 else p2).div(denom).clamp_min(1e-9))
                             ci_options = sorted(list({f1_map[i], f2_map[i]}))
                             cj_options = sorted(list({f1_map[j], f2_map[j]}))
                             ci = next(c for c in ci_options if not any(tuple(sorted((c, t))) in stable_edge_set_lookup for t in cj_options))
                             cj = f1_map[j] if pick_j == 1 else f2_map[j]
                             added_edges_2d.append([ci, cj])
-
                             actions_recorded.setdefault("step2d_edges", {})[self._canon_pair(i, j)] = [int(ci), int(cj)]
-
-                            entropy_rij = -(prob_pick1 * prob_pick1.log() + (1 - prob_pick1) * (1 - prob_pick1).log())
-                            total_entropy = total_entropy + entropy_rij
+                            total_entropy = total_entropy + (-(prob_pick1 * prob_pick1.log()
+                                                              + (1 - prob_pick1) * (1 - prob_pick1).log()))
                         elif n_j == 1 and n_i == 2:
                             key = (j, i)
                             p1, p2 = dir_p12.get(key, (torch.tensor(0.5, device=device), torch.tensor(0.5, device=device)))
                             denom = (p1 + p2 + 1e-9)
                             prob_pick1 = (p1 / denom).clamp(1e-9, 1 - 1e-9)
-
                             u2 = torch.rand((), generator=rng, device=device)
                             pick_i = 1 if u2 < prob_pick1 else 2
                             actions_recorded["step2d_rij"][pair] = ("pick_i", int(pick_i))
-
-                            logP_A = logP_A + torch.log((p1 if pick_i == 1 else p2).div(denom).clamp(min=1e-9))
+                            logP_A = logP_A + torch.log((p1 if pick_i == 1 else p2).div(denom).clamp_min(1e-9))
                             cj_options = sorted(list({f1_map[j], f2_map[j]}))
                             ci_options = sorted(list({f1_map[i], f2_map[i]}))
                             cj = next(c for c in cj_options if not any(tuple(sorted((c, t))) in stable_edge_set_lookup for t in ci_options))
                             ci = f1_map[i] if pick_i == 1 else f2_map[i]
                             added_edges_2d.append([ci, cj])
-
                             actions_recorded.setdefault("step2d_edges", {})[self._canon_pair(i, j)] = [int(ci), int(cj)]
-
-                            entropy_rij = -(prob_pick1 * prob_pick1.log() + (1 - prob_pick1) * (1 - prob_pick1).log())
-                            total_entropy = total_entropy + entropy_rij
-                    else:  # n_i + n_j == 4 → no extra edges needed
+                            total_entropy = total_entropy + (-(prob_pick1 * prob_pick1.log()
+                                                              + (1 - prob_pick1) * (1 - prob_pick1).log()))
+                    else:
                         actions_recorded["step2d_rij"][pair] = ("none", 0)
                         pass
 
@@ -731,9 +836,13 @@ if __name__ == "__main__":
     import json
     import copy
     from datetime import datetime
-    import matplotlib.pyplot as plt
     from torch_geometric.nn import global_mean_pool
+    from dehb_helper import DEHBHelper, DEHBRunConfig, ObjectiveResult
+    import graph_similarity2 as GS2
     import graph_similarity as GS
+    import numpy as np
+    import ConfigSpace as CS
+    import matplotlib.pyplot as plt
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SEED = 1234
@@ -741,15 +850,15 @@ if __name__ == "__main__":
     ACTOR_RNG.manual_seed(SEED + 7)
 
     # ---------- config ----------
-    LR           = 1e-4
+    LR           = 3e-4
     ENTROPY_COEF = 0.01
-    EPOCHS       = 25
-    BATCH_SIZE   = 64
+    EPOCHS       = 50
+    BATCH_SIZE   = 256
     NOISE_STD    = 0
-    PRINT_EVERY  = 1
+    PRINT_EVERY  = 10
 
     # dataset sizes
-    N_TRAIN = 960
+    N_TRAIN = 3840
     N_VAL   = 1000
     N_MIN_NODES = 7
     N_MAX_NODES = 11
@@ -763,6 +872,41 @@ if __name__ == "__main__":
     P_EXTRA              = 0.25
 
     K_MAX = 2
+
+
+    def build_configspace(seed: int = 0) -> CS.ConfigurationSpace:
+        cs = CS.ConfigurationSpace(seed=seed)
+
+        # Examples targeted to your script:
+        # LR (log scale)
+        cs.add_hyperparameter(CS.UniformFloatHyperparameter("lr", lower=1e-5, upper=3e-3, log=True))
+
+        # ENTROPY_COEF (log scale-ish; keep it small)
+        cs.add_hyperparameter(CS.UniformFloatHyperparameter("entropy_coef", lower=1e-4, upper=5e-2, log=True))
+
+        # Unpool MLP widths (categorical)
+        cs.add_hyperparameter(CS.CategoricalHyperparameter("unpool_size", choices=[128, 256, 384, 512]))
+
+        # Batch size (categorical)
+        cs.add_hyperparameter(CS.CategoricalHyperparameter("batch_size", choices=[64, 128, 256, 384]))
+
+        # PPO update epochs (small int)
+        cs.add_hyperparameter(CS.UniformIntegerHyperparameter("ppo_update_epochs", lower=2, upper=8))
+
+        # PPO clip epsilon
+        cs.add_hyperparameter(CS.UniformFloatHyperparameter("ppo_clip_eps", lower=0.05, upper=0.3, log=False))
+
+        return cs
+
+
+
+
+
+
+
+
+
+
 
     def unpool_k_fixed(unpool, x0, ei0, ea0=None, k: int = K_MAX,
                        actions_to_replay: list[Dict] | None = None, rng: torch.Generator | None = None):
@@ -1084,7 +1228,7 @@ if __name__ == "__main__":
 
     # ---------- validation ----------
     @torch.no_grad()
-    def evaluate(dataset, n_eval=64):
+    def evaluate(dataset, similarity_metric, n_eval=64):
         unpool.eval()
         # snapshot actor RNG
         rng_state = ACTOR_RNG.get_state()
@@ -1092,7 +1236,10 @@ if __name__ == "__main__":
             total = 0.0
             count = 0
             avg_gen_n_size = avg_tgt_n_size = avg_gen_e_size = avg_tgt_e_size = 0
-            for (x_seed, x_t, ei_t, ea_t) in random.sample(dataset, k=min(n_eval, len(dataset))):
+            if len(dataset) != n_eval:
+                dataset = random.sample(dataset, k=min(n_eval, len(dataset)))
+
+            for (x_seed, x_t, ei_t, ea_t) in dataset:
                 x_gen, ei_gen, ea_gen, _, _, _ = unpool_k_fixed(
                     unpool, x_seed, seed_ei, None, k=K_MAX, rng=ACTOR_RNG
                 )
@@ -1100,7 +1247,7 @@ if __name__ == "__main__":
                 avg_gen_n_size += x_gen.size(0); avg_tgt_n_size += x_t.size(0)
                 avg_gen_e_size += ei_gen.size(1); avg_tgt_e_size += ei_t.size(1)
 
-                score, _ = GS.graph_similarity(
+                score, _ = similarity_metric.graph_similarity(
                     ei_gen.cpu(), ei_t.cpu(),
                     x1=x_gen.cpu(), x2=x_t.cpu(),
                     edge_attr1=ea_gen.cpu(),
@@ -1242,9 +1389,17 @@ if __name__ == "__main__":
 
         # Print detailed log every PRINT_EVERY epochs, otherwise print a concise one
         if (epoch % PRINT_EVERY) == 0 or epoch == 1:
-            val_R = evaluate(val_set)
+            n_eval = 64
+            test_sample = random.sample(val_set, k=min(n_eval, len(val_set)))
+
+            val_R = evaluate(test_sample, GS, n_eval=n_eval)
             print(f"[{epoch:04d}] loss={avg_total_loss:<7.4f} | p_loss={avg_policy_loss:<7.4f} | v_loss={avg_value_loss:<7.4f} | "
                   f"train_R={avg_reward:.3f} | val_R={val_R:.3f} | critic_V={avg_critic_value:.3f} | entropy={avg_entropy:.3f}")
+
+            ##
+            other_score = evaluate(test_sample, GS2, n_eval=n_eval)
+            print(f"Other score: {other_score}")
+            ##
         else:
             print(f"[{epoch:04d}] loss={avg_total_loss:<7.4f} | train_R={avg_reward:.3f} | critic_V={avg_critic_value:.3f}")
 
