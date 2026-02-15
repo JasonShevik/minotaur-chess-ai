@@ -120,6 +120,7 @@ def perturb_position(
                 new_sq = move.to_square
                 new_visited = visited | {new_sq}
                 if moves_done + 1 == target:
+                    next_board.turn = turn_white
                     return next_board.fen()
                 next_board.turn = turn_white
                 result = try_complete_moves(next_board, new_sq, new_visited, moves_done + 1, target)
@@ -579,22 +580,20 @@ if __name__ == "__main__":
     # 5 King move
     # 6 Queen move
 
-    visualize_graph(get_chess_graph_edges()[2])
+    #visualize_graph(get_chess_graph_edges()[2])
     #visualize_graph(get_castling_edges(hu.fen_to_vector("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")))
 
-    # Confirmed correct:
-    # Pawn move edges
-    # Pawn attack edges
-    # Knight edges
 
-    # Bishop move
-    # Rook move
-    # King move
-
-
-
-
-
+    # Visualize board perturbations
+    fen = "r1bq1b1r/ppp3pp/2n1k3/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R w KQ - 0 1"
+    board = chess.Board(fen)
+    print(board)
+    print(fen)
+    print("\n")
+    fen = perturb_position(fen, perturb_type=0, magnitude=1)
+    board = chess.Board(fen)
+    print(board)
+    print(fen)
 
 
 
