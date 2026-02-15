@@ -87,14 +87,14 @@ def perturb_position(
     """
 
     def perturb_fen_piece_move_legal(fen_str: str) -> str:
-        # Do 'magnitude' legal moves of the same piece in a row (same side to move after each).
-        # Exclude moves that transpose back to a square the piece has already visited.
+        # Do 'magnitude' legal moves of the same piece in a row. The piece can be of either color;
+        # we temporarily set the board's turn to that piece's color to get legal moves, then restore
+        # the original turn after each move so the final FEN keeps e.g. white to move.
         rand = rng if rng is not None else random
         n = max(1, int(magnitude))
         board = chess.Board(fen_str)
-        turn_white = board.turn
-        color = chess.WHITE if turn_white else chess.BLACK
-        order = [s for s in chess.SQUARES if board.piece_at(s) is not None and board.color_at(s) == color] # List of all of our squares
+        turn_white = board.turn  # turn to show in final FEN (unchanged by our moves)
+        order = [s for s in chess.SQUARES if board.piece_at(s) is not None]
         rand.shuffle(order)
 
         def try_complete_moves(
@@ -107,6 +107,10 @@ def perturb_position(
             """Try to complete exactly `target` moves; at each step try all candidates (shuffled)."""
             if moves_done == target:
                 return current.fen()
+            piece_color = current.color_at(piece_square)
+            if piece_color is None:
+                return None
+            current.turn = piece_color
             candidates = [
                 m for m in current.legal_moves
                 if m.from_square == piece_square and m.to_square not in visited and m.promotion is None
