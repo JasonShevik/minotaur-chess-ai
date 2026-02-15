@@ -75,7 +75,8 @@ def perturb_position(
     :param fen: FEN string of the position to perturb.
     :param perturb_type: Which perturbation to apply (0..7). If None, one is chosen
         from type_distribution or uniformly at random.
-    :param magnitude: Interpretation depends on perturb_type.
+    :param magnitude: Interpretation depends on perturb_type, but it is the size 
+        of a single perturbation, not the total number of perturbations.
     :param type_distribution: When perturb_type is None, how to choose the type.
         - If a 1D tensor of shape (num_types,): if all values are in [0, 1], treated
           as probabilities (normalized by sum); otherwise treated as logits (softmax).
@@ -86,7 +87,7 @@ def perturb_position(
     :return: Perturbed position as a FEN string.
     """
 
-    def perturb_fen_piece_move_legal(fen_str: str) -> str:
+    def perturb_fen_piece_move_legal(fen_str: str) -> str:      # ----- Perturbation Type 0 -----
         # Do 'magnitude' legal moves of the same piece in a row. The piece can be of either color;
         # we temporarily set the board's turn to that piece's color to get legal moves, then restore
         # the original turn after each move so the final FEN keeps e.g. white to move.
@@ -144,27 +145,82 @@ def perturb_position(
                     return result
         return fen_str
 
-    def perturb_fen_piece_move_illegal(fen_str: str) -> str:
-        # TODO: move a piece to a square it can reach (neighbor) but that is not legal (blocked, check, etc.)
+    def perturb_fen_piece_move_illegal(fen_str: str) -> str:      # ----- Perturbation Type 1 -----
+        # Pick a random piece, find unoccupied squares within magnitude (Chebyshev) radius,
+        # exclude squares that are legal moves for that piece, then move the piece to a random
+        # illegal destination (starting square becomes empty).
+        rand = rng if rng is not None else random
+        board = chess.Board(fen_str)
+        turn_white = board.turn
+        radius = max(1, int(magnitude))
+        order = [s for s in chess.SQUARES if board.piece_at(s) is not None]
+        if not order:
+            return fen_str
+        rand.shuffle(order)
+        for start_square in order:
+            piece = board.piece_at(start_square)
+            if piece is None:
+                continue
+            f0, r0 = chess.square_file(start_square), chess.square_rank(start_square)
+            in_radius = []
+            for f in range(8):
+                for r in range(8):
+                    if max(abs(f - f0), abs(r - r0)) <= radius:
+                        sq = chess.square(f, r)
+                        if sq == start_square:
+                            continue
+                        if board.piece_at(sq) is not None:
+                            continue
+                        in_radius.append(sq)
+            if not in_radius:
+                continue
+            piece_color = piece.color
+            board.turn = piece_color
+            legal_to = {m.to_square for m in board.legal_moves if m.from_square == start_square}
+            illegal_dest = [sq for sq in in_radius if sq not in legal_to]
+            if not illegal_dest:
+                continue
+            to_square = rand.choice(illegal_dest)
+            board.remove_piece_at(start_square)
+            board.set_piece_at(to_square, chess.Piece(piece.piece_type, piece.color))
+            board.turn = turn_white
+            return board.fen()
+        board.turn = turn_white
         return fen_str
 
-    def perturb_fen_piece_deletion(fen_str: str) -> str:
-        # TODO: remove one or more pieces
-        return fen_str
+    def perturb_fen_piece_deletion(fen_str: str) -> str:      # ----- Perturbation Type 2 -----
+        # Delete exactly one "thing" at random: any piece (either color, including kings) or the
+        # en passant target square if present. Magnitude is ignored.
+        rand = rng if rng is not None else random
+        board = chess.Board(fen_str)
+        options: List[Optional[chess.Square]] = [
+            s for s in chess.SQUARES if board.piece_at(s) is not None
+        ]
+        if board.ep_square is not None:
+            options.append(None)  # sentinel: clear en passant
+        if not options:
+            return fen_str
+        choice = rand.choice(options)
+        if choice is None:
+            board.ep_square = None
+            return board.fen()
+        else:
+            board.remove_piece_at(choice)
+            return board.fen()
 
-    def perturb_fen_piece_addition(fen_str: str) -> str:
+    def perturb_fen_piece_addition(fen_str: str) -> str:      # ----- Perturbation Type 3 -----
         # TODO: add a piece on an empty square
         return fen_str
 
-    def perturb_fen_piece_swap(fen_str: str) -> str:
+    def perturb_fen_piece_swap(fen_str: str) -> str:      # ----- Perturbation Type 4 -----
         # TODO: swap two pieces
         return fen_str
 
-    def perturb_fen_piece_change(fen_str: str) -> str:
+    def perturb_fen_piece_change(fen_str: str) -> str:      # ----- Perturbation Type 5 -----
         # TODO: change piece type (e.g. knight -> bishop)
         return fen_str
 
-    def perturb_fen_piece_color_change(fen_str: str) -> str:
+    def perturb_fen_piece_color_change(fen_str: str) -> str:      # ----- Perturbation Type 6 -----
         # TODO: flip color of a piece
         return fen_str
 
@@ -594,7 +650,7 @@ if __name__ == "__main__":
     print(board)
     print(fen)
     print("\n")
-    fen = perturb_position(fen, perturb_type=0, magnitude=1)
+    fen = perturb_position(fen, perturb_type=1, magnitude=1)
     board = chess.Board(fen)
     print(board)
     print(fen)
