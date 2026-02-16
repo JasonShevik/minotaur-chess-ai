@@ -244,7 +244,7 @@ def perturb_position(
                 options.append(("ep", ep_sq))
 
         # All piece additions: each empty square × each (piece_type, color)
-        piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+        piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
         for s in chess.SQUARES:
             if board.piece_at(s) is not None:
                 continue
@@ -264,18 +264,56 @@ def perturb_position(
         return board.fen()
 
     def perturb_fen_piece_swap(fen_str: str) -> str:      # ----- Perturbation Type 4 -----
-        # TODO: swap two pieces
-        return fen_str
+        # Swap two randomly chosen pieces that differ in type or color (so the position actually changes).
+        # Magnitude ignored. No en passant.
+        rand = rng if rng is not None else random
+        board = chess.Board(fen_str)
+        occupied = [s for s in chess.SQUARES if board.piece_at(s) is not None]
+        if len(occupied) < 2:
+            return fen_str
+        if len({(board.piece_at(s).piece_type, board.piece_at(s).color) for s in occupied}) < 2:
+            return fen_str
+        while True:
+            sq1, sq2 = rand.sample(occupied, 2)
+            p1, p2 = board.piece_at(sq1), board.piece_at(sq2)
+            if p1.piece_type != p2.piece_type or p1.color != p2.color:
+                break
+        board.remove_piece_at(sq1)
+        board.remove_piece_at(sq2)
+        board.set_piece_at(sq1, p2)
+        board.set_piece_at(sq2, p1)
+        return board.fen()
 
     def perturb_fen_piece_change(fen_str: str) -> str:      # ----- Perturbation Type 5 -----
-        # TODO: change piece type (e.g. knight -> bishop)
-        return fen_str
+        # Pick a random piece on the board and change it to a random different piece type (same color).
+        # En passant not considered; all pieces except kings count. Magnitude ignored.
+        rand = rng if rng is not None else random
+        board = chess.Board(fen_str)
+        piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
+        occupied = [s for s in chess.SQUARES if (board.piece_at(s) is not None and board.piece_at(s).piece_type != chess.KING)]
+        if not occupied:
+            return fen_str
+        square = rand.choice(occupied)
+        piece = board.piece_at(square)
+        other_types = [t for t in piece_types if t != piece.piece_type]
+        new_type = rand.choice(other_types)
+        board.set_piece_at(square, chess.Piece(new_type, piece.color))
+        return board.fen()
 
     def perturb_fen_piece_color_change(fen_str: str) -> str:      # ----- Perturbation Type 6 -----
-        # TODO: flip color of a piece
-        return fen_str
+        # Pick a random piece (not a king; en passant not considered) and flip its color.
+        rand = rng if rng is not None else random
+        board = chess.Board(fen_str)
+        swappable = [s for s in chess.SQUARES if board.piece_at(s) is not None and board.piece_at(s).piece_type != chess.KING]
+        if not swappable:
+            return fen_str
+        square = rand.choice(swappable)
+        piece = board.piece_at(square)
+        new_color = chess.BLACK if piece.color == chess.WHITE else chess.WHITE
+        board.set_piece_at(square, chess.Piece(piece.piece_type, new_color))
+        return board.fen()
 
-    def perturb_fen_castling_rights_change(fen_str: str) -> str:
+    def perturb_fen_castling_rights_change(fen_str: str) -> str:     # ----- Perturbation Type 7 -----
         # TODO: change castling rights
         return fen_str
 
@@ -703,7 +741,7 @@ if __name__ == "__main__":
     print(board)
     print(fen)
     print("\n")
-    fen = perturb_position(fen, perturb_type=2, magnitude=1)
+    fen = perturb_position(fen, perturb_type=4, magnitude=1)
     board = chess.Board(fen)
     print(board)
     print(fen)
