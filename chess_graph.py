@@ -209,8 +209,59 @@ def perturb_position(
             return board.fen()
 
     def perturb_fen_piece_addition(fen_str: str) -> str:      # ----- Perturbation Type 3 -----
-        # TODO: add a piece on an empty square
-        return fen_str
+        # Add one thing at random: a piece (any type and color) on an empty square, or an en passant
+        # target. If en passant is not already set, possible ep squares are inferred from 4th/5th rank
+        # pawn pairs (adjacent files with one white and one black pawn). Magnitude is ignored.
+        rand = rng if rng is not None else random
+        board = chess.Board(fen_str)
+        options: List[Tuple[str, Any]] = []
+
+        # Possible en passant squares only when ep is not already set (each square at most once).
+        # Only consider the rank where the side to move could capture en passant: Black to move -> 4th rank (white just moved); White to move -> 5th rank (black just moved).
+        possible_ep_squares: set[chess.Square] = set()
+        if board.ep_square is None:
+            if board.turn == chess.BLACK:
+                # 4th rank: white could have just moved two -> 3rd rank ep squares (Black captures)
+                for f in range(7):
+                    sq_a, sq_b = chess.square(f, 3), chess.square(f + 1, 3)
+                    pa, pb = board.piece_at(sq_a), board.piece_at(sq_b)
+                    if pa is not None and pb is not None and pa.piece_type == chess.PAWN and pb.piece_type == chess.PAWN:
+                        if pa.color != pb.color:
+                            ep_sq = chess.square(f, 2) if pa.color == chess.WHITE else chess.square(f + 1, 2)
+                            if board.piece_at(ep_sq) is None:
+                                possible_ep_squares.add(ep_sq)
+            else:
+                # 5th rank: black could have just moved two -> 6th rank ep squares (White captures)
+                for f in range(7):
+                    sq_a, sq_b = chess.square(f, 4), chess.square(f + 1, 4)
+                    pa, pb = board.piece_at(sq_a), board.piece_at(sq_b)
+                    if pa is not None and pb is not None and pa.piece_type == chess.PAWN and pb.piece_type == chess.PAWN:
+                        if pa.color != pb.color:
+                            ep_sq = chess.square(f, 5) if pa.color == chess.BLACK else chess.square(f + 1, 5)
+                            if board.piece_at(ep_sq) is None:
+                                possible_ep_squares.add(ep_sq)
+            for ep_sq in possible_ep_squares:
+                options.append(("ep", ep_sq))
+
+        # All piece additions: each empty square × each (piece_type, color)
+        piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+        for s in chess.SQUARES:
+            if board.piece_at(s) is not None:
+                continue
+            for pt in piece_types:
+                for color in (chess.WHITE, chess.BLACK):
+                    options.append(("piece", s, pt, color))
+
+        if not options:
+            return fen_str
+        choice = rand.choice(options)
+        if choice[0] == "ep":
+            parts = board.fen().split()
+            parts[3] = chess.square_name(choice[1])
+            return " ".join(parts)
+        _tag, square, piece_type, color = choice
+        board.set_piece_at(square, chess.Piece(piece_type, color))
+        return board.fen()
 
     def perturb_fen_piece_swap(fen_str: str) -> str:      # ----- Perturbation Type 4 -----
         # TODO: swap two pieces
@@ -645,12 +696,14 @@ if __name__ == "__main__":
 
 
     # Visualize board perturbations
-    fen = "r1bq1b1r/ppp3pp/2n1k3/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R w KQ - 0 1"
+    # Example FEN: "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w KQkq - 0 1" # En passant example
+    # Example FEN: "r1bq1b1r/ppp3pp/2n1k3/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R w KQ - 0 1" # Fried Liver Attack
+    fen = "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w KQkq - 0 1"
     board = chess.Board(fen)
     print(board)
     print(fen)
     print("\n")
-    fen = perturb_position(fen, perturb_type=1, magnitude=1)
+    fen = perturb_position(fen, perturb_type=2, magnitude=1)
     board = chess.Board(fen)
     print(board)
     print(fen)
