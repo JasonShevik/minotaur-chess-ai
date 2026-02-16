@@ -314,8 +314,80 @@ def perturb_position(
         return board.fen()
 
     def perturb_fen_castling_rights_change(fen_str: str) -> str:     # ----- Perturbation Type 7 -----
-        # TODO: change castling rights
-        return fen_str
+        # One of: remove an existing castling right, or add a castling right if sensical (Chess960-aware).
+        # Kings go to g1/g8 or c1/c8; rooks to f1/f8 or d1/d8. Magnitude ignored.
+        rand = rng if rng is not None else random
+        board = chess.Board(fen_str)
+
+        # Destinations (standard): white K g1/f1, white Q c1/d1; black K g8/f8, black Q c8/d8
+        WK_KING, WK_ROOK = chess.square(6, 0), chess.square(5, 0)   # g1, f1
+        WQ_KING, WQ_ROOK = chess.square(2, 0), chess.square(3, 0)   # c1, d1
+        BK_KING, BK_ROOK = chess.square(6, 7), chess.square(5, 7)   # g8, f8
+        BQ_KING, BQ_ROOK = chess.square(2, 7), chess.square(3, 7)   # c8, d8
+
+        def squares_between_file_range(rank: int, f_lo: int, f_hi: int) -> set:
+            return {chess.square(f, rank) for f in range(min(f_lo, f_hi), max(f_lo, f_hi) + 1)}
+
+        def can_add_castling(
+            color: chess.Color,
+            kingside: bool,
+            king_dest: int,
+            rook_dest: int,
+            rank: int,
+        ) -> bool:
+            king_sq = board.king(color)
+            if king_sq is None:
+                return False
+            kf, kr = chess.square_file(king_sq), chess.square_rank(king_sq)
+            dest_f = chess.square_file(king_dest)
+            rooks_on_rank = [
+                s for s in chess.SQUARES
+                if chess.square_rank(s) == rank
+                and board.piece_at(s) == chess.Piece(chess.ROOK, color)
+            ]
+            # Chess960: kingside = rook to the right of the king (nearest one); queenside = rook to the left (nearest).
+            # So king on f1, rooks on g1 and h1 -> kingside rook is g1 (moves to f1); king can stay on g1.
+            candidates = [s for s in rooks_on_rank if (chess.square_file(s) > kf if kingside else chess.square_file(s) < kf)]
+            if not candidates:
+                return False
+            rook_sq = min(candidates, key=chess.square_file) if kingside else max(candidates, key=chess.square_file)
+            rf = chess.square_file(rook_sq)
+            path_king = squares_between_file_range(rank, kf, dest_f)
+            path_rook = squares_between_file_range(rank, rf, chess.square_file(rook_dest))
+            union = path_king | path_rook
+            pieces_on = [s for s in union if board.piece_at(s) is not None]
+            if len(pieces_on) != 2 or set(pieces_on) != {king_sq, rook_sq}:
+                return False
+            for sq in path_king:
+                if board.is_attacked_by(not color, sq):
+                    return False
+            return True
+
+        castling_str = board.fen().split()[2]
+        current = set(c for c in castling_str if c in "KQkq")
+        actions: List[Tuple[str, str]] = []  # ('remove'|'add', 'K'|'Q'|'k'|'q')
+        for key, color, kingside, king_dest, rook_dest, rank in [
+            ("K", chess.WHITE, True, WK_KING, WK_ROOK, 0),
+            ("Q", chess.WHITE, False, WQ_KING, WQ_ROOK, 0),
+            ("k", chess.BLACK, True, BK_KING, BK_ROOK, 7),
+            ("q", chess.BLACK, False, BQ_KING, BQ_ROOK, 7),
+        ]:
+            if key in current:
+                actions.append(("remove", key))
+            elif can_add_castling(color, kingside, king_dest, rook_dest, rank):
+                actions.append(("add", key))
+
+        if not actions:
+            return fen_str
+        op, key = rand.choice(actions)
+        if op == "remove":
+            new_set = current - {key}
+        else:
+            new_set = current | {key}
+        new_castling = "".join(c for c in "KQkq" if c in new_set) if new_set else "-"
+        parts = board.fen().split()
+        parts[2] = new_castling
+        return " ".join(parts)
 
     perturbation_dispatch_table: Dict[int, Callable[[str], str]] = {
         0: perturb_fen_piece_move_legal,
@@ -734,9 +806,9 @@ if __name__ == "__main__":
 
 
     # Visualize board perturbations
-    # Example FEN: "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w KQkq - 0 1" # En passant example
-    # Example FEN: "r1bq1b1r/ppp3pp/2n1k3/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R w KQ - 0 1" # Fried Liver Attack
-    fen = "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w KQkq - 0 1"
+    # Example FEN: "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w Kk - 0 1" # En passant example
+    # Example FEN: "r1bq1b1r/ppp3pp/2n1k3/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R w K - 0 1" # Fried Liver Attack
+    fen = "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w - - 0 1"
     board = chess.Board(fen)
     print(board)
     print(fen)
