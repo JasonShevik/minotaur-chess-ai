@@ -3,7 +3,6 @@ import chess
 import torch
 import math
 import random
-import helper_utils as hu
 import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils import to_networkx
@@ -62,6 +61,59 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     return edges_lists
 
 
+# Castling destination squares (standard / Chess960): king g1/f1, c1/d1; g8/f8, c8/d8
+_CASTLING_DESTS = [
+    ("K", chess.WHITE, True, chess.square(6, 0), chess.square(5, 0), 0),
+    ("Q", chess.WHITE, False, chess.square(2, 0), chess.square(3, 0), 0),
+    ("k", chess.BLACK, True, chess.square(6, 7), chess.square(5, 7), 7),
+    ("q", chess.BLACK, False, chess.square(2, 7), chess.square(3, 7), 7),
+]
+
+
+def is_castling_right_plausible(board: chess.Board, key: str) -> bool:
+    """
+    Return True if the given castling right (K, Q, k, q) is still plausible on this board:
+    the king is on the correct back rank and there is at least one rook of that color on
+    the correct side of the king (kingside = right of king, queenside = left of king).
+    We do not check for blocking pieces or attacks on the path; edges represent the
+    right to castle, not whether castling is currently legal.
+    """
+    if key not in "KQkq":
+        return False
+    params = {k: (c, ks, kd, rd, r) for k, c, ks, kd, rd, r in _CASTLING_DESTS}
+    color, kingside, king_dest, rook_dest, rank = params[key]
+    king_sq = board.king(color)
+    if king_sq is None or chess.square_rank(king_sq) != rank:
+        return False
+    kf = chess.square_file(king_sq)
+    rooks_on_rank = [
+        s for s in chess.SQUARES
+        if chess.square_rank(s) == rank
+        and board.piece_at(s) == chess.Piece(chess.ROOK, color)
+    ]
+    candidates = [s for s in rooks_on_rank if (chess.square_file(s) > kf if kingside else chess.square_file(s) < kf)]
+    return len(candidates) > 0
+
+
+def fix_castling_in_fen(fen_str: str) -> str:
+    """
+    Return FEN with castling string pruned to only plausible rights. Only removes rights
+    that are no longer plausible; never adds castling. Call after any perturbation that
+    might have made castling implausible (e.g. king/rook moved, piece deleted, etc.).
+    """
+    parts = fen_str.split()
+    if len(parts) < 3:
+        return fen_str
+    current = set(c for c in parts[2] if c in "KQkq")
+    if not current:
+        return fen_str
+    board = chess.Board(fen_str)
+    plausible = {k for k in current if is_castling_right_plausible(board, k)}
+    new_castling = "".join(c for c in "KQkq" if c in plausible) if plausible else "-"
+    parts[2] = new_castling
+    return " ".join(parts)
+
+
 def perturb_position(
     fen: str,
     perturb_type: Optional[int] = None,
@@ -107,7 +159,7 @@ def perturb_position(
         ) -> Optional[str]:
             """Try to complete exactly `target` moves; at each step try all candidates (shuffled)."""
             if moves_done == target:
-                return current.fen()
+                return fix_castling_in_fen(current.fen())
             piece_color = current.color_at(piece_square)
             if piece_color is None:
                 return None
@@ -126,7 +178,7 @@ def perturb_position(
                 new_visited = visited | {new_sq}
                 if moves_done + 1 == target:
                     next_board.turn = turn_white
-                    return next_board.fen()
+                    return fix_castling_in_fen(next_board.fen())
                 next_board.turn = turn_white
                 result = try_complete_moves(next_board, new_sq, new_visited, moves_done + 1, target)
                 if result is not None:
@@ -184,7 +236,7 @@ def perturb_position(
             board.remove_piece_at(start_square)
             board.set_piece_at(to_square, chess.Piece(piece.piece_type, piece.color))
             board.turn = turn_white
-            return board.fen()
+            return fix_castling_in_fen(board.fen())
         board.turn = turn_white
         return fen_str
 
@@ -203,10 +255,10 @@ def perturb_position(
         choice = rand.choice(options)
         if choice is None:
             board.ep_square = None
-            return board.fen()
+            return fix_castling_in_fen(board.fen())
         else:
             board.remove_piece_at(choice)
-            return board.fen()
+            return fix_castling_in_fen(board.fen())
 
     def perturb_fen_piece_addition(fen_str: str) -> str:      # ----- Perturbation Type 3 -----
         # Add one thing at random: a piece (any type and color) on an empty square, or an en passant
@@ -261,7 +313,7 @@ def perturb_position(
             return " ".join(parts)
         _tag, square, piece_type, color = choice
         board.set_piece_at(square, chess.Piece(piece_type, color))
-        return board.fen()
+        return fix_castling_in_fen(board.fen())
 
     def perturb_fen_piece_swap(fen_str: str) -> str:      # ----- Perturbation Type 4 -----
         # Swap two randomly chosen pieces that differ in type or color (so the position actually changes).
@@ -282,7 +334,7 @@ def perturb_position(
         board.remove_piece_at(sq2)
         board.set_piece_at(sq1, p2)
         board.set_piece_at(sq2, p1)
-        return board.fen()
+        return fix_castling_in_fen(board.fen())
 
     def perturb_fen_piece_change(fen_str: str) -> str:      # ----- Perturbation Type 5 -----
         # Pick a random piece on the board and change it to a random different piece type (same color).
@@ -298,7 +350,7 @@ def perturb_position(
         other_types = [t for t in piece_types if t != piece.piece_type]
         new_type = rand.choice(other_types)
         board.set_piece_at(square, chess.Piece(new_type, piece.color))
-        return board.fen()
+        return fix_castling_in_fen(board.fen())
 
     def perturb_fen_piece_color_change(fen_str: str) -> str:      # ----- Perturbation Type 6 -----
         # Pick a random piece (not a king; en passant not considered) and flip its color.
@@ -311,74 +363,25 @@ def perturb_position(
         piece = board.piece_at(square)
         new_color = chess.BLACK if piece.color == chess.WHITE else chess.WHITE
         board.set_piece_at(square, chess.Piece(piece.piece_type, new_color))
-        return board.fen()
+        return fix_castling_in_fen(board.fen())
 
     def perturb_fen_castling_rights_change(fen_str: str) -> str:     # ----- Perturbation Type 7 -----
         # One of: remove an existing castling right, or add a castling right if sensical (Chess960-aware).
-        # Kings go to g1/g8 or c1/c8; rooks to f1/f8 or d1/d8. Magnitude ignored.
+        # Uses is_castling_right_plausible for add-check; final FEN is cleaned with fix_castling_in_fen.
         rand = rng if rng is not None else random
         board = chess.Board(fen_str)
-
-        # Destinations (standard): white K g1/f1, white Q c1/d1; black K g8/f8, black Q c8/d8
-        WK_KING, WK_ROOK = chess.square(6, 0), chess.square(5, 0)   # g1, f1
-        WQ_KING, WQ_ROOK = chess.square(2, 0), chess.square(3, 0)   # c1, d1
-        BK_KING, BK_ROOK = chess.square(6, 7), chess.square(5, 7)   # g8, f8
-        BQ_KING, BQ_ROOK = chess.square(2, 7), chess.square(3, 7)   # c8, d8
-
-        def squares_between_file_range(rank: int, f_lo: int, f_hi: int) -> set:
-            return {chess.square(f, rank) for f in range(min(f_lo, f_hi), max(f_lo, f_hi) + 1)}
-
-        def can_add_castling(
-            color: chess.Color,
-            kingside: bool,
-            king_dest: int,
-            rook_dest: int,
-            rank: int,
-        ) -> bool:
-            king_sq = board.king(color)
-            if king_sq is None:
-                return False
-            kf, kr = chess.square_file(king_sq), chess.square_rank(king_sq)
-            dest_f = chess.square_file(king_dest)
-            rooks_on_rank = [
-                s for s in chess.SQUARES
-                if chess.square_rank(s) == rank
-                and board.piece_at(s) == chess.Piece(chess.ROOK, color)
-            ]
-            # Chess960: kingside = rook to the right of the king (nearest one); queenside = rook to the left (nearest).
-            # So king on f1, rooks on g1 and h1 -> kingside rook is g1 (moves to f1); king can stay on g1.
-            candidates = [s for s in rooks_on_rank if (chess.square_file(s) > kf if kingside else chess.square_file(s) < kf)]
-            if not candidates:
-                return False
-            rook_sq = min(candidates, key=chess.square_file) if kingside else max(candidates, key=chess.square_file)
-            rf = chess.square_file(rook_sq)
-            path_king = squares_between_file_range(rank, kf, dest_f)
-            path_rook = squares_between_file_range(rank, rf, chess.square_file(rook_dest))
-            union = path_king | path_rook
-            pieces_on = [s for s in union if board.piece_at(s) is not None]
-            if len(pieces_on) != 2 or set(pieces_on) != {king_sq, rook_sq}:
-                return False
-            for sq in path_king:
-                if board.is_attacked_by(not color, sq):
-                    return False
-            return True
 
         castling_str = board.fen().split()[2]
         current = set(c for c in castling_str if c in "KQkq")
         actions: List[Tuple[str, str]] = []  # ('remove'|'add', 'K'|'Q'|'k'|'q')
-        for key, color, kingside, king_dest, rook_dest, rank in [
-            ("K", chess.WHITE, True, WK_KING, WK_ROOK, 0),
-            ("Q", chess.WHITE, False, WQ_KING, WQ_ROOK, 0),
-            ("k", chess.BLACK, True, BK_KING, BK_ROOK, 7),
-            ("q", chess.BLACK, False, BQ_KING, BQ_ROOK, 7),
-        ]:
+        for key in "KQkq":
             if key in current:
                 actions.append(("remove", key))
-            elif can_add_castling(color, kingside, king_dest, rook_dest, rank):
+            elif is_castling_right_plausible(board, key):
                 actions.append(("add", key))
 
         if not actions:
-            return fen_str
+            return fix_castling_in_fen(fen_str)
         op, key = rand.choice(actions)
         if op == "remove":
             new_set = current - {key}
@@ -387,7 +390,7 @@ def perturb_position(
         new_castling = "".join(c for c in "KQkq" if c in new_set) if new_set else "-"
         parts = board.fen().split()
         parts[2] = new_castling
-        return " ".join(parts)
+        return fix_castling_in_fen(" ".join(parts))
 
     perturbation_dispatch_table: Dict[int, Callable[[str], str]] = {
         0: perturb_fen_piece_move_legal,
@@ -438,7 +441,7 @@ def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.Tensor], torch.Tens
         is the tensor with all of the node features, which includes piece locations and en passant information.
     """
     # Create a list of 64 floats that contains the information from the fen
-    position_vector: List[float] = hu.fen_to_vector(fen)
+    position_vector: List[float] = fen_to_vector(fen)
 
     # Initialize the working variables that I will eventually return
     edges_lists: List[set[Tuple[int, int]]] = get_chess_graph_edges()
@@ -762,6 +765,140 @@ def depth_first_recursive(visited: List[bool],
     return edges
 
 
+# Takes in a FEN string and returns a list of 64 numbers
+# https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation
+def fen_to_vector(fen: str) -> List[float]:
+    piece_values: Dict[str, int] = {"p": 1,
+                                    "n": 2,
+                                    "b": 3,
+                                    "r": 4,
+                                    "q": 5,
+                                    "k": 6}
+
+    # Split the fen by spaces
+    fen_parts: List[str] = fen.split(" ")
+
+    # The first part is the board portion. Split it by '/' to get each row
+    row_strings: List[str] = fen_parts[0].split("/")
+
+    # Initialize some variables for constructing the vector
+    vector_version: List[float] = [0 for _ in range(64)]
+    index_buffer_num_rows: int = 0
+
+    # Vectors go a1, b1, ... a2, b2, ..., so if we're white then we need to go through the strings in reverse order
+    if fen_parts[1] == "w":
+        row_strings = list(reversed(row_strings))
+
+    # If playing as black, then we want to go through the strings in the current order
+    # BUT we need to reverse all of the individual strings like we're rotating the board
+    elif fen_parts[1] == "b":
+        for index, _ in enumerate(row_strings):
+            row_strings[index] = row_strings[index][::-1]
+
+    # This value can only be 'w' or 'b'
+    else:
+        print(f"Invalid FEN: {fen_parts[0]}")
+        return [0]
+
+    # Iterate over the rows backwards (start from row 1 and go up)
+    current_row: str
+    for current_row in row_strings:
+        index_buffer_this_row: int = 0
+
+        # Loop through each character in this row of the chess board
+        index: int
+        character: str
+        for index, character in enumerate(current_row):
+            # If the character is numerical...
+            if character.isdigit():
+                # Record the number of sequential empty squares
+                index_buffer_this_row += int(character) - 1
+
+                # For each of the empty squares
+                index_to_zero: int
+                for index_to_zero in range(int(character)):
+                    # Set that index of the vector_version to zero
+                    # (index_buffer_num_rows * 8) because we need to offset by the number of rows we've already done
+                    # index because we need to offset by the number of characters in this row we've already done
+                    # index_to_zero because we need to count up how many zeros we're adding based on the character
+                    # (index_buffer_this_row - int(character) + 1) because ...
+                    # if not first digit in row, need offset by more
+                    vector_version[index + index_to_zero + (index_buffer_num_rows * 8) + (index_buffer_this_row - int(character) + 1)] = 0
+            # If the character is alphabetical...
+            else:
+                # Set the value in the vector to the piece value
+                true_index: int = index + (index_buffer_num_rows * 8) + index_buffer_this_row
+                vector_version[true_index] = piece_values[character.lower()]
+
+                # If the piece is black
+                if character.islower():
+                    # And the AI is playing as white
+                    if fen_parts[1] == "w":
+                        # Then multiply it by -1 because it's on the opponent's team
+                        vector_version[true_index] *= -1
+                # If the piece is white
+                else:
+                    # And the AI is playing as black
+                    if fen_parts[1] == "b":
+                        # Then multiply it by -1 because it's on the opponent's team
+                        vector_version[true_index] *= -1
+
+        index_buffer_num_rows += 1
+
+    # ----- Castling -----
+
+    # King value of +/-6 is modified by +/-0.1 and 0.2
+    # This means the square can have 4 possible values:
+    # 6: May not castle
+    # 6.1: May castle king-side
+    # 6.2: May castle queen-side
+    # 6.3: May castle either side
+
+    # Establish what side we're on so that we know if the king is a positive or negative number
+    if fen_parts[1] == "w":
+        white_mod: int = 1
+        black_mod: int = -1
+    else:
+        white_mod: int = -1
+        black_mod: int = 1
+
+    # Since we may modify kings multiple times in a row...
+    # Doing this work on separate list using indices of the old list so .index() works properly
+    working_castle_vector = vector_version[:]
+
+    # White may castle king-side
+    if "K" in fen_parts[2]:
+        working_castle_vector[vector_version.index(white_mod * 6)] += (white_mod * 0.1)
+    # White may castle queen-side
+    if "Q" in fen_parts[2]:
+        working_castle_vector[vector_version.index(white_mod * 6)] += (white_mod * 0.2)
+    # Black may castle king-side
+    if "k" in fen_parts[2]:
+        working_castle_vector[vector_version.index(black_mod * 6)] += (black_mod * 0.1)
+    # Black may castle queen-side
+    if "q" in fen_parts[2]:
+        working_castle_vector[vector_version.index(black_mod * 6)] += (black_mod * 0.2)
+
+    # Save changes to the original list
+    vector_version = working_castle_vector[:]
+
+    # ----- En Passant -----
+
+    # If there is no En Passant, finish
+    if fen_parts[3][0] == "-":
+        return vector_version
+
+    character_values = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7}
+    en_passant_square = ((int(fen_parts[3][1]) - 1) * 8) + character_values[fen_parts[3][0]]
+    if black_mod == 1:
+        en_passant_square = 63 - en_passant_square
+
+    # noinspection PyTypeChecker
+    vector_version[en_passant_square] = -0.5
+
+    return vector_version
+
+
 def visualize_graph(edge_list: set[Tuple[int, int]]) -> None:
     # Create a directed graph
     G = nx.DiGraph()
@@ -802,7 +939,7 @@ if __name__ == "__main__":
     # 6 Queen move
 
     #visualize_graph(get_chess_graph_edges()[2])
-    #visualize_graph(get_castling_edges(hu.fen_to_vector("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")))
+    #visualize_graph(get_castling_edges(fen_to_vector("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")))
 
 
     # Visualize board perturbations

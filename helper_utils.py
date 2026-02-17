@@ -149,7 +149,7 @@ def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], dat
         # If the stop_event was set
         else:
             engine.quit()
-            print(f"{data_dict["Name"]} done!")
+            print(f'{data_dict["Name"]} done!')
             break
 
 
@@ -285,6 +285,11 @@ def fen_to_vector(fen: str) -> List[float]:
     vector_version[en_passant_square] = -0.5
 
     return vector_version
+
+
+
+
+
 
 
 
