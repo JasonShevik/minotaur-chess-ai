@@ -432,10 +432,16 @@ def perturb_position(
     return perturbation_dispatch_table[perturb_type](fen)
 
 
-def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
+def create_filled_chess_graphs(
+    fen: str,
+    castling_rook_squares: Optional[Tuple[int, int, int, int]] = None,
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
     """
     A function to get the graph representations of all piece interactions for a specified chess position.
     :param fen: The string that identifies the position to make graphs for.
+    :param castling_rook_squares: Optional tuple of 4 square indices (0-63) in order K, Q, k, q for the
+        castling rook on each side; use -1 for no right. When provided (e.g. from the DB column), castling
+        edges use these squares; when None, rooks are inferred from the position (legacy behavior).
     :return: A tuple with the information needed for all of the graph networks. The first value in the tuple is
         a list of edge index tensors, one for a graph for each piece movement type. The second value in the tuple
         is the tensor with all of the node features, which includes piece locations and en passant information.
@@ -446,7 +452,7 @@ def create_filled_chess_graphs(fen: str) -> Tuple[List[torch.Tensor], torch.Tens
     # Initialize the working variables that I will eventually return
     edges_lists: List[set[Tuple[int, int]]] = get_chess_graph_edges()
     # Add the castling edges
-    edges_lists.append(get_castling_edges(position_vector))
+    edges_lists.append(get_castling_edges(position_vector, castling_rook_squares))
 
     # node_features indices mean the following:
     # 0: Enemy controlled square flag
@@ -655,56 +661,151 @@ def get_king_neighbors(start_coordinates: Tuple[int, int]) -> set[Tuple[int, int
                                         if not (row_offset == 0 and column_offset == 0)})
 
 
-def get_castling_edges(board_vector: List[float]) -> set[Tuple[int, int]]:
+def get_castling_edges(
+    board_vector: List[float],
+    castling_rook_squares: Optional[Tuple[int, int, int, int]] = None,
+    infer_symmetric: bool = True,
+) -> set[Tuple[int, int]]:
     """
-    This is a helper function to add castling edges to the graph. It needs to be done after the blank graph has
-    been made and after the piece placement has been decided.
+    Add castling edges to the graph. When castling_rook_squares is provided (K, Q, k, q rook square
+    indices; -1 for none), those squares are used. When None, rooks are inferred from the board (legacy).
 
-    6.1: May castle king-side
-    6.2: May castle queen-side
-    6.3: May castle either side
-    :param board_vector: A vector with values -6.3 to 6.3 representing the pieces on the board, plus
-    castling and en passant.
-    :return: A list of edge pairs that show where castling may be possible. (king g1,g8,c1,c8 and rook f1,f8,d1,d8)
+    If infer_symmetric is True and castling_rook_squares is None, infer rooks so K/k and Q/q share
+    the same file. When both colors have the right but no common file, skip those edges (inconsistent).
+    When only one color has the right, pick randomly among that side's rooks.
+
+    board_vector: 6.1 = king-side, 6.2 = queen-side, 6.3 = either. Destinations: white K (g1,f1)=6,5;
+    white Q (c1,d1)=2,3; black K (g8,f8)=62,61; black Q (c8,d8)=58,59.
     """
     edges: set[Tuple[int, int]] = set()
 
-    # ----- Enemy -----
-    castleable_king = [i for i, piece_value in enumerate(board_vector) if int(piece_value) == -6 and piece_value % 1]
-    if castleable_king:
-        rooks = [i for i, piece_value in enumerate(board_vector) if piece_value == -4]
-        rooks = [x for x in rooks if x > 55]
+    # White: king index and rights from board_vector
+    white_king = [i for i, pv in enumerate(board_vector) if int(pv) == 6 and pv % 1]
+    # Black: king index and rights
+    black_king = [i for i, pv in enumerate(board_vector) if int(pv) == -6 and pv % 1]
 
-        # Queen Side
-        if board_vector[castleable_king[0]] == -6.3 or board_vector[castleable_king[0]] == -6.2:
-            the_rook = random.choice([rook for rook in rooks if rook < castleable_king[0]])
-            edges.add((castleable_king[0], 58))
-            edges.add((the_rook, 59))
+    if castling_rook_squares is not None:
+        # Use provided rook squares (K, Q, k, q); -1 means no right / skip
+        k_rook, q_rook, k_rook_b, q_rook_b = castling_rook_squares
+        if white_king:
+            king_idx = white_king[0]
+            pv = board_vector[king_idx]
+            if (pv == 6.3 or pv == 6.1) and k_rook >= 0:
+                edges.add((king_idx, 6))
+                edges.add((k_rook, 5))
+            if (pv == 6.3 or pv == 6.2) and q_rook >= 0:
+                edges.add((king_idx, 2))
+                edges.add((q_rook, 3))
+        if black_king:
+            king_idx = black_king[0]
+            pv = board_vector[king_idx]
+            if (pv == -6.3 or pv == -6.1) and k_rook_b >= 0:
+                edges.add((king_idx, 62))
+                edges.add((k_rook_b, 61))
+            if (pv == -6.3 or pv == -6.2) and q_rook_b >= 0:
+                edges.add((king_idx, 58))
+                edges.add((q_rook_b, 59))
+        return edges
 
-        # King side
-        if board_vector[castleable_king[0]] == -6.3 or board_vector[castleable_king[0]] == -6.1:
-            the_rook = random.choice([rook for rook in rooks if rook > castleable_king[0]])
-            edges.add((castleable_king[0], 62))
-            edges.add((the_rook, 61))
+    # Helper: file of square index (0-7)
+    def _file(sq: int) -> int:
+        return sq % 8
 
-    # ----- Ally -----
-    castleable_king = [i for i, piece_value in enumerate(board_vector) if int(piece_value) == 6 and piece_value % 1]
-    if castleable_king:
-        rooks = [i for i, piece_value in enumerate(board_vector) if piece_value == 4]
-        rooks = [x for x in rooks if x < 8]
+    # Legacy: infer rooks from board (with optional symmetric inference)
+    if infer_symmetric and white_king and black_king:
+        # Symmetric mode: when both have a right, use common file; skip if no common file
+        w_pv = board_vector[white_king[0]]
+        b_pv = board_vector[black_king[0]]
+        wk_has = w_pv == 6.3 or w_pv == 6.1
+        wq_has = w_pv == 6.3 or w_pv == 6.2
+        bk_has = b_pv == -6.3 or b_pv == -6.1
+        bq_has = b_pv == -6.3 or b_pv == -6.2
 
-        # Queen Side
-        if board_vector[castleable_king[0]] == 6.3 or board_vector[castleable_king[0]] == 6.2:
-            the_rook = random.choice([rook for rook in rooks if rook < castleable_king[0]])
-            edges.add((castleable_king[0], 2))
-            edges.add((the_rook, 3))
+        w_k_rooks = [i for i in range(8) if board_vector[i] == 4 and _file(i) > _file(white_king[0])]
+        w_q_rooks = [i for i in range(8) if board_vector[i] == 4 and _file(i) < _file(white_king[0])]
+        b_k_rooks = [i for i in range(56, 64) if board_vector[i] == -4 and _file(i) > _file(black_king[0])]
+        b_q_rooks = [i for i in range(56, 64) if board_vector[i] == -4 and _file(i) < _file(black_king[0])]
 
-        # King side
-        if board_vector[castleable_king[0]] == 6.3 or board_vector[castleable_king[0]] == 6.1:
-            the_rook = random.choice([rook for rook in rooks if rook > castleable_king[0]])
-            edges.add((castleable_king[0], 6))
-            edges.add((the_rook, 5))
+        # Kingside: both have right -> common file or skip
+        if wk_has and bk_has:
+            w_f = {_file(r) for r in w_k_rooks}
+            b_f = {_file(r) for r in b_k_rooks}
+            common = w_f & b_f
+            if common:
+                cf = random.choice(list(common))
+                wr = next(r for r in w_k_rooks if _file(r) == cf)
+                br = next(r for r in b_k_rooks if _file(r) == cf)
+                edges.add((white_king[0], 6))
+                edges.add((wr, 5))
+                edges.add((black_king[0], 62))
+                edges.add((br, 61))
+        elif wk_has:
+            if w_k_rooks:
+                the_rook = random.choice(w_k_rooks)
+                edges.add((white_king[0], 6))
+                edges.add((the_rook, 5))
+        elif bk_has:
+            if b_k_rooks:
+                the_rook = random.choice(b_k_rooks)
+                edges.add((black_king[0], 62))
+                edges.add((the_rook, 61))
 
+        # Queenside: both have right -> common file or skip
+        if wq_has and bq_has:
+            w_f = {_file(r) for r in w_q_rooks}
+            b_f = {_file(r) for r in b_q_rooks}
+            common = w_f & b_f
+            if common:
+                cf = random.choice(list(common))
+                wr = next(r for r in w_q_rooks if _file(r) == cf)
+                br = next(r for r in b_q_rooks if _file(r) == cf)
+                edges.add((white_king[0], 2))
+                edges.add((wr, 3))
+                edges.add((black_king[0], 58))
+                edges.add((br, 59))
+        elif wq_has:
+            if w_q_rooks:
+                the_rook = random.choice(w_q_rooks)
+                edges.add((white_king[0], 2))
+                edges.add((the_rook, 3))
+        elif bq_has:
+            if b_q_rooks:
+                the_rook = random.choice(b_q_rooks)
+                edges.add((black_king[0], 58))
+                edges.add((the_rook, 59))
+        return edges
+
+    # Legacy non-symmetric: infer rooks independently (random when multiple)
+    if black_king:
+        rooks = [i for i, pv in enumerate(board_vector) if pv == -4 and i > 55]
+        pv = board_vector[black_king[0]]
+        if pv == -6.3 or pv == -6.2:
+            cand = [r for r in rooks if r % 8 < black_king[0] % 8]
+            if cand:
+                the_rook = random.choice(cand)
+                edges.add((black_king[0], 58))
+                edges.add((the_rook, 59))
+        if pv == -6.3 or pv == -6.1:
+            cand = [r for r in rooks if r % 8 > black_king[0] % 8]
+            if cand:
+                the_rook = random.choice(cand)
+                edges.add((black_king[0], 62))
+                edges.add((the_rook, 61))
+    if white_king:
+        rooks = [i for i, pv in enumerate(board_vector) if pv == 4 and i < 8]
+        pv = board_vector[white_king[0]]
+        if pv == 6.3 or pv == 6.2:
+            cand = [r for r in rooks if r % 8 < white_king[0] % 8]
+            if cand:
+                the_rook = random.choice(cand)
+                edges.add((white_king[0], 2))
+                edges.add((the_rook, 3))
+        if pv == 6.3 or pv == 6.1:
+            cand = [r for r in rooks if r % 8 > white_king[0] % 8]
+            if cand:
+                the_rook = random.choice(cand)
+                edges.add((white_king[0], 6))
+                edges.add((the_rook, 5))
     return edges
 
 
@@ -785,18 +886,12 @@ def fen_to_vector(fen: str) -> List[float]:
     vector_version: List[float] = [0 for _ in range(64)]
     index_buffer_num_rows: int = 0
 
-    # Vectors go a1, b1, ... a2, b2, ..., so if we're white then we need to go through the strings in reverse order
+    # Put the player to move at the bottom (reflect vertically). Do not reverse files, so kingside/queenside stay correct.
     if fen_parts[1] == "w":
         row_strings = list(reversed(row_strings))
+    # If black to move, row_strings stays in FEN order (rank 8 first) so black is at bottom; rows stay a->h (no horizontal flip).
 
-    # If playing as black, then we want to go through the strings in the current order
-    # BUT we need to reverse all of the individual strings like we're rotating the board
-    elif fen_parts[1] == "b":
-        for index, _ in enumerate(row_strings):
-            row_strings[index] = row_strings[index][::-1]
-
-    # This value can only be 'w' or 'b'
-    else:
+    if fen_parts[1] not in ("w", "b"):
         print(f"Invalid FEN: {fen_parts[0]}")
         return [0]
 
@@ -939,9 +1034,10 @@ if __name__ == "__main__":
     # 6 Queen move
 
     #visualize_graph(get_chess_graph_edges()[2])
-    #visualize_graph(get_castling_edges(fen_to_vector("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")))
+    visualize_graph(get_castling_edges(fen_to_vector("rnr1k1nq/pp6/2p3p1/3P4/1b1PQ3/1PN1P3/P2N1P1P/R3KR2 b KQq - 0 15")))
 
 
+    """
     # Visualize board perturbations
     # Example FEN: "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w Kk - 0 1" # En passant example
     # Example FEN: "r1bq1b1r/ppp3pp/2n1k3/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R w K - 0 1" # Fried Liver Attack
@@ -954,7 +1050,7 @@ if __name__ == "__main__":
     board = chess.Board(fen)
     print(board)
     print(fen)
-
+    """
 
 
 
