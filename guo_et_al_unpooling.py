@@ -40,6 +40,10 @@ class GuoUnpool(nn.Module):
         super().__init__()
         self.dx, self.dw, self.dy, self.du = dx, dw, dy, du
         self.use_preference = use_preference
+        # Policy smoothing: floor/ceiling on every action probability. Prevents
+        # saturation (p -> 0/1), which bounds d(logP)/dstep and keeps per-update
+        # trajectory KL finite
+        self.p_eps = 0.01
 
         # PS1/PS2 projection indices (d' = floor(dx/2) + floor(dx/4))
         ds = dx // 2
@@ -66,6 +70,15 @@ class GuoUnpool(nn.Module):
     @staticmethod
     def agg(a, b):
         return F.leaky_relu(a + b, negative_slope=0.05)
+
+    def _smooth_bern(self, p: torch.Tensor) -> torch.Tensor:
+        """Clamp a Bernoulli probability into [eps, 1-eps]."""
+        return p.clamp(self.p_eps, 1.0 - self.p_eps)
+
+    def _smooth_cat(self, probs: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Mix a categorical distribution with uniform: (1-eps)*p + eps/L."""
+        L = probs.size(dim)
+        return probs * (1.0 - self.p_eps) + self.p_eps / L
 
     def _project(self, x):
         return x[:, self._ps1_idx], x[:, self._ps2_idx]
@@ -98,14 +111,14 @@ class GuoUnpool(nn.Module):
             h0s = self.mlp_zero_s(y1s)                                  # [K,1]
             h0b = self.mlp_zero_b(x_other)                              # [K,1]
             logits = torch.cat([hs1, hs2, hb, h0s + h0b], dim=1)        # [K,4]
-            Z = F.softmax(logits, dim=1)
+            Z = self._smooth_cat(F.softmax(logits, dim=1), dim=1)
             p1, p2, pB = Z[:, 0], Z[:, 1], Z[:, 2]
         else:
             s1 = self.mlp_ie1(torch.cat([y1s, w_ij, x_other], dim=1))
             s2 = self.mlp_ie1(torch.cat([y2s, w_ij, x_other], dim=1))
             sb = self.mlp_ie2(torch.cat([self.agg(y1s, y2s), w_ij, x_other], dim=1))
             logits = torch.cat([s1, s2, sb], dim=1)                     # [K,3]
-            Z = F.softmax(logits, dim=1)
+            Z = self._smooth_cat(F.softmax(logits, dim=1), dim=1)
             p1, p2, pB = Z[:, 0], Z[:, 1], Z[:, 2]
         return p1, p2, pB, Z  # Z is [K,3 or 4]
 
@@ -161,7 +174,7 @@ class GuoUnpool(nn.Module):
         logP = x.new_zeros(())
         total_entropy = x.new_zeros(())
 
-        pr = self.mlp_r(x[I_r]).squeeze(-1)  # [|I_r|]
+        pr = self._smooth_bern(self.mlp_r(x[I_r]).squeeze(-1))  # [|I_r|]
         if replay_mode:
             choose_unpool = actions_to_replay['step1a_unpool'][0]
         else:
@@ -203,7 +216,7 @@ class GuoUnpool(nn.Module):
         if len(Iu) > 0:
             y1 = x_out[torch.arange(len(Iu), device=device) + base_c1]
             y2 = x_out[torch.arange(len(Iu), device=device) + base_c2]
-            p_intra = self.mlp_ia(self.agg(y1, y2)).squeeze(-1)  # [|Iu|]
+            p_intra = self._smooth_bern(self.mlp_ia(self.agg(y1, y2)).squeeze(-1))  # [|Iu|]
 
             if replay_mode:
                 Vc_mask = actions_to_replay['step2a_intra'][0]
@@ -237,12 +250,6 @@ class GuoUnpool(nn.Module):
         # ------- Step 2b: vectorized neighbor scoring -------
         bj_choice: Dict[int, int] = {}
         if iu_no_intra.numel() > 0:
-            # For each parent, find positions where it appears as src or dst (neighbors in either direction)
-            # We keep the same neighbor set you used (undirected adjacency): adj[parent] contains (nei, ek)
-            # Build a compact list of all (parent, nei, ek) rows.
-            # First find mask of rows where parent appears either as src or dst.
-            # We'll do a two-pass: one python loop to collect tensors of indices (cheap),
-            # but the heavy scoring is batched.
             parent_rows = []
             parent_ptrs = [0]  # prefix to segment rows by parent
             all_neis = []
@@ -293,7 +300,7 @@ class GuoUnpool(nn.Module):
                     if L == 0:
                         continue
                     seg_scores = scores[start:start+L]
-                    probs = F.softmax(seg_scores, dim=0)
+                    probs = self._smooth_cat(F.softmax(seg_scores, dim=0), dim=0)
 
                     if replay_mode:
                         rec = actions_to_replay['step2b_pick'].get(int(p), None)
@@ -570,7 +577,7 @@ class GuoUnpool(nn.Module):
                     if {a, b} == {i, j}: ek = kk; break
                 w = edge_attr[ek] if ek is not None else x.new_zeros(self.dw)
 
-                pa = self.mlp_ie_a(torch.cat([x[i], x[j], w], dim=0).unsqueeze(0)).squeeze(0).squeeze(-1)
+                pa = self._smooth_bern(self.mlp_ie_a(torch.cat([x[i], x[j], w], dim=0).unsqueeze(0)).squeeze(0).squeeze(-1))
 
                 if replay_mode:
                     chosen = bool(actions_to_replay["step2d_pa"][pair])
@@ -724,7 +731,7 @@ def random_directed_graph_with_features(
           weak  (default): build a random spanning tree (undirected), then orient each tree edge randomly.
           strong: add a directed Hamiltonian cycle (over a random permutation).
       - Extra edges: sampled with probability p_extra from all remaining directed pairs.
-      - Node features are FIXED-DIM across graphs (so your encoder can be a single MLP):
+      - Node features are FIXED-DIM across graphs (so the encoder can be a single MLP):
           [ desc (broadcast) | per-node gaussian | (optional) normalized degrees ]
       - If you prefer ID one-hots, add them yourself; they make input dim depend on n.
     """
@@ -831,471 +838,402 @@ def random_directed_graph_with_features(
     return x_raw, edge_index, edge_attr, meta
 
 
-if __name__ == "__main__":
-    # ---------- imports & tiny patch ----------
-    import json
-    import copy
-    from datetime import datetime
-    from torch_geometric.nn import global_mean_pool
-    from dehb_helper import DEHBHelper, DEHBRunConfig, ObjectiveResult
-    import graph_similarity2 as GS2
-    import graph_similarity as GS
-    import numpy as np
-    import ConfigSpace as CS
-    import matplotlib.pyplot as plt
+# ============================================================================
+# Components hoisted out of __main__ so the DEHB objective can reuse them.
+# Logic is unchanged from the original script except where noted.
+# ============================================================================
 
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    SEED = 1234
-    ACTOR_RNG = torch.Generator(device=DEVICE)
-    ACTOR_RNG.manual_seed(SEED + 7)
+def unpool_k_fixed(unpool, x0, ei0, ea0=None, k: int = 2,
+                   actions_to_replay: Optional[List[Dict]] = None,
+                   rng: Optional[torch.Generator] = None):
+    x, ei, ea = x0, ei0, ea0
+    logP_total = x0.new_zeros(())
+    entropy_total = x0.new_zeros(())
 
-    # ---------- config ----------
-    LR           = 3e-4
-    ENTROPY_COEF = 0.01
-    EPOCHS       = 50
-    BATCH_SIZE   = 256
-    NOISE_STD    = 0
-    PRINT_EVERY  = 10
+    replay_mode = actions_to_replay is not None
+    k_actions_recorded = []
 
-    # dataset sizes
-    N_TRAIN = 3840
-    N_VAL   = 1000
-    N_MIN_NODES = 7
-    N_MAX_NODES = 11
+    for step_k in range(k):
+        actions_for_step = actions_to_replay[step_k] if replay_mode else None
 
-    # random graph generator knobs
-    NODE_FEAT_DIM        = 5
-    DW                   = 2  # input edge features
-    DESC_BROADCAST_DIM   = 16
-    EDGE_FEAT_DIM        = DW
-    INCLUDE_DEG_FEATURES = True
-    P_EXTRA              = 0.25
+        x, ei, ea, logP, entropy, *_, actions_obj = unpool(
+            x, ei, edge_attr=ea, actions_to_replay=actions_for_step, rng=rng
+        )
 
-    K_MAX = 2
+        logP_total = logP_total + logP
+        entropy_total = entropy_total + entropy
+        if not replay_mode:
+            k_actions_recorded.append(actions_obj)
+
+    return x, ei, ea, logP_total, entropy_total, k_actions_recorded
 
 
-    def build_configspace(seed: int = 0) -> CS.ConfigurationSpace:
-        cs = CS.ConfigurationSpace(seed=seed)
+class LosslessGraphEncoder(nn.Module):
+    """
+    Encodes a graph into two scrambled tensors (integer and float), preserving
+    all information perfectly. The scrambling is a fixed, seeded permutation.
+    """
 
-        # Examples targeted to your script:
-        # LR (log scale)
-        cs.add_hyperparameter(CS.UniformFloatHyperparameter("lr", lower=1e-5, upper=3e-3, log=True))
+    def __init__(self, capN: int, node_dim: int, edge_dim: int, scramble_seed: int = 0):
+        super().__init__()
+        self.capN = int(capN)
+        self.node_dim = int(node_dim)
+        self.edge_dim = int(edge_dim)
 
-        # ENTROPY_COEF (log scale-ish; keep it small)
-        cs.add_hyperparameter(CS.UniformFloatHyperparameter("entropy_coef", lower=1e-4, upper=5e-2, log=True))
+        self.int_dim = 1 + self.capN * self.capN
+        self.float_dim = self.capN * self.node_dim + self.capN * self.capN * self.edge_dim
 
-        # Unpool MLP widths (categorical)
-        cs.add_hyperparameter(CS.CategoricalHyperparameter("unpool_size", choices=[128, 256, 384, 512]))
+        g = torch.Generator(device="cpu").manual_seed(int(scramble_seed))
+        int_perm = torch.randperm(self.int_dim, generator=g)
+        float_perm = torch.randperm(self.float_dim, generator=g)
 
-        # Batch size (categorical)
-        cs.add_hyperparameter(CS.CategoricalHyperparameter("batch_size", choices=[64, 128, 256, 384]))
+        self.register_buffer("int_perm", int_perm)
+        self.register_buffer("float_perm", float_perm)
 
-        # PPO update epochs (small int)
-        cs.add_hyperparameter(CS.UniformIntegerHyperparameter("ppo_update_epochs", lower=2, upper=8))
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> Dict[str, torch.Tensor]:
+        device = x.device
+        n = x.size(0)
+        assert n <= self.capN, f"Graph size n={n} exceeds capacity capN={self.capN}"
 
-        # PPO clip epsilon
-        cs.add_hyperparameter(CS.UniformFloatHyperparameter("ppo_clip_eps", lower=0.05, upper=0.3, log=False))
+        n_tensor = torch.tensor([n], dtype=torch.int64, device=device)
 
-        return cs
+        adj_matrix = torch.zeros(self.capN, self.capN, dtype=torch.bool, device=device)
+        if edge_index.numel() > 0:
+            adj_matrix[edge_index[0], edge_index[1]] = True
+
+        int_flat = torch.cat([
+            n_tensor,
+            adj_matrix.view(-1).long()
+        ])
+
+        X_pad = torch.zeros(self.capN, self.node_dim, dtype=x.dtype, device=device)
+        X_pad[:n, :] = x
+
+        W_pad = torch.zeros(self.capN, self.capN, self.edge_dim, dtype=x.dtype, device=device)
+        if edge_attr is not None and edge_index.numel() > 0:
+            edge_index = edge_index.to(device)
+            edge_attr = edge_attr.to(device)
+            W_pad[edge_index[0], edge_index[1]] = edge_attr
+
+        float_flat = torch.cat([
+            X_pad.view(-1),
+            W_pad.view(-1)
+        ])
+
+        int_scrambled = int_flat[self.int_perm.to(device)]
+        float_scrambled = float_flat[self.float_perm.to(device)]
+
+        return {
+            "int_scrambled": int_scrambled,
+            "float_scrambled": float_scrambled,
+        }
 
 
+class LosslessSeedFeaturizer(nn.Module):
+    """
+    Deterministically converts the scrambled, lossless graph encoding into
+    the initial seed features for the generator.
+    """
 
+    def __init__(self, capN: int, node_dim: int, edge_dim: int,
+                 dx: int, n_seed: int, scramble_seed: int = 0, dim_check: bool = False):
+        super().__init__()
+        self.capN = int(capN)
+        self.node_dim = int(node_dim)
+        self.edge_dim = int(edge_dim)
+        self.dx = int(dx)
+        self.n_seed = int(n_seed)
 
+        self.int_dim = 1 + self.capN * self.capN
+        self.float_dim = self.capN * self.node_dim + self.capN * self.capN * self.edge_dim
+        self.int_as_float_dim = self.int_dim
+        self.total_packed_dim = self.float_dim + self.int_as_float_dim
 
-
-
-
-
-
-
-    def unpool_k_fixed(unpool, x0, ei0, ea0=None, k: int = K_MAX,
-                       actions_to_replay: list[Dict] | None = None, rng: torch.Generator | None = None):
-        x, ei, ea = x0, ei0, ea0
-        logP_total = x0.new_zeros(())
-        entropy_total = x0.new_zeros(())
-
-        replay_mode = actions_to_replay is not None
-        k_actions_recorded = []
-
-        for step_k in range(k):
-            actions_for_step = actions_to_replay[step_k] if replay_mode else None
-
-            # The unpool module now returns the actions object directly
-            x, ei, ea, logP, entropy, *_, actions_obj = unpool(
-                x, ei, edge_attr=ea, actions_to_replay=actions_for_step, rng=rng
+        seed_capacity = self.n_seed * self.dx
+        if not dim_check:
+            assert seed_capacity >= self.total_packed_dim, (
+                f"Seed capacity {seed_capacity} is less than packed data size "
+                f"{self.total_packed_dim}. Increase DX or N_SEED."
             )
 
-            logP_total = logP_total + logP
-            entropy_total = entropy_total + entropy
-            if not replay_mode:
-                k_actions_recorded.append(actions_obj)  # Append the dataclass object
-
-        return x, ei, ea, logP_total, entropy_total, k_actions_recorded
-
-
-    class LosslessGraphEncoder(nn.Module):
-        """
-        Encodes a graph into two scrambled tensors (integer and float), preserving
-        all information perfectly. The scrambling is a fixed, seeded permutation.
-
-        This avoids the floating-point precision issues of packing discrete data
-        into a float tensor before scrambling.
-        """
-
-        def __init__(self, capN: int, node_dim: int, edge_dim: int, scramble_seed: int = 0):
-            super().__init__()
-            self.capN = int(capN)
-            self.node_dim = int(node_dim)
-            self.edge_dim = int(edge_dim)
-
-            # Calculate the total size of discrete/integer components
-            # 1 for n + capN*capN for the adjacency matrix
-            self.int_dim = 1 + self.capN * self.capN
-
-            # Calculate the total size of continuous/float components
-            # capN*node_dim for node features + capN*capN*edge_dim for edge features
-            self.float_dim = self.capN * self.node_dim + self.capN * self.capN * self.edge_dim
-
-            # --- Create fixed, seeded permutations for scrambling ---
-            g = torch.Generator(device="cpu").manual_seed(int(scramble_seed))
-
-            # Permutation for integer data
-            int_perm = torch.randperm(self.int_dim, generator=g)
-            # Permutation for float data
-            float_perm = torch.randperm(self.float_dim, generator=g)
-
-            self.register_buffer("int_perm", int_perm)
-            self.register_buffer("float_perm", float_perm)
-
-        def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> Dict[
-            str, torch.Tensor]:
-            """
-            Packs and scrambles the graph into a dictionary of two tensors.
-
-            Args:
-                x: Node features [n, node_dim]
-                edge_index: Edge index [2, E] (directed)
-                edge_attr: Edge attributes [E, edge_dim]
-
-            Returns:
-                A dictionary containing the scrambled integer and float data.
-                {
-                    "int_scrambled": [int_dim],
-                    "float_scrambled": [float_dim]
-                }
-            """
-            device = x.device
-            n = x.size(0)
-            assert n <= self.capN, f"Graph size n={n} exceeds capacity capN={self.capN}"
-
-            # --- Pack Integer Data ---
-            # 1. Node count
-            n_tensor = torch.tensor([n], dtype=torch.int64, device=device)
-
-            # 2. Adjacency Matrix (using bool/byte is efficient)
-            adj_matrix = torch.zeros(self.capN, self.capN, dtype=torch.bool, device=device)
-            if edge_index.numel() > 0:
-                # Note: Assumes no self-loops, consistent with your generator
-                adj_matrix[edge_index[0], edge_index[1]] = True
-
-            # Flatten and concatenate all integer components
-            int_flat = torch.cat([
-                n_tensor,
-                adj_matrix.view(-1).long()  # Flatten and cast to long for consistency
-            ])
-
-            # --- Pack Float Data ---
-            # 3. Padded Node Features
-            X_pad = torch.zeros(self.capN, self.node_dim, dtype=x.dtype, device=device)
-            X_pad[:n, :] = x
-
-            # 4. Padded Edge Features (in canonical adjacency matrix order)
-            W_pad = torch.zeros(self.capN, self.capN, self.edge_dim, dtype=x.dtype, device=device)
-            if edge_attr is not None and edge_index.numel() > 0:
-                edge_index = edge_index.to(device)
-                edge_attr = edge_attr.to(device)
-                W_pad[edge_index[0], edge_index[1]] = edge_attr
-
-            # Flatten and concatenate all float components
-            float_flat = torch.cat([
-                X_pad.view(-1),
-                W_pad.view(-1)
-            ])
-
-            # --- Apply Scrambling Permutations ---
-            int_scrambled = int_flat[self.int_perm.to(device)]
-            float_scrambled = float_flat[self.float_perm.to(device)]
-
-            return {
-                "int_scrambled": int_scrambled,
-                "float_scrambled": float_scrambled,
-            }
-
-
-    class LosslessSeedFeaturizer(nn.Module):
-        """
-        Deterministically converts the scrambled, lossless graph encoding into
-        the initial seed features for the generator. This is the inverse of the
-        encoder, followed by a packing into the desired feature shape.
-        """
-
-        def __init__(self, capN: int, node_dim: int, edge_dim: int,
-                     dx: int, n_seed: int, scramble_seed: int = 0, dim_check: bool = False):
-            super().__init__()
-            self.capN = int(capN)
-            self.node_dim = int(node_dim)
-            self.edge_dim = int(edge_dim)
-            self.dx = int(dx)
-            self.n_seed = int(n_seed)
-
-            # Calculate dimensions to match the encoder
-            self.int_dim = 1 + self.capN * self.capN
-            self.float_dim = self.capN * self.node_dim + self.capN * self.capN * self.edge_dim
-
-            # An int64 takes the space of two float32s
-            # ... but we only use one because we don't need the full capacity
-            self.int_as_float_dim = self.int_dim
-
-            self.total_packed_dim = self.float_dim + self.int_as_float_dim
-
-            seed_capacity = self.n_seed * self.dx
-            if not dim_check:
-                assert seed_capacity >= self.total_packed_dim, (
-                    f"Seed capacity {seed_capacity} is less than packed data size "
-                    f"{self.total_packed_dim}. Increase DX or N_SEED."
-                )
-
-            # --- Create INVERSE permutations for unscrambling ---
-            g = torch.Generator(device="cpu").manual_seed(int(scramble_seed))
-            int_perm = torch.randperm(self.int_dim, generator=g)
-            float_perm = torch.randperm(self.float_dim, generator=g)
-
-            # The inverse of a permutation is its argsort
-            self.register_buffer("int_unperm", torch.argsort(int_perm))
-            self.register_buffer("float_unperm", torch.argsort(float_perm))
-
-        def forward(self, encoded_dict: Dict[str, torch.Tensor], noise_std: float = 0.0) -> torch.Tensor:
-            """
-            Unscrambles and packs the graph representation into seed features.
-
-            Args:
-                encoded_dict: The output from LosslessGraphEncoder.
-                noise_std: Standard deviation for optional Gaussian noise.
-
-            Returns:
-                A tensor of shape [n_seed, dx] representing the initial node features.
-            """
-            device = encoded_dict["float_scrambled"].device
-
-            # --- Apply Inverse Permutations to Unscramble ---
-            int_flat = encoded_dict["int_scrambled"][self.int_unperm.to(device)]
-            float_flat = encoded_dict["float_scrambled"][self.float_unperm.to(device)]
-
-            # --- Lossless Union of Integer and Float Data ---
-            # To combine the int64 tensor with the float32 tensor without losing
-            # information, we could view the int64 data as raw bytes and interpret
-            # those bytes as two float32s. This is a lossless "bit-cast".
-            # [int_dim] (int64) -> [int_dim, 2] (int32) -> [int_dim * 2] (float32)
-
-            # However, we're unlikely to need that much capacity.
-            int_as_float = int_flat.to(torch.float32)
-
-            # Concatenate the two float tensors into one large vector
-            z_combined = torch.cat([float_flat, int_as_float], dim=0)
-
-            # --- Pack into Seed Feature Matrix ---
-            x_seed = torch.zeros(self.n_seed, self.dx, device=device)
-
-            # Flatten the seed matrix to easily copy the data
-            x_seed_flat = x_seed.view(-1)
-            x_seed_flat[:self.total_packed_dim] = z_combined
-
-            # Reshape back to the desired [n_seed, dx]
-            x_seed = x_seed_flat.view(self.n_seed, self.dx)
-
-            if noise_std > 0:
-                x_seed = x_seed + torch.randn_like(x_seed) * noise_std
-
-            return x_seed
-
-    # ----------
-
-    class Critic(nn.Module):
-        def __init__(self, node_feature_dim: int, hidden=(512, 256)):
-            super().__init__()
-            core_in = node_feature_dim * 3
-            dims = (core_in,) + tuple(hidden) + (1,)
-            self.alpha = nn.Parameter(torch.zeros(core_in))
-            self.net = mlp(dims, norm="layer")
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            feats = x.reshape(-1)
-            feats = (feats * torch.exp(self.alpha)).clone()
-            v = self.net(feats)
-            return v.squeeze(-1)
-
-    # ---------- dataset ----------
-    def make_dataset(n_graphs: int):
-        ds = []
-        for _ in range(n_graphs):
-            n = random.randint(N_MIN_NODES, N_MAX_NODES)
-            x, ei, ea, meta = random_directed_graph_with_features(
-                n,
-                strongly_connected=False,
-                allow_self_loops=False,
-                p_extra=P_EXTRA,
-                node_feat_dim=NODE_FEAT_DIM,
-                desc_dim=DESC_BROADCAST_DIM,
-                include_degree_feats= INCLUDE_DEG_FEATURES,
-                edge_feat_dim=EDGE_FEAT_DIM,
-                edge_feat_style="gaussian",
-                device=DEVICE,
-            )
-            ds.append((x, ei, ea, meta))
-
-        return ds
-
-    print("Building datasets…")
-    train_set = make_dataset(N_TRAIN)
-    val_set   = make_dataset(N_VAL)
-    print(f"train={len(train_set)} graphs, val={len(val_set)} graphs")
-
-    # 1. Calculate dimensions (this part remains the same)
-    capN = N_MAX_NODES
-    RAW_NODE_DIM = train_set[0][0].size(1)
-    N_SEED = 3
-    encoder_for_dims = LosslessGraphEncoder(
-        capN=capN, node_dim=RAW_NODE_DIM, edge_dim=EDGE_FEAT_DIM
-    )
-    featurizer_for_dims = LosslessSeedFeaturizer(
-        capN=capN, node_dim=RAW_NODE_DIM, edge_dim=EDGE_FEAT_DIM, dx=1, n_seed=N_SEED, dim_check=True
-    )
-    packed_dim = featurizer_for_dims.total_packed_dim
-    print(f"Truly lossless packed dim (float equivalent): {packed_dim}")
-
-    DX = math.ceil(packed_dim / N_SEED)
-    seed_ei = seed_graph().to(DEVICE)
-
-    # 2. Instantiate the encoder and featurizer
-    encoder = LosslessGraphEncoder(
-        capN=capN,
-        node_dim=RAW_NODE_DIM,
-        edge_dim=EDGE_FEAT_DIM,
-        scramble_seed=42  # Use a fixed seed for reproducibility
-    ).to(DEVICE).eval()
-
-    featurizer = LosslessSeedFeaturizer(
-        capN=capN,
-        node_dim=RAW_NODE_DIM,
-        edge_dim=EDGE_FEAT_DIM,
-        dx=DX,
-        n_seed=N_SEED,
-        scramble_seed=42  # Must be the same seed as the encoder!
-    ).to(DEVICE).eval()
-
-    # 3. Update the dataset creation loop (the featurizer now takes the dict directly)
-    train_set = [(featurizer(encoder(x_t, ei_t, ea_t), noise_std=NOISE_STD), x_t, ei_t, ea_t) for (x_t, ei_t, ea_t, _) in train_set]
-    val_set = [(featurizer(encoder(x_t, ei_t, ea_t), noise_std=NOISE_STD), x_t, ei_t, ea_t) for (x_t, ei_t, ea_t, _) in val_set]
-
-    # ----- Unpooler stuff -----
-    unpool_size = 256
-    unpool = GuoUnpool(dx=DX, dw=DW, dy=DX, du=DW, kv=unpool_size, kia=unpool_size, kie=unpool_size, kw=unpool_size).to(DEVICE)
-    critic = Critic(
-        node_feature_dim=DX,  # same DX you compute for the seed features
-        hidden=(512, 256),  # (256,128) also works if you want it smaller
-    ).to(DEVICE)
-    opt = torch.optim.AdamW(
-        list(unpool.parameters()) + list(critic.parameters()),
-        lr=LR,
-        weight_decay=0.0
-    )
-    warmup = 10
-    sched = torch.optim.lr_scheduler.SequentialLR(
-        opt,
-        schedulers=[
-            torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=warmup),
-            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS - warmup, eta_min=LR * 0.1),
-        ],
-        milestones=[warmup],
-    )
-
-    # ---------- batching ----------
-    def iterate_minibatches(dataset, batch_size):
-        idxs = list(range(len(dataset)))
-        random.shuffle(idxs)
-        for i in range(0, len(idxs), batch_size):
-            yield [dataset[j] for j in idxs[i:i+batch_size]]
-
-    # ---------- validation ----------
-    @torch.no_grad()
-    def evaluate(dataset, similarity_metric, n_eval=64):
-        unpool.eval()
-        # snapshot actor RNG
-        rng_state = ACTOR_RNG.get_state()
-        try:
-            total = 0.0
-            count = 0
-            avg_gen_n_size = avg_tgt_n_size = avg_gen_e_size = avg_tgt_e_size = 0
-            if len(dataset) != n_eval:
-                dataset = random.sample(dataset, k=min(n_eval, len(dataset)))
-
-            for (x_seed, x_t, ei_t, ea_t) in dataset:
-                x_gen, ei_gen, ea_gen, _, _, _ = unpool_k_fixed(
-                    unpool, x_seed, seed_ei, None, k=K_MAX, rng=ACTOR_RNG
-                )
-
-                avg_gen_n_size += x_gen.size(0); avg_tgt_n_size += x_t.size(0)
-                avg_gen_e_size += ei_gen.size(1); avg_tgt_e_size += ei_t.size(1)
-
-                score, _ = similarity_metric.graph_similarity(
-                    ei_gen.cpu(), ei_t.cpu(),
-                    x1=x_gen.cpu(), x2=x_t.cpu(),
-                    edge_attr1=ea_gen.cpu(),
-                    edge_attr2=(ea_t.cpu() if ea_t is not None else None),
-                    directed=True, wl_iters=2
-                )
-                total += float(score); count += 1
-
-            print(f"Avg Gen N Size: {avg_gen_n_size/max(1, count)}\tTarget: {avg_tgt_n_size/max(1, count)}")
-            print(f"Avg Gen E Size: {avg_gen_e_size/max(1, count)}\tTarget: {avg_tgt_e_size/max(1, count)}")
-            result = total / max(1, count)
-
-            unpool.train()
-            return result
-
-        finally:
-            ACTOR_RNG.set_state(rng_state)
-
-    # ---------- train ----------
-    print("Training…")
-    t0 = time.time()
-
-    experience_buffer = []
-    losses_hist = []
-    rewards_hist = []
-
-    for epoch in range(1, EPOCHS + 1):
+        g = torch.Generator(device="cpu").manual_seed(int(scramble_seed))
+        int_perm = torch.randperm(self.int_dim, generator=g)
+        float_perm = torch.randperm(self.float_dim, generator=g)
+
+        self.register_buffer("int_unperm", torch.argsort(int_perm))
+        self.register_buffer("float_unperm", torch.argsort(float_perm))
+
+    def forward(self, encoded_dict: Dict[str, torch.Tensor], noise_std: float = 0.0) -> torch.Tensor:
+        device = encoded_dict["float_scrambled"].device
+
+        int_flat = encoded_dict["int_scrambled"][self.int_unperm.to(device)]
+        float_flat = encoded_dict["float_scrambled"][self.float_unperm.to(device)]
+
+        int_as_float = int_flat.to(torch.float32)
+        z_combined = torch.cat([float_flat, int_as_float], dim=0)
+
+        x_seed = torch.zeros(self.n_seed, self.dx, device=device)
+        x_seed_flat = x_seed.view(-1)
+        x_seed_flat[:self.total_packed_dim] = z_combined
+        x_seed = x_seed_flat.view(self.n_seed, self.dx)
+
+        if noise_std > 0:
+            x_seed = x_seed + torch.randn_like(x_seed) * noise_std
+
+        return x_seed
+
+
+class Critic(nn.Module):
+    def __init__(self, node_feature_dim: int, hidden=(512, 256)):
+        super().__init__()
+        core_in = node_feature_dim * 3
+        dims = (core_in,) + tuple(hidden) + (1,)
+        self.alpha = nn.Parameter(torch.zeros(core_in))
+        self.net = mlp(dims, norm="layer")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = x.reshape(-1)
+        feats = (feats * torch.exp(self.alpha)).clone()
+        v = self.net(feats)
+        return v.squeeze(-1)
+
+
+# ============================================================================
+# Dataset / context construction (built ONCE, shared by every DEHB evaluation
+# so all configs are scored on identical data)
+# ============================================================================
+
+def make_dataset(n_graphs: int, *, n_min_nodes: int, n_max_nodes: int,
+                 node_feat_dim: int, desc_dim: int, include_degree_feats: bool,
+                 edge_feat_dim: int, p_extra: float, device):
+    ds = []
+    for _ in range(n_graphs):
+        n = random.randint(n_min_nodes, n_max_nodes)
+        x, ei, ea, meta = random_directed_graph_with_features(
+            n,
+            strongly_connected=False,
+            allow_self_loops=False,
+            p_extra=p_extra,
+            node_feat_dim=node_feat_dim,
+            desc_dim=desc_dim,
+            include_degree_feats=include_degree_feats,
+            edge_feat_dim=edge_feat_dim,
+            edge_feat_style="gaussian",
+            device=device,
+        )
+        ds.append((x, ei, ea, meta))
+    return ds
+
+
+def build_training_context(
+    *,
+    n_train: int,
+    n_val: int,
+    n_min_nodes: int = 7,
+    n_max_nodes: int = 11,
+    node_feat_dim: int = 5,
+    desc_dim: int = 16,
+    edge_feat_dim: int = 2,
+    include_degree_feats: bool = True,
+    p_extra: float = 0.25,
+    n_seed: int = 3,
+    noise_std: float = 0.0,
+    scramble_seed: int = 42,
+    data_seed: int = 1234,
+    device="cpu",
+) -> Dict[str, Any]:
+    """Builds datasets + lossless seed featurization exactly as the original
+    script did, and returns everything the objective needs."""
+    random.seed(data_seed)
+    torch.manual_seed(data_seed)
+
+    raw_train = make_dataset(n_train, n_min_nodes=n_min_nodes, n_max_nodes=n_max_nodes,
+                             node_feat_dim=node_feat_dim, desc_dim=desc_dim,
+                             include_degree_feats=include_degree_feats,
+                             edge_feat_dim=edge_feat_dim, p_extra=p_extra, device=device)
+    raw_val = make_dataset(n_val, n_min_nodes=n_min_nodes, n_max_nodes=n_max_nodes,
+                           node_feat_dim=node_feat_dim, desc_dim=desc_dim,
+                           include_degree_feats=include_degree_feats,
+                           edge_feat_dim=edge_feat_dim, p_extra=p_extra, device=device)
+
+    capN = n_max_nodes
+    raw_node_dim = raw_train[0][0].size(1)
+
+    probe = LosslessSeedFeaturizer(capN=capN, node_dim=raw_node_dim, edge_dim=edge_feat_dim,
+                                   dx=1, n_seed=n_seed, dim_check=True)
+    packed_dim = probe.total_packed_dim
+    dx = math.ceil(packed_dim / n_seed)
+
+    encoder = LosslessGraphEncoder(capN=capN, node_dim=raw_node_dim,
+                                   edge_dim=edge_feat_dim, scramble_seed=scramble_seed).to(device).eval()
+    featurizer = LosslessSeedFeaturizer(capN=capN, node_dim=raw_node_dim, edge_dim=edge_feat_dim,
+                                        dx=dx, n_seed=n_seed, scramble_seed=scramble_seed).to(device).eval()
+
+    with torch.no_grad():
+        train_set = [(featurizer(encoder(x, ei, ea), noise_std=noise_std), x, ei, ea)
+                     for (x, ei, ea, _) in raw_train]
+        val_set = [(featurizer(encoder(x, ei, ea), noise_std=noise_std), x, ei, ea)
+                   for (x, ei, ea, _) in raw_val]
+
+    return {
+        "train_set": train_set,
+        "val_set": val_set,
+        "dx": dx,
+        "dw": edge_feat_dim,
+        "packed_dim": packed_dim,
+        "n_seed": n_seed,
+        "seed_ei": seed_graph().to(device),
+        "device": device,
+    }
+
+
+# ============================================================================
+# Evaluation (deterministic RNG so every config is scored identically)
+# ============================================================================
+
+@torch.no_grad()
+def evaluate_policy(unpool, dataset, similarity, seed_ei, *, k: int, device,
+                    eval_seed: int = 9999, n_eval: int = 64, verbose: bool = False) -> float:
+    was_training = unpool.training
+    unpool.eval()
+
+    # NOTE: a *fresh* generator with a fixed seed, NOT the actor RNG. This makes
+    # val scores comparable across DEHB evaluations.
+    rng = torch.Generator(device=device)
+    rng.manual_seed(eval_seed)
+
+    total = 0.0
+    count = 0
+    gen_n = tgt_n = gen_e = tgt_e = 0
+
+    for (x_seed, x_t, ei_t, ea_t) in dataset[:n_eval]:
+        x_gen, ei_gen, ea_gen, *_ = unpool_k_fixed(unpool, x_seed, seed_ei, None, k=k, rng=rng)
+
+        gen_n += x_gen.size(0); tgt_n += x_t.size(0)
+        gen_e += ei_gen.size(1); tgt_e += ei_t.size(1)
+
+        score, _ = similarity.graph_similarity(
+            ei_gen.cpu(), ei_t.cpu(),
+            x1=x_gen.cpu(), x2=x_t.cpu(),
+            edge_attr1=ea_gen.cpu(),
+            edge_attr2=(ea_t.cpu() if ea_t is not None else None),
+            directed=True, wl_iters=2
+        )
+        total += float(score); count += 1
+
+    if verbose:
+        print(f"Avg Gen N Size: {gen_n / max(1, count):.2f}\tTarget: {tgt_n / max(1, count):.2f}")
+        print(f"Avg Gen E Size: {gen_e / max(1, count):.2f}\tTarget: {tgt_e / max(1, count):.2f}")
+
+    if was_training:
+        unpool.train()
+    return total / max(1, count)
+
+
+# ============================================================================
+# The DEHB objective: config + fidelity (epochs) -> validation similarity
+# ============================================================================
+
+def train_and_eval(
+    config: Dict[str, Any],
+    fidelity: float,
+    ctx: Dict[str, Any],
+    *,
+    k_unpool: int = 2,
+    seed: int = 1234,
+    value_loss_coef: float = 0.5,
+    warmup_frac: float = 0.1,
+    eval_n: int = 64,
+    eval_seed: int = 9999,
+    log_every: int = 0,
+    similarity=None,
+    similarity_ref=None,   # optional second metric (e.g. graph_similarity2) printed as a reference
+    target_kl: Optional[float] = 1.0,    # TRAJECTORY-level KL budget: logP sums over all unpooling
+                                         # actions, so this is ~n_actions x per-action KL. Calibrate
+                                         # from the kl= diagnostic in the logs (see below).
+    log_ratio_bound: float = 10.0,       # hard bound on log(ratio) before exp() — prevents inf/NaN
+    adv_std_floor: float = 0.05,         # floor on advantage std: as the policy converges, rollout
+                                         # scores homogenize and std -> 0; dividing by it amplifies
+                                         # metric noise into huge pseudo-advantages (the late-run
+                                         # policy collapse). Floor keeps the scale sane.
+    adv_clip: float = 5.0,               # hard cap on normalized advantages
+    early_stop_patience: Optional[int] = None,  # stop after this many periodic evals w/o a new best
+    return_models: bool = False,
+) -> Dict[str, Any]:
+    """
+    Trains the unpooler from scratch for int(fidelity) epochs with the given
+    hyperparameters and returns validation similarity. This is the function
+    DEHB drives.
+
+    config keys (must match build_configspace):
+      lr, entropy_coef, unpool_size, batch_size, ppo_update_epochs, ppo_clip_eps
+    """
+    if similarity is None:
+        import graph_similarity as similarity  # local module, import lazily
+
+    device = ctx["device"]
+    DX, DW = ctx["dx"], ctx["dw"]
+    train_set = ctx["train_set"]
+    seed_ei = ctx["seed_ei"]
+
+    epochs = max(1, int(round(float(fidelity))))
+    lr = float(config["lr"])
+    entropy_coef = float(config["entropy_coef"])
+    unpool_size = int(config["unpool_size"])
+    batch_size = int(config["batch_size"])
+    ppo_update_epochs = int(config["ppo_update_epochs"])
+    ppo_clip_eps = float(config["ppo_clip_eps"])
+
+    # Fixed seeding => every config starts from a comparable init / action stream
+    torch.manual_seed(seed)
+    actor_rng = torch.Generator(device=device)
+    actor_rng.manual_seed(seed + 7)
+
+    unpool = GuoUnpool(dx=DX, dw=DW, dy=DX, du=DW,
+                       kv=unpool_size, kia=unpool_size,
+                       kie=unpool_size, kw=unpool_size).to(device)
+    critic = Critic(node_feature_dim=DX, hidden=(512, 256)).to(device)
+    opt = torch.optim.AdamW(list(unpool.parameters()) + list(critic.parameters()),
+                            lr=lr, weight_decay=0.0)
+
+    warmup = max(1, int(round(epochs * warmup_frac)))
+    if epochs > warmup:
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=warmup),
+                torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs - warmup, eta_min=lr * 0.1),
+            ],
+            milestones=[warmup],
+        )
+    else:
+        sched = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=epochs)
+
+    import copy as _copy
+    experience_buffer: List[Dict[str, Any]] = []
+    losses_hist, rewards_hist = [], []
+    adv_std_hist, entropy_hist = [], []
+    best_val_R = -math.inf
+    best_state: Optional[Dict[str, Any]] = None
+    evals_since_best = 0
+
+    for epoch in range(1, epochs + 1):
         # ----- Data collection -----
-        unpool.eval()
-        critic.eval()
+        unpool.eval(); critic.eval()
         experience_buffer.clear()
         with torch.no_grad():
-            # For each encoded seed graph in the batch
             for (x_seed, x_t, ei_t, ea_t) in train_set:
-                # Generate graph and get the logP from the current acting policy
-                x_gen, ei_gen, ea_gen, logP_old, entropy, actions_taken = unpool_k_fixed(unpool, x_seed, seed_ei, k=K_MAX, rng=ACTOR_RNG)
-
-                # Also get the predicted_value and score
+                x_gen, ei_gen, ea_gen, logP_old, entropy, actions_taken = unpool_k_fixed(
+                    unpool, x_seed, seed_ei, k=k_unpool, rng=actor_rng
+                )
                 predicted_value = critic(x_seed)
-                score, _ = GS.graph_similarity(
+                score, _ = similarity.graph_similarity(
                     ei_gen.cpu(), ei_t.cpu(),
                     x1=x_gen.cpu(), x2=x_t.cpu(),
                     edge_attr1=ea_gen.cpu(),
                     edge_attr2=(ea_t.cpu() if ea_t is not None else None),
                     directed=True, wl_iters=2
                 )
-
-                # And store them
                 experience_buffer.append({
                     "x_seed": x_seed,
                     "seed_ei": seed_ei,
@@ -1306,154 +1244,340 @@ if __name__ == "__main__":
                     "predicted_value": predicted_value.detach(),
                 })
 
-        # ----- Build epoch-wide tensors (fixed during PPO epochs) -----
-        scores_all = torch.tensor([exp["score"] for exp in experience_buffer], device=DEVICE, dtype=torch.float32)
-        values_all = torch.stack([exp["predicted_value"] for exp in experience_buffer]).detach().squeeze(-1)
-        logP_old_all = torch.stack([exp["logP_old"] for exp in experience_buffer]).detach()
+        scores_all = torch.tensor([e["score"] for e in experience_buffer], device=device, dtype=torch.float32)
+        values_all = torch.stack([e["predicted_value"] for e in experience_buffer]).detach().squeeze(-1)
+        logP_old_all = torch.stack([e["logP_old"] for e in experience_buffer]).detach()
 
         advantages_all = scores_all - values_all
-        adv_mean = advantages_all.mean()
-        adv_std = advantages_all.std().clamp_min(1e-8)
-        advantages_all = (advantages_all - adv_mean) / adv_std
+        adv_std_raw = float(advantages_all.std())          # diagnostic: the collapse precursor
+        mean_entropy = float(torch.stack([e["entropy"] for e in experience_buffer]).mean())
+        advantages_all = (advantages_all - advantages_all.mean()) / advantages_all.std().clamp_min(adv_std_floor)
+        advantages_all = advantages_all.clamp(-adv_clip, adv_clip)
 
         # ----- PPO Update -----
-        unpool.train()
-        critic.train()
-
-        PPO_UPDATE_EPOCHS = 4
-        PPO_CLIP_EPSILON = 0.2
-        VALUE_LOSS_COEF = 0.5
-
-        epoch_total_losses, epoch_policy_losses, epoch_value_losses, epoch_entropies = [], [], [], []
-        for _ in range(PPO_UPDATE_EPOCHS):
-            # make a fresh random permutation each epoch pass
-            perm = torch.randperm(len(experience_buffer), device=DEVICE)
-            for i in range(0, len(experience_buffer), BATCH_SIZE):
-                mb_idx = perm[i:i + BATCH_SIZE]
-
-                # Collate fixed epoch-wide views
+        unpool.train(); critic.train()
+        epoch_total_losses = []
+        epoch_skipped = 0
+        kl_stopped = False
+        kl_at_stop = None
+        n_minibatches = max(1, math.ceil(len(experience_buffer) / batch_size))
+        total_planned_steps = ppo_update_epochs * n_minibatches
+        for _ in range(ppo_update_epochs):
+            if kl_stopped:
+                break
+            perm = torch.randperm(len(experience_buffer), device=device)
+            for i in range(0, len(experience_buffer), batch_size):
+                mb_idx = perm[i:i + batch_size]
                 scores_tensor = scores_all[mb_idx]
                 logPs_old_tensor = logP_old_all[mb_idx]
                 advantages_mb = advantages_all[mb_idx]
 
-                # --- Re-evaluate with current policy (same as before) ---
                 logPs_new_list, entropies_new_list, current_values_list = [], [], []
                 for j in mb_idx.tolist():
                     exp = experience_buffer[j]
-                    actions_copy = copy.deepcopy(exp["actions"])
+                    actions_copy = _copy.deepcopy(exp["actions"])
                     _, _, _, logP_new, entropy_new, _ = unpool_k_fixed(
-                        unpool, exp["x_seed"], exp["seed_ei"], k=K_MAX,
-                        actions_to_replay=actions_copy, rng=ACTOR_RNG
+                        unpool, exp["x_seed"], exp["seed_ei"], k=k_unpool,
+                        actions_to_replay=actions_copy, rng=actor_rng
                     )
-                    current_value = critic(exp["x_seed"])
                     logPs_new_list.append(logP_new)
                     entropies_new_list.append(entropy_new)
-                    current_values_list.append(current_value)
+                    current_values_list.append(critic(exp["x_seed"]))
 
                 logPs_new_tensor = torch.stack(logPs_new_list)
                 entropies_new_tensor = torch.stack(entropies_new_list)
                 current_values_tensor = torch.stack(current_values_list).squeeze(-1)
 
-                # --- PPO losses (unchanged except using advantages_mb) ---
-                opt.zero_grad()
-                ratio = torch.exp(logPs_new_tensor - logPs_old_tensor)
-                surr1 = ratio * advantages_mb
-                surr2 = torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * advantages_mb
-                policy_loss = -torch.min(surr1, surr2).mean()
+                opt.zero_grad(set_to_none=True)
+                # Bound the log-ratio BEFORE exponentiating. Unbounded, exp() can
+                # overflow to inf (the epoch-50 loss=4079 / epoch-80 NaN failure):
+                # for negative advantages min(surr1, surr2) is NOT bounded by the
+                # PPO clip, so an exploding ratio explodes the loss.
+                log_ratio = (logPs_new_tensor - logPs_old_tensor).clamp(-log_ratio_bound, log_ratio_bound)
+                ratio = torch.exp(log_ratio)
 
+                # Early stop on KL drift (k3 estimator). Repeated PPO epochs over
+                # the same buffer push the policy off-policy; once KL exceeds the
+                # target, further replay updates are noise at best, poison at worst.
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                if target_kl is not None and float(approx_kl) > target_kl:
+                    kl_stopped = True
+                    kl_at_stop = float(approx_kl)
+                    break
+
+                surr1 = ratio * advantages_mb
+                surr2 = torch.clamp(ratio, 1 - ppo_clip_eps, 1 + ppo_clip_eps) * advantages_mb
+                policy_loss = -torch.min(surr1, surr2).mean()
                 value_loss = F.mse_loss(current_values_tensor, scores_tensor)
                 entropy_bonus = entropies_new_tensor.mean()
 
-                loss = policy_loss + VALUE_LOSS_COEF * value_loss - ENTROPY_COEF * entropy_bonus
+                loss = policy_loss + value_loss_coef * value_loss - entropy_coef * entropy_bonus
+
+                # Never let a non-finite loss or gradient reach opt.step():
+                # clip_grad_norm_ does NOT sanitize NaN/inf — it multiplies by a
+                # NaN norm and opt.step() then writes NaN into every weight.
+                if not torch.isfinite(loss):
+                    epoch_skipped += 1
+                    continue
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(unpool.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                gn_u = torch.nn.utils.clip_grad_norm_(unpool.parameters(), 1.0)
+                gn_c = torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                if not (torch.isfinite(gn_u) and torch.isfinite(gn_c)):
+                    opt.zero_grad(set_to_none=True)
+                    epoch_skipped += 1
+                    continue
                 opt.step()
-
                 epoch_total_losses.append(loss.item())
-                epoch_policy_losses.append(policy_loss.item())
-                epoch_value_losses.append(value_loss.item())
-                epoch_entropies.append(entropy_bonus.item())
 
-        # Calculate final stats for the epoch
-        avg_total_loss = torch.tensor(epoch_total_losses).mean().item()
-        avg_policy_loss = torch.tensor(epoch_policy_losses).mean().item()
-        avg_value_loss = torch.tensor(epoch_value_losses).mean().item()
-        avg_entropy = torch.tensor(epoch_entropies).mean().item()
-        avg_reward = torch.tensor([exp["score"] for exp in experience_buffer]).mean().item()
-        avg_critic_value = torch.stack([exp["predicted_value"] for exp in experience_buffer]).mean().item()
-
-        # Append to history for plotting
+        if not epoch_total_losses:
+            epoch_total_losses = [float("nan")]
+        avg_total_loss = float(torch.tensor(epoch_total_losses).nanmean())
+        avg_reward = float(scores_all.mean())
         losses_hist.append(avg_total_loss)
         rewards_hist.append(avg_reward)
+        adv_std_hist.append(adv_std_raw)
+        entropy_hist.append(mean_entropy)
 
-        # Print detailed log every PRINT_EVERY epochs, otherwise print a concise one
-        if (epoch % PRINT_EVERY) == 0 or epoch == 1:
-            n_eval = 64
-            test_sample = random.sample(val_set, k=min(n_eval, len(val_set)))
+        # Weight health check: if anything non-finite slipped into the params,
+        # restore the last good snapshot instead of burning the remaining epochs
+        # on a dead network.
+        params_ok = all(torch.isfinite(p).all() for p in unpool.parameters())
+        if not params_ok:
+            if best_state is not None:
+                unpool.load_state_dict(best_state["unpool"])
+                critic.load_state_dict(best_state["critic"])
+                print(f"[{epoch:04d}/{epochs}] !! non-finite weights detected — "
+                      f"restored best snapshot (val_R={best_val_R:.3f} @ epoch {best_state['epoch']})")
+            else:
+                print(f"[{epoch:04d}/{epochs}] !! non-finite weights detected with no snapshot to restore — stopping")
+                break
 
-            val_R = evaluate(test_sample, GS, n_eval=n_eval)
-            print(f"[{epoch:04d}] loss={avg_total_loss:<7.4f} | p_loss={avg_policy_loss:<7.4f} | v_loss={avg_value_loss:<7.4f} | "
-                  f"train_R={avg_reward:.3f} | val_R={val_R:.3f} | critic_V={avg_critic_value:.3f} | entropy={avg_entropy:.3f}")
+        if log_every and (epoch % log_every == 0 or epoch == 1):
+            val_R_now = evaluate_policy(unpool, ctx["val_set"], similarity, seed_ei,
+                                        k=k_unpool, device=device,
+                                        eval_seed=eval_seed, n_eval=eval_n)
+            if math.isfinite(val_R_now) and val_R_now > best_val_R:
+                best_val_R = float(val_R_now)
+                evals_since_best = 0
+                best_state = {
+                    "epoch": epoch,
+                    "unpool": _copy.deepcopy(unpool.state_dict()),
+                    "critic": _copy.deepcopy(critic.state_dict()),
+                }
+            else:
+                evals_since_best += 1
+            line = (f"[{epoch:04d}/{epochs}] loss={avg_total_loss:<7.4f} | "
+                    f"train_R={avg_reward:.3f} | val_R={val_R_now:.3f} | "
+                    f"adv_std={adv_std_raw:.3f} | H={mean_entropy:.1f}")
+            if similarity_ref is not None:
+                val_R_ref = evaluate_policy(unpool, ctx["val_set"], similarity_ref, seed_ei,
+                                            k=k_unpool, device=device,
+                                            eval_seed=eval_seed, n_eval=eval_n)
+                line += f" | val_R_ref={val_R_ref:.3f}"
+            if kl_stopped:
+                line += f" | kl_stop@{len(epoch_total_losses)}/{total_planned_steps} (kl={kl_at_stop:.3f})"
+            else:
+                line += f" | steps={len(epoch_total_losses)}/{total_planned_steps}"
+            if epoch_skipped:
+                line += f" | skipped={epoch_skipped}"
+            print(line)
 
-            ##
-            other_score = evaluate(test_sample, GS2, n_eval=n_eval)
-            print(f"Other score: {other_score}")
-            ##
-        else:
-            print(f"[{epoch:04d}] loss={avg_total_loss:<7.4f} | train_R={avg_reward:.3f} | critic_V={avg_critic_value:.3f}")
+            if early_stop_patience is not None and evals_since_best >= early_stop_patience:
+                print(f"[{epoch:04d}/{epochs}] no val improvement in {evals_since_best} evals "
+                      f"(best={best_val_R:.3f} @ epoch {best_state['epoch'] if best_state else '?'}) — stopping early.")
+                break
 
         sched.step()
 
-    t1 = time.time()
-    print(f"Done in {t1 - t0:.1f}s. Saving…")
-    os.makedirs("artifacts", exist_ok=True)
+    # If the final weights underperform the best periodic snapshot (e.g. the
+    # run degraded late), restore the snapshot before final evaluation.
+    if best_state is not None:
+        final_probe = evaluate_policy(unpool, ctx["val_set"], similarity, seed_ei,
+                                      k=k_unpool, device=device,
+                                      eval_seed=eval_seed, n_eval=eval_n)
+        if not math.isfinite(final_probe) or final_probe < best_val_R:
+            unpool.load_state_dict(best_state["unpool"])
+            critic.load_state_dict(best_state["critic"])
+            if log_every:
+                print(f"Final weights (val_R={final_probe:.3f}) underperform best snapshot "
+                      f"(val_R={best_val_R:.3f} @ epoch {best_state['epoch']}) — using snapshot.")
 
-    # ---------- save model ----------
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ckpt = {
-        "unpool_state_dict": unpool.state_dict(),
-        "critic_state_dict": critic.state_dict(),
-        "optimizer_state_dict": opt.state_dict(),
-        "unpool_config": {
-            "dx": DX, "dw": DW, "dy": DX, "du": DW,
-            "k_max": K_MAX,
-            "packed_dim": packed_dim,
-            "n_seed": N_SEED,
-            "seed_ei": seed_ei.detach().cpu().tolist(),  # for reproducible seeding graph
-        }
+    val_R = evaluate_policy(unpool, ctx["val_set"], similarity, seed_ei,
+                            k=k_unpool, device=device,
+                            eval_seed=eval_seed, n_eval=eval_n, verbose=bool(log_every))
+    val_R_ref = None
+    if similarity_ref is not None:
+        val_R_ref = float(evaluate_policy(unpool, ctx["val_set"], similarity_ref, seed_ei,
+                                          k=k_unpool, device=device,
+                                          eval_seed=eval_seed, n_eval=eval_n))
+
+    out: Dict[str, Any] = {
+        "val_R": float(val_R),
+        "val_R_ref": val_R_ref,
+        "train_R_last": float(rewards_hist[-1]),
+        "best_val_R": (None if best_state is None else float(best_val_R)),
+        "best_val_epoch": (None if best_state is None else int(best_state["epoch"])),
+        "epochs": epochs,
+        "losses_hist": losses_hist,
+        "rewards_hist": rewards_hist,
+        "adv_std_hist": adv_std_hist,
+        "entropy_hist": entropy_hist,
     }
-    ckpt_path = os.path.join("artifacts", f"unpool_last_{stamp}.pt")
-    torch.save({
-        "unpool_state_dict": unpool.state_dict(),
-        "optimizer_state_dict": opt.state_dict(),
-        "scheduler_state_dict": sched.state_dict(),
-        # ... your config ...
-    }, ckpt_path)
-    with open(os.path.join("artifacts", f"unpool_last_{stamp}.json"), "w") as f:
-        json.dump(ckpt["unpool_config"], f, indent=2)
-    print(f"Saved unpool checkpoint to {ckpt_path}")
+    if return_models:
+        out["unpool"] = unpool
+        out["critic"] = critic
+        out["opt"] = opt
+        out["sched"] = sched
+    return out
 
-    # ---------- save training curves ----------
-    fig1 = plt.figure()
-    plt.plot(losses_hist)
-    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Unpooling REINFORCE Loss")
-    loss_path = os.path.join("artifacts", "unpool_loss.png")
-    fig1.savefig(loss_path, dpi=150); plt.close(fig1)
 
-    fig2 = plt.figure()
-    plt.plot(rewards_hist)
-    plt.xlabel("Epoch"); plt.ylabel("Reward (similarity)"); plt.title("Unpooling Reward")
-    rew_path = os.path.join("artifacts", "unpool_reward.png")
-    fig2.savefig(rew_path, dpi=150); plt.close(fig2)
+def build_configspace(seed: int = 0):
+    import ConfigSpace as CS
+    cs = CS.ConfigurationSpace(seed=seed)
+    cs.add_hyperparameter(CS.UniformFloatHyperparameter("lr", lower=1e-5, upper=3e-3, log=True))
+    cs.add_hyperparameter(CS.UniformFloatHyperparameter("entropy_coef", lower=1e-4, upper=5e-2, log=True))
+    cs.add_hyperparameter(CS.CategoricalHyperparameter("unpool_size", choices=[128, 256, 384, 512]))
+    cs.add_hyperparameter(CS.CategoricalHyperparameter("batch_size", choices=[64, 128, 256, 384]))
+    cs.add_hyperparameter(CS.UniformIntegerHyperparameter("ppo_update_epochs", lower=2, upper=8))
+    cs.add_hyperparameter(CS.UniformFloatHyperparameter("ppo_clip_eps", lower=0.05, upper=0.3, log=False))
+    return cs
 
-    print(f"Saved: {loss_path} and {rew_path}")
 
-    """
-    ckpt = torch.load("artifacts/unpool_best.pt", map_location=DEVICE)
-    cfg = ckpt["config"]
-    unpool_reuse = GuoUnpool(dx=cfg["dx"], dw=cfg["dw"], dy=cfg["dy"], du=cfg["du"]).to(DEVICE)
-    unpool_reuse.load_state_dict(ckpt["unpool_state_dict"])
-    unpool_reuse.eval()
-    """
+# ============================================================================
+# Entry point: UNPOOL_MODE=tune (default) runs DEHB; UNPOOL_MODE=train does a
+# full-length training run (optionally with the tuned config) and saves it.
+# ============================================================================
 
+if __name__ == "__main__":
+    import json
+    from datetime import datetime
+    from dehb_helper import DEHBHelper, DEHBRunConfig, ObjectiveResult
+    import graph_similarity as GS
+    import graph_similarity2 as GS2
+
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    SEED = 1234
+    K_MAX = 2
+
+    MODE = os.environ.get("UNPOOL_MODE", "tune")  # "tune" | "train"
+
+    # ---- HPO uses a SUBSET of the full data so each eval is tractable.
+    N_TRAIN_HPO = 512
+    N_VAL_HPO = 128
+
+    N_TRAIN_FULL = 3840
+    N_VAL_FULL = 1000
+    EPOCHS_FULL = 300
+
+    if MODE == "tune":
+        # Auto-resume: if a previous tune run left state in the output dir,
+        # pick up where it stopped instead of starting the search over.
+        # (DEHB checkpoints after every eval; evals.jsonl existing means at
+        # least one eval completed and DEHB state was saved alongside it.)
+        # Delete the dehb_unpool_out/ directory to force a fresh search.
+        DEHB_OUT = "dehb_unpool_out"
+        RESUME = os.path.exists(os.path.join(DEHB_OUT, "evals.jsonl"))
+        if RESUME:
+            print(f"Found previous run state in {DEHB_OUT}/ — resuming. "
+                  f"(Delete that directory to start fresh.)")
+
+        print("Building HPO datasets (shared across all DEHB evaluations)…")
+        ctx = build_training_context(
+            n_train=N_TRAIN_HPO, n_val=N_VAL_HPO,
+            data_seed=SEED, device=DEVICE,
+        )
+        print(f"dx={ctx['dx']} packed_dim={ctx['packed_dim']} "
+              f"train={len(ctx['train_set'])} val={len(ctx['val_set'])}")
+
+        def objective(cfg: Dict[str, Any], fidelity: float) -> ObjectiveResult:
+            out = train_and_eval(cfg, fidelity, ctx, k_unpool=K_MAX, seed=SEED, similarity=GS)
+            return ObjectiveResult(
+                metric=out["val_R"],
+                info={"train_R_last": out["train_R_last"], "epochs": out["epochs"]},
+            )
+
+        helper = DEHBHelper(
+            configspace=build_configspace(seed=0),
+            objective=objective,
+            direction="maximize",          # similarity: higher is better
+            run_cfg=DEHBRunConfig(
+                min_fidelity=8,            # epochs at the lowest rung
+                max_fidelity=72,           # epochs at full fidelity (eta=3 → rungs ~8/24/72)
+                eta=3,
+                fevals=40,                 # total number of (config, fidelity) evaluations
+                seed=0,
+                n_workers=1,
+                output_path=DEHB_OUT,
+                resume=RESUME,
+            ),
+        )
+
+        summary = helper.run()
+        print(json.dumps(summary, indent=2, default=str))
+        print(f"\nBest config saved to {summary['best_config_path']}")
+        print("Re-train at full scale with:  UNPOOL_MODE=train python guo_et_al_unpooling.py")
+
+    elif MODE == "train":
+        import matplotlib.pyplot as plt
+
+        # Use tuned config if available, otherwise the original defaults
+        best_path = os.path.join("dehb_unpool_out", "best_config.json")
+        if os.path.exists(best_path):
+            with open(best_path) as f:
+                config = json.load(f)["best_config"]
+            print(f"Loaded tuned config: {config}")
+        else:
+            config = {"lr": 3e-4, "entropy_coef": 0.01, "unpool_size": 256,
+                      "batch_size": 256, "ppo_update_epochs": 4, "ppo_clip_eps": 0.2}
+            print(f"No tuned config found; using defaults: {config}")
+
+        print("Building full datasets…")
+        ctx = build_training_context(
+            n_train=N_TRAIN_FULL, n_val=N_VAL_FULL,
+            data_seed=SEED, device=DEVICE,
+        )
+
+        out = train_and_eval(config, EPOCHS_FULL, ctx, k_unpool=K_MAX, seed=SEED,
+                             similarity=GS, similarity_ref=GS2, log_every=10, return_models=True,
+                             early_stop_patience=10)
+        print(f"Final val_R = {out['val_R']:.4f} | val_R_ref (GS2) = {out['val_R_ref']:.4f}")
+
+        os.makedirs("artifacts", exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_path = os.path.join("artifacts", f"unpool_last_{stamp}.pt")
+        torch.save({
+            "unpool_state_dict": out["unpool"].state_dict(),
+            "critic_state_dict": out["critic"].state_dict(),
+            "optimizer_state_dict": out["opt"].state_dict(),
+            "scheduler_state_dict": out["sched"].state_dict(),
+        }, ckpt_path)
+        with open(os.path.join("artifacts", f"unpool_last_{stamp}.json"), "w") as f:
+            json.dump({
+                "dx": ctx["dx"], "dw": ctx["dw"], "dy": ctx["dx"], "du": ctx["dw"],
+                "k_max": K_MAX, "packed_dim": ctx["packed_dim"], "n_seed": ctx["n_seed"],
+                "seed_ei": ctx["seed_ei"].detach().cpu().tolist(),
+                "config": config,
+            }, f, indent=2)
+        print(f"Saved checkpoint to {ckpt_path}")
+
+        fig1 = plt.figure()
+        plt.plot(out["losses_hist"]); plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Unpooling PPO Loss")
+        fig1.savefig(os.path.join("artifacts", "unpool_loss.png"), dpi=150); plt.close(fig1)
+
+        fig2 = plt.figure()
+        plt.plot(out["rewards_hist"]); plt.xlabel("Epoch"); plt.ylabel("Reward (similarity)"); plt.title("Unpooling Reward")
+        fig2.savefig(os.path.join("artifacts", "unpool_reward.png"), dpi=150); plt.close(fig2)
+
+        fig3, ax1 = plt.subplots()
+        ax1.plot(out["adv_std_hist"], color="tab:blue", label="advantage std (raw)")
+        ax1.axhline(0.05, color="tab:blue", linestyle=":", alpha=0.6, label="std floor")
+        ax1.set_xlabel("Epoch"); ax1.set_ylabel("Advantage std", color="tab:blue")
+        ax2 = ax1.twinx()
+        ax2.plot(out["entropy_hist"], color="tab:orange", label="mean policy entropy")
+        ax2.set_ylabel("Entropy", color="tab:orange")
+        ax1.set_title("Collapse diagnostics: advantage std & policy entropy")
+        fig3.savefig(os.path.join("artifacts", "unpool_diagnostics.png"), dpi=150); plt.close(fig3)
+
+    else:
+        raise ValueError(f"Unknown UNPOOL_MODE={MODE!r} (use 'tune' or 'train')")
