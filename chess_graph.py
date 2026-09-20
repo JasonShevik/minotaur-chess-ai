@@ -127,7 +127,7 @@ def perturb_position(
     :param fen: FEN string of the position to perturb.
     :param perturb_type: Which perturbation to apply (0..7). If None, one is chosen
         from type_distribution or uniformly at random.
-    :param magnitude: Interpretation depends on perturb_type, but it is the size 
+    :param magnitude: Interpretation depends on perturb_type, but it is the size
         of a single perturbation, not the total number of perturbations.
     :param type_distribution: When perturb_type is None, how to choose the type.
         - If a 1D tensor of shape (num_types,): if all values are in [0, 1], treated
@@ -976,6 +976,15 @@ def fen_to_vector(fen: str) -> List[float]:
 
     # Save changes to the original list
     vector_version = working_castle_vector[:]
+
+    # Snap castling fractions (0.1 / 0.2 / 0.3) so float noise does not break == checks downstream
+    for i, v in enumerate(vector_version):
+        base = int(v)
+        if base in (6, -6):
+            frac = abs(v) - 6
+            if frac > 1e-9:
+                sign = 1 if v > 0 else -1
+                vector_version[i] = sign * (6 + round(frac * 10) / 10)
 
     # ----- En Passant -----
 

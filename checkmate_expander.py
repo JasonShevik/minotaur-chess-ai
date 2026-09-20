@@ -1,25 +1,29 @@
 import chess.engine
 import chess
-from typing import Dict, List, Optional, Set, Tuple
 import helper_utils as hu
+from typing import Dict, List, Optional, Set, Tuple
 
 import sys
 sys.setrecursionlimit(11000)
 
 def _analyze_position(
-        engine: chess.engine.SimpleEngine,
-        board: chess.Board,
-        attacker: chess.Color,
-        *,
-        limit_depth: int = 10,
+    engine: chess.engine.SimpleEngine,
+    board: chess.Board,
+    attacker: chess.Color,
+    *,
+    limit_depth: int = 10,
+    limit_time_sec: float = 600.0,
 ) -> Tuple[bool, Optional[int], Optional[str]]:
     """
     Analyze a position and return whether it is forced checkmate for the attacker,
     the depth to mate in full moves (if forced), and the best move in UCI.
 
+    Search is bounded by both depth and time at the engine level; the engine stops
+    when either limit is reached.
+
     :return: (is_forced_mate_for_attacker, depth_to_mate_in_moves, best_move_uci)
     """
-    limit = chess.engine.Limit(depth=limit_depth)
+    limit = chess.engine.Limit(depth=limit_depth, time=limit_time_sec)
     try:
         info = engine.analyse(board, limit)
     except Exception as e:
@@ -59,12 +63,12 @@ def _ensure_full_fen(fen: str) -> str:
 
 
 def expand_down(
-        engine: chess.engine.SimpleEngine,
-        position: str,
-        path: Optional[Set[str]] = None,
-        attacker: Optional[chess.Color] = None,
-        verified: Optional[Dict[str, Tuple[int, str]]] = None,
-        memo: Optional[Dict[str, Optional[int]]] = None,
+    engine: chess.engine.SimpleEngine,
+    position: str,
+    path: Optional[Set[str]] = None,
+    attacker: Optional[chess.Color] = None,
+    verified: Optional[Dict[str, Tuple[int, str]]] = None,
+    memo: Optional[Dict[str, Optional[int]]] = None,
 ) -> Optional[int]:
     """
     Recursively expand the full downward tree of a forced checkmate position.
@@ -89,8 +93,6 @@ def expand_down(
 
     my_count += 1
     print(my_count)
-    if my_count > 100000:
-        return None
 
     position_key = _normalize_fen(position)
 
@@ -212,7 +214,7 @@ def expand_down(
 def verify(
         engine: chess.engine.SimpleEngine,
         fens: List[str],
-        depth: int = 15,
+        depth: int = 20,
 ) -> Tuple[int, int]:
     """
     Verify a list of positions and count how many are forced checkmates.
@@ -265,7 +267,7 @@ if __name__ == "__main__":
 
     my_count = 0
 
-    engine = hu.initialize_engine("stockfish", {"Threads": 8, "Hash": 20000})
+    engine = hu.initialize_engine("stockfish", {"Threads": 8, "Hash": 10000})
     expand_down(engine, fen, verified=verified)
 
     verified_fens = list(verified.keys())

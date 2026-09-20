@@ -602,6 +602,28 @@ def print_head(db_name: str, n: int = 5) -> None:
             print(" | ".join(str(x) for x in row))
 
 
+def print_random_checkmates(db_name: str, count: int = 10) -> None:
+    """Query and print a random sample of checkmate positions from the database."""
+    with sqlite3.connect(f"{db_name}.db") as conn:
+        cursor: sqlite3.Cursor = conn.cursor()
+        cursor.execute('''
+            SELECT fen, engine_name, depth, score, best_move
+            FROM "960_position_data"
+            WHERE is_forced_checkmate = 1
+            ORDER BY RANDOM()
+            LIMIT ?
+        ''', (count,))
+        rows: list = cursor.fetchall()
+    if not rows:
+        print("No checkmate positions found.")
+        return
+    print(f"Random checkmate positions (n={len(rows)}):\n")
+    for i, row in enumerate(rows, start=1):
+        fen, engine_name, depth, score, best_move = row
+        print(f"{i}. FEN: {fen}")
+        print(f"   Engine: {engine_name}, Depth: {depth}, Score: {score}, Best move: {best_move}\n")
+
+
 # Program Body
 if __name__ == "__main__":
     name = "minotaur_data"
@@ -613,8 +635,10 @@ if __name__ == "__main__":
     #export_analyzed_positions(name, "minotaur_analyzed")
 
     #backfill_castling_rook_column("minotaur_data")
-    
-    print_head(name)
+
+    print_random_checkmates(name, 10)
+
+    #print_head(name)
 
 
 """
