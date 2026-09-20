@@ -846,9 +846,11 @@ if __name__ == "__main__":
     # Defaults to a dry run; pass dry_run=False to actually write.
     #fix_stripped_castling_rights(name)
 
-    print_random_checkmates(name, 10)
+    #print_random_checkmates(name, 10)
 
     #print_head(name)
+
+    fix_stripped_castling_rights('minotaur_data', dry_run=False)
 
 
 """
