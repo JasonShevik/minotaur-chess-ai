@@ -107,7 +107,7 @@ def fix_castling_in_fen(fen_str: str) -> str:
     current = set(c for c in parts[2] if c in "KQkq")
     if not current:
         return fen_str
-    board = chess.Board(fen_str)
+    board = chess.Board(fen_str, chess960=True)
     plausible = {k for k in current if is_castling_right_plausible(board, k)}
     new_castling = "".join(c for c in "KQkq" if c in plausible) if plausible else "-"
     parts[2] = new_castling
@@ -145,7 +145,7 @@ def perturb_position(
         # the original turn after each move so the final FEN keeps e.g. white to move.
         rand = rng if rng is not None else random
         n = max(1, int(magnitude))
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
         turn_white = board.turn  # turn to show in final FEN (unchanged by our moves)
         order = [s for s in chess.SQUARES if board.piece_at(s) is not None]
         rand.shuffle(order)
@@ -202,7 +202,7 @@ def perturb_position(
         # exclude squares that are legal moves for that piece, then move the piece to a random
         # illegal destination (starting square becomes empty).
         rand = rng if rng is not None else random
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
         turn_white = board.turn
         radius = max(1, int(magnitude))
         order = [s for s in chess.SQUARES if board.piece_at(s) is not None]
@@ -244,7 +244,7 @@ def perturb_position(
         # Delete exactly one "thing" at random: any piece (either color, including kings) or the
         # en passant target square if present. Magnitude is ignored.
         rand = rng if rng is not None else random
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
         options: List[Optional[chess.Square]] = [
             s for s in chess.SQUARES if board.piece_at(s) is not None
         ]
@@ -265,7 +265,7 @@ def perturb_position(
         # target. If en passant is not already set, possible ep squares are inferred from 4th/5th rank
         # pawn pairs (adjacent files with one white and one black pawn). Magnitude is ignored.
         rand = rng if rng is not None else random
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
         options: List[Tuple[str, Any]] = []
 
         # Possible en passant squares only when ep is not already set (each square at most once).
@@ -319,7 +319,7 @@ def perturb_position(
         # Swap two randomly chosen pieces that differ in type or color (so the position actually changes).
         # Magnitude ignored. No en passant.
         rand = rng if rng is not None else random
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
         occupied = [s for s in chess.SQUARES if board.piece_at(s) is not None]
         if len(occupied) < 2:
             return fen_str
@@ -340,7 +340,7 @@ def perturb_position(
         # Pick a random piece on the board and change it to a random different piece type (same color).
         # En passant not considered; all pieces except kings count. Magnitude ignored.
         rand = rng if rng is not None else random
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
         piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
         occupied = [s for s in chess.SQUARES if (board.piece_at(s) is not None and board.piece_at(s).piece_type != chess.KING)]
         if not occupied:
@@ -355,7 +355,7 @@ def perturb_position(
     def perturb_fen_piece_color_change(fen_str: str) -> str:      # ----- Perturbation Type 6 -----
         # Pick a random piece (not a king; en passant not considered) and flip its color.
         rand = rng if rng is not None else random
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
         swappable = [s for s in chess.SQUARES if board.piece_at(s) is not None and board.piece_at(s).piece_type != chess.KING]
         if not swappable:
             return fen_str
@@ -369,7 +369,7 @@ def perturb_position(
         # One of: remove an existing castling right, or add a castling right if sensical (Chess960-aware).
         # Uses is_castling_right_plausible for add-check; final FEN is cleaned with fix_castling_in_fen.
         rand = rng if rng is not None else random
-        board = chess.Board(fen_str)
+        board = chess.Board(fen_str, chess960=True)
 
         castling_str = board.fen().split()[2]
         current = set(c for c in castling_str if c in "KQkq")
@@ -1051,12 +1051,12 @@ if __name__ == "__main__":
     # Example FEN: "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w Kk - 0 1" # En passant example
     # Example FEN: "r1bq1b1r/ppp3pp/2n1k3/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R w K - 0 1" # Fried Liver Attack
     fen = "r1bqk2r/p1ppbpp1/2n2n1p/Pp2p3/4P3/2N2N2/1PPPBPPP/R1BQK2R w - - 0 1"
-    board = chess.Board(fen)
+    board = chess.Board(fen, chess960=True)
     print(board)
     print(fen)
     print("\n")
     fen = perturb_position(fen, perturb_type=4, magnitude=1)
-    board = chess.Board(fen)
+    board = chess.Board(fen, chess960=True)
     print(board)
     print(fen)
     """

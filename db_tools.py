@@ -434,7 +434,7 @@ def _castling_rook_squares_from_fen(fen: str, rng: Optional[random.Random] = Non
     if not allowed:
         return ([-1, -1, -1, -1], False)
     try:
-        board = chess.Board(fen)
+        board = chess.Board(fen, chess960=True)
     except (ValueError, TypeError):
         return ([-1, -1, -1, -1], False)
 
@@ -496,7 +496,7 @@ def _castling_rook_squares_from_fen_symmetric(
     if not allowed:
         return ([-1, -1, -1, -1], False, False)
     try:
-        board = chess.Board(fen)
+        board = chess.Board(fen, chess960=True)
     except (ValueError, TypeError):
         return ([-1, -1, -1, -1], False, False)
 

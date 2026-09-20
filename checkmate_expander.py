@@ -107,7 +107,7 @@ def expand_down(
     path = set(path)
     path.add(position_key)
 
-    board = chess.Board(position)
+    board = chess.Board(position, chess960=True)
 
     # Infer attacker
     if attacker is None:
@@ -228,7 +228,7 @@ def verify(
 
     for fen in fens:
         full_fen = _ensure_full_fen(fen)
-        board = chess.Board(full_fen)
+        board = chess.Board(full_fen, chess960=True)
         is_forced_mate, mate_plies, best_move_uci = _analyze_position(
             engine,
             board,
@@ -262,7 +262,7 @@ def expand_up() -> None:
 if __name__ == "__main__":
     verified = {}
     fen = "8/7p/kR2p1p1/5p2/N3RPP1/1P6/1K5P/8 b - - 1 37"
-    board = chess.Board(fen)
+    board = chess.Board(fen, chess960=True)
     print(f"{board}\n\n")
 
     my_count = 0

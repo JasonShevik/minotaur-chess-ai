@@ -128,8 +128,13 @@ def engine_loop(engine: chess.engine.SimpleEngine, position_list: List[str], dat
             # No nodes have been visited yet
             data_dict["Nodes"] = 0
 
-            # Parse the position and make an object
-            board: chess.Board = chess.Board(position)
+            # Parse the position and make an object.
+            # chess960=True is required. Without it, python-chess silently discards any
+            # castling right whose king and rook are not on the standard squares, and it
+            # is that stripped position which gets sent to the engine, so the evaluation
+            # would not describe the FEN we store. python-chess also sets the engine's
+            # UCI_Chess960 option from this flag.
+            board: chess.Board = chess.Board(position, chess960=True)
 
             # Begin the analysis of this board position
             analysis: chess.engine.SimpleAnalysisResult
