@@ -108,10 +108,10 @@ stockfish_breaks = [[20, 400],
                     [40, 100],
                     [50, -1]]  # Maximum depth
 
-stockfish_config = {"Threads": 4,
+stockfish_config = {"Threads": 8,
                     "Hash": 20000}
 
-stockfish_dict = {"Name": "Stockfish 17",
+stockfish_dict = {"Name": "Stockfish 19",
                   "Breaks": stockfish_breaks,
                   "Threshold Index": 0,
                   "Nodes": 0}
@@ -124,13 +124,13 @@ leela_breaks = [[10, 400],
                 [16, 100],
                 [19, -1]]  # Maximum depth
 
-leela_config = {"Threads": 2,
+leela_config = {"Threads": 1,
                 "NNCacheSize": 1000000,
                 "MinibatchSize": 1024,
-                # "WeightsFile": "lc0-v0.30.0-windows-gpu-nvidia-cuda/768x15x24h-t82-2-swa-5230000.pb",
+                # "WeightsFile": "lc0-v0.32.1-windows-gpu-nvidia-cuda12/791556.pb.gz",
                 "RamLimitMb": 20000}
 
-leela_dict = {"Name": "Leela 0.31.2",
+leela_dict = {"Name": "Leela 0.32.1",
               "Breaks": leela_breaks,
               "Threshold Index": 0,
               "Nodes": 0}
@@ -148,7 +148,7 @@ if __name__ == "__main__":
     leela_checkmates_yes = False
 
     # Start the log
-    logging.basicConfig(filename="depth_breaks_log.log",
+    logging.basicConfig(filename="position_labeler_log.log",
                         level=logging.DEBUG,
                         format="%(asctime)s - %(levelname)s - %(message)s")
 

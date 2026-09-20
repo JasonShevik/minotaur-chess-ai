@@ -1,0 +1,32 @@
+# ----- Engine binaries -----
+# Downloaded separately; far too large for GitHub.
+# helper_utils.initialize_engine() expects them at these paths in the project root:
+#   stockfish/stockfish-windows-x86-64-universal.exe
+#   lc0-v0.32.1-windows-gpu-nvidia-cuda12/lc0.exe
+stockfish/
+lc0-v*/
+
+# ----- Large working database -----
+# minotaur_data.db is the full ~3M position table (>500 MB; GitHub caps files at 100 MB).
+# The small exported minotaur_analyzed.db IS tracked on purpose.
+minotaur_data*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ----- Raw game data -----
+lichess-games/
+
+# ----- Run outputs -----
+*.log
+artifacts/
+dehb_unpool_out/
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ----- IDE -----
+.idea/

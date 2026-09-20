@@ -11,15 +11,30 @@ import os
 from typing import List, Tuple, Dict, Any, Callable
 
 
+# Engine binaries live in the project root (next to this file) and are gitignored.
+# Paths are resolved against this file's directory rather than the current working
+# directory, so the engines are found no matter where a script is launched from.
+PROJECT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
+
+ENGINE_PATHS: Dict[str, str] = {
+    "leela": os.path.join("lc0-v0.32.1-windows-gpu-nvidia-cuda12", "lc0.exe"),
+    "stockfish": os.path.join("stockfish", "stockfish-windows-x86-64-universal.exe"),
+}
+
+
 # This function creates and returns a chess engine object according to the configuration settings
 def initialize_engine(which_engine: str, configure_options: Dict[str, Any]) -> chess.engine.SimpleEngine:
-    if which_engine == "leela":
-        engine_dir: str = "lc0-v0.31.2-windows-gpu-nvidia-cuda/lc0.exe"
-    elif which_engine == "stockfish":
-        engine_dir: str = "stockfish/stockfish-windows-x86-64-avx2.exe"
-    else:
-        print("Invalid Engine Choice")
-        engine_dir: str = ""
+    if which_engine not in ENGINE_PATHS:
+        raise ValueError(
+            f"Invalid engine choice: {which_engine!r}. Expected one of {sorted(ENGINE_PATHS)}."
+        )
+
+    engine_dir: str = os.path.join(PROJECT_ROOT, ENGINE_PATHS[which_engine])
+    if not os.path.isfile(engine_dir):
+        raise FileNotFoundError(
+            f"{which_engine} binary not found at {engine_dir}. Engine binaries are gitignored; "
+            f"download it and place it at that path."
+        )
 
     this_engine = chess.engine.SimpleEngine.popen_uci(engine_dir)
     this_engine.configure(configure_options)
