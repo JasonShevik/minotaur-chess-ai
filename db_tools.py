@@ -3,7 +3,7 @@ import sqlite3
 import random
 import chess
 from os.path import exists
-from typing import List, Tuple, Callable, Optional
+from typing import Dict, List, Tuple, Callable, Optional
 
 
 def create_db(db_name: str) -> None:
@@ -624,6 +624,212 @@ def print_random_checkmates(db_name: str, count: int = 10) -> None:
         print(f"   Engine: {engine_name}, Depth: {depth}, Score: {score}, Best move: {best_move}\n")
 
 
+def engine_seen_fen(fen: str) -> str:
+    """
+    Rebuild the FEN exactly as python-chess hands it to a UCI engine for a board that was
+    built in standard mode, which is what every analysis run did before the chess960 fix.
+
+    Standard mode silently discards any castling right whose king and rook are not on the
+    standard squares, and the FEN sent to the engine is generated from that stripped board.
+    For a position with no Chess960 castling rights this returns the FEN unchanged.
+
+    :param fen: The FEN as stored in the database.
+    :return: The FEN the engine actually received.
+    """
+    board = chess.Board(fen)
+    return board.root().fen(shredder=False, en_passant="fen")
+
+
+def fix_stripped_castling_rights(
+    db_name: str,
+    dry_run: bool = True,
+    requeue_originals: bool = True,
+    batch_size: int = 1000,
+) -> Dict[str, int]:
+    """
+    Repair analyzed rows whose evaluation was produced without their Chess960 castling rights.
+
+    Every analysis run before the chess960 fix built its boards in python-chess standard mode,
+    which throws away a castling right whose king and rook are not on the standard squares.
+    python-chess generates the FEN it sends to the engine from that board, so the engine
+    analyzed a position with those rights removed while we stored the original FEN. The
+    engine_name, depth, score, is_forced_checkmate and best_move on those rows are all
+    correct, but they describe the stripped position rather than the one in the fen column.
+
+    For each analyzed row this rebuilds the FEN the engine actually received. If it matches
+    the stored FEN then the row was never affected and is left alone. Otherwise the row's fen
+    is rewritten to the engine-seen position, which makes the row self consistent at no engine
+    cost, and castling_rook_squares is cleared because the new FEN claims no castling rights.
+
+    When requeue_originals is True the original FEN is then inserted as a fresh unanalyzed
+    row, so the true position goes back into the queue to be labeled properly by the fixed
+    code. The rewrite frees that key first, so the insert cannot collide. Leaving this False
+    discards the original positions permanently, so prefer True unless you are certain.
+
+    A row is only touched when the difference is confined to the castling field. Anything
+    else would mean something other than castling changed, so those rows are left alone,
+    counted as anomalies and printed for review. Rows whose target FEN already exists as a
+    different row are also skipped and counted rather than colliding on the primary key.
+
+    Safe to run repeatedly. After a successful run the repaired rows no longer claim castling
+    rights, so a second pass finds nothing to do.
+
+    :param db_name: Database filename without the .db suffix.
+    :param dry_run: When True, the default, nothing is written and only the report is printed.
+    :param requeue_originals: Re-insert each original FEN as an unanalyzed row.
+    :param batch_size: How many repaired rows to commit at a time.
+    :return: Counts keyed by analyzed, affected, rewritten, requeued, collisions, anomalies.
+    """
+    counts: Dict[str, int] = {
+        "analyzed": 0,
+        "affected": 0,
+        "rewritten": 0,
+        "requeued": 0,
+        "collisions": 0,
+        "anomalies": 0,
+    }
+
+    conn: sqlite3.Connection = sqlite3.connect(f"{db_name}.db")
+    cursor: sqlite3.Cursor = conn.cursor()
+
+    # Which optional columns exist determines what we can write back
+    cursor.execute('PRAGMA table_info("960_position_data")')
+    columns = [row[1] for row in cursor.fetchall()]
+    has_castling_column = "castling_rook_squares" in columns
+    has_inconsistent_column = "inconsistent" in columns
+
+    mode = "DRY RUN (nothing will be written)" if dry_run else "WRITING"
+    print(f"Scanning analyzed rows in {db_name}.db for stripped castling rights... [{mode}]")
+
+    # Pull the analyzed FENs up front so we are not iterating a cursor while writing to it
+    cursor.execute('SELECT fen FROM "960_position_data" WHERE is_analyzed = 1')
+    analyzed_fens: List[str] = [row[0] for row in cursor.fetchall()]
+    counts["analyzed"] = len(analyzed_fens)
+    print(f"  {counts['analyzed']} analyzed rows to check.")
+
+    anomalies: List[Tuple[str, str]] = []
+    collisions: List[str] = []
+    pending: int = 0
+
+    fen: str
+    for fen in analyzed_fens:
+        try:
+            target_fen: str = engine_seen_fen(fen)
+        except (ValueError, TypeError) as e:
+            # An unparseable FEN is not something to guess at
+            anomalies.append((fen, f"could not parse: {e}"))
+            counts["anomalies"] += 1
+            continue
+
+        # Unaffected: what we stored is what the engine saw
+        if target_fen == fen:
+            continue
+
+        # Only ever touch rows where the castling field alone moved
+        stored_parts = fen.split()
+        target_parts = target_fen.split()
+        stored_rest = [p for i, p in enumerate(stored_parts) if i != 2]
+        target_rest = [p for i, p in enumerate(target_parts) if i != 2]
+        if len(stored_parts) != len(target_parts) or stored_rest != target_rest:
+            anomalies.append((fen, f"differs outside the castling field: {target_fen}"))
+            counts["anomalies"] += 1
+            continue
+
+        counts["affected"] += 1
+
+        # Never clobber an existing row
+        cursor.execute('SELECT 1 FROM "960_position_data" WHERE fen = ? LIMIT 1', (target_fen,))
+        if cursor.fetchone() is not None:
+            collisions.append(fen)
+            counts["collisions"] += 1
+            continue
+
+        if dry_run:
+            counts["rewritten"] += 1
+            if requeue_originals:
+                counts["requeued"] += 1
+            continue
+
+        # Point the row at the position the engine actually evaluated. The new FEN claims no
+        # castling rights, so any recorded castling rook squares no longer apply.
+        if has_castling_column:
+            cursor.execute(
+                'UPDATE "960_position_data" SET fen = ?, castling_rook_squares = ? WHERE fen = ?',
+                (target_fen, _castling_rook_squares_to_db_value([-1, -1, -1, -1]), fen),
+            )
+        else:
+            cursor.execute(
+                'UPDATE "960_position_data" SET fen = ? WHERE fen = ?', (target_fen, fen)
+            )
+        counts["rewritten"] += 1
+
+        # The original key is free now, so put the true position back in the queue
+        if requeue_originals:
+            if has_castling_column:
+                squares, _, inconsistent = _castling_rook_squares_from_fen_symmetric(fen)
+                value = _castling_rook_squares_to_db_value(squares)
+                if has_inconsistent_column:
+                    cursor.execute(
+                        'INSERT OR IGNORE INTO "960_position_data" '
+                        '(fen, is_analyzed, castling_rook_squares, inconsistent) VALUES (?, 0, ?, ?)',
+                        (fen, value, 1 if inconsistent else 0),
+                    )
+                else:
+                    cursor.execute(
+                        'INSERT OR IGNORE INTO "960_position_data" '
+                        '(fen, is_analyzed, castling_rook_squares) VALUES (?, 0, ?)',
+                        (fen, value),
+                    )
+            else:
+                cursor.execute(
+                    'INSERT OR IGNORE INTO "960_position_data" (fen, is_analyzed) VALUES (?, 0)',
+                    (fen,),
+                )
+            if cursor.rowcount > 0:
+                counts["requeued"] += cursor.rowcount
+
+        pending += 1
+        if pending >= batch_size:
+            conn.commit()
+            pending = 0
+            print(f"  {counts['rewritten']} rows repaired so far...")
+
+    if not dry_run:
+        conn.commit()
+    conn.close()
+
+    # ----- Report -----
+    print()
+    print("===== Castling rights repair =====")
+    print(f"Mode:                      {mode}")
+    print(f"Analyzed rows checked:     {counts['analyzed']}")
+    print(f"Affected rows found:       {counts['affected']}")
+    print(f"Rows repaired:             {counts['rewritten']}")
+    print(f"Originals re-queued:       {counts['requeued']}")
+    print(f"Skipped, key collision:    {counts['collisions']}")
+    print(f"Skipped, anomalies:        {counts['anomalies']}")
+
+    if collisions:
+        print("\nSkipped because the engine-seen FEN already exists as another row:")
+        for bad_fen in collisions[:20]:
+            print(f"  {bad_fen}")
+        if len(collisions) > 20:
+            print(f"  ... and {len(collisions) - 20} more")
+
+    if anomalies:
+        print("\nSkipped because the change was not confined to castling:")
+        for bad_fen, why in anomalies[:20]:
+            print(f"  {bad_fen}")
+            print(f"    {why}")
+        if len(anomalies) > 20:
+            print(f"  ... and {len(anomalies) - 20} more")
+
+    if dry_run:
+        print("\nNothing was written. Re-run with dry_run=False to apply.")
+
+    return counts
+
+
 # Program Body
 if __name__ == "__main__":
     name = "minotaur_data"
@@ -635,6 +841,10 @@ if __name__ == "__main__":
     #export_analyzed_positions(name, "minotaur_analyzed")
 
     #backfill_castling_rook_column("minotaur_data")
+
+    # Repair rows whose evaluation was made without their Chess960 castling rights.
+    # Defaults to a dry run; pass dry_run=False to actually write.
+    #fix_stripped_castling_rights(name)
 
     print_random_checkmates(name, 10)
 
