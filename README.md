@@ -1,35 +1,34 @@
 # minotaur-chess-ai
-This is a new chess AI that I am developing. It will have a innovative and unconventional architecture which combines [Graph Attention Networks (GATs)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network), [Recurrent Neural Networks (RNNs)](https://en.wikipedia.org/wiki/Recurrent_neural_network), and [Reinforcement Learning (RL) with self-play](https://en.wikipedia.org/wiki/Self-play) to learn the rules of chess from scratch and how to play the best move in a given position without ever employing an explicit search function. Instead, repeated passes of the linear network will update a hidden state which contains the model's current reasoning, and the distribution of its hypothesis moves in the embedding space from one pass to another will inform the decision of when to stop.
+The Minotaur chess AI project aims to create a new framework for chess analysis. It is fundamentally a representations first approach to chess that represents the chess board as a [heterogenous graph](https://en.wikipedia.org/wiki/Graph_(discrete_mathematics)) with different edge types for each interaction to create a high dimensional [self-supervised](https://en.wikipedia.org/wiki/Self-supervised_learning) chess position encoder using [Graph Attention Networks (GATs)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network), [learnable graph unpooling](https://arxiv.org/abs/2206.01874), [Deep Graph InfoMax (DGI)](https://arxiv.org/html/1809.10341v2), contrastive learning via [InfoNCE](https://arxiv.org/abs/2407.00143), and [reinforcement learning via self-play](https://en.wikipedia.org/wiki/Self-play). The idea is that a sufficiently advanced and thorough position encoding could contain emergent organizational properties that enable easier and higher quality downstream position analysis, whether that be a chess playing AI or a classifier of some kind.
 
 ## Table of Contents
 
-* In Progress
-* Architecture
-   * Encoder/Decoder
-   * Recurrent Neural Network
-* Training plan
+* Labyrinth (Encoder)
+   * Architecture / training
+* Minotaur (Player)
+   * Architecture
    * Pre-training
    * Supervised learning
    * Reinforcement learning
    * Adversarial model
 
-## In Progress:
-* Update the architecture, start working on encoder.
-* There is a flaw in FEN where if two rooks are on one side of the king in a Fischer random game, then it is unclear which one is the castling rook without knowing the rook starting squares. Add an option to specify starting squares.
 
-## Architecture:
-#### Encoder/Decoder:
-The model utilizes a collection of 8 [message passing graphs](https://pytorch-geometric.readthedocs.io/en/latest/tutorial/create_gnn.html) implemented via [Graph Attention Networks (GATs)](https://en.wikipedia.org/wiki/Graph_neural_network#Graph_attention_network). The input to the network is a graph with 64 nodes and 8 lists of edges for different piece movement types (pawn move, pawn attack, knight, bishop, rook, king, castle). The node features are 8 dimensional vectors with the 6 piece types, en passant, and a hostility flag. The result of the graph attention networks at each square will be appended such that the 64 nodes then each have a vector with local information relevant to every piece movement type. These node level embeddings will be fed into a [multilayer perceptron](https://en.wikipedia.org/wiki/Multilayer_perceptron) to consolidate the information and compress it to a smaller vector. The process is then repeated for an additional two hops of the graph so that the final node level embeddings contain information about how that square relates to the entire board.
+## Labyrinth (Encoder):
+#### Architecture / training:
+Labyrinth is the position encoder that will be trained fully self supervised using Deep Graph InfoMax and contrastive learning via InfoNCE. DGI involves three agents working together in a single training loop: the local encoder, the global summarizer, and the discriminator.
 
-The model will then be trained with [Deep Graph Infomax (DGI)](https://arxiv.org/abs/1809.10341), a form of [Self-Supervised Learning (SSL)](https://en.wikipedia.org/wiki/Self-supervised_learning) where the model infers a hyperdimensional embedding space for chess positions by maximizing the mutual information between the embeddings of nodes or neighborhoods compared to a summary of the entire graph. 
-The summary may be created using [a graph unpooling layer](https://arxiv.org/abs/2206.01874), a method which learns to enlarge a graph by adding additional nodes and connections. This should augment the graph by making implicit aspects of its structure explicit and learning to encode the information in the nodel level embeddings
+The local encoder involves three graph attention network layers on the heterogenous graph which ensures that every single node has received information from every other node through multiple paths, as well as [multilayer perceptrons](https://en.wikipedia.org/wiki/Multilayer_perceptron). This results in 64 different encoded vectors, and each one essentially describes the relationships between that square and every other square on the board.
 
-The full process involves taking a chess position (P_0) and creating a slightly purturbed copy of it (P_1), then feeding each of those to the DGI encoder model to get node level encodings that contain information about each square's relationship with the entire board. The original position P_0 is fed to the summarizer model to create the latent space representation of the position. Finally, a discriminator classifier model takes in the full board summary of the original position P_0, along with a node level encoding that could come from either P_0 or P_1, and the discriminator returns true or false for whether the node came from that global summary. This involves a multi-agent learning setup where the encoder, summarizer, and discriminator all learn from each other simultaneously. Once this has been done for hundreds of millions of Fischer random positions, the final summarizer is the chess position encoder which defines the high dimensional latent space.
+The global summarizer involves multiple learnable graph unpooling layers that learn to expand the position from 64 nodes into a larger graph that makes explicit some of the deeper relationships that were previously only implicit in the position. The larger concept graph is then fed into a graph attention network then flattened and fed into a multilayer perceptron before outputting one large summary vector.
 
-#### Recurrent Neural Network (RNN):
-After a chess position is encoded, it is passed to a [Recurrent Neural Network (RNN)](https://en.wikipedia.org/wiki/Recurrent_neural_network) along with another vector populated by zeros which is the hidden state. After a forward pass, the model outputs another high-context embedded vector, which is the hypothesis move, along with a modified hidden state. The hypothesis move can either be chosen, or the modified hidden state fed back into the network for another pass along with the original high-context encoded vector. This allows the model to perform an 'implicit search' by continuing to think about the implications of the current position without explicitly choosing/pruning specific lines to analyze.
+The discriminator must be able to look at the highly descriptive summary vector and determine if a specific node encoding belongs to that summarized position or if it came from a perturbed position. In other words, if a perturbed position had a pawn removed from the g2 square, then the discriminator should be able to look at the summary of the original position, and the encoding of the b8 square from the perturbed position, and realize that they do not match. This should force the summarizer and local encoder to create highly descriptive encodings.
 
-## Training plan
+Somewhat unconventionally, the global summarizer will be kept as the final position encoder, since it summarizes the entire position so descriptively as to recognize the nuances of the relationships of every square it contains.
+
+## Minotaur (Player):
+#### Architecture:
+After a chess position is encoded, it is passed to a [Recurrent Neural Network (RNN)](https://en.wikipedia.org/wiki/Recurrent_neural_network) along with a hidden state vector. After a forward pass, the model outputs the hypothesis move, along with a modified hidden state. The hypothesis move can either be chosen, or the modified hidden state fed back into the network for another pass along with the original high-context encoded vector. This allows the model to perform a 'latent search' by continuing to think about the implications of the current position without explicitly choosing/pruning specific lines to analyze.
+
 #### Pre-training (RL)
 The model may be pre-trained on a very large collection of unlabeled chess960 positions to predict sequences of legal moves without regard to their quality. The hope is to learn extremely robust and perfectly unbiased representations for the game of chess so as to maximize the benefit of the supervised learning phase when the model learns which moves are good. By learning to predict sequences of legal unbiased moves, rather than singular moves, the model will learn to implicitly understand the consequences of moves, and drastically increase the robustness of its representations.
 
