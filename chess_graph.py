@@ -69,49 +69,413 @@ _CASTLING_DESTS = [
     ("q", chess.BLACK, False, chess.square(2, 7), chess.square(3, 7), 7),
 ]
 
+# Castling right letter -> (color, kingside)
+_CASTLING_KEYS: Dict[str, Tuple[chess.Color, bool]] = {
+    "K": (chess.WHITE, True),
+    "Q": (chess.WHITE, False),
+    "k": (chess.BLACK, True),
+    "q": (chess.BLACK, False),
+}
 
-def is_castling_right_plausible(board: chess.Board, key: str) -> bool:
+
+# ##### ##### ##### ##### #####
+#   Position plausibility
+#
+# Perturbations must produce positions that are different from the original but still
+# plausible: something that could arise in a legal game of Chess960. The helpers below
+# encode the rules that the perturbations and the final gate in perturb_position rely on.
+
+
+def _normalize_castling_field(fen: str) -> str:
     """
-    Return True if the given castling right (K, Q, k, q) is still plausible on this board:
-    the king is on the correct back rank and there is at least one rook of that color on
-    the correct side of the king (kingside = right of king, queenside = left of king).
-    We do not check for blocking pieces or attacks on the path; edges represent the
-    right to castle, not whether castling is currently legal.
+    Return the FEN with its castling field expressed strictly as K/Q/k/q letters.
+
+    X-FEN and Shredder-FEN may name the castling rook by its file letter (e.g. "Fd") when the
+    castling rook is not the outermost rook. The rest of this project only understands the
+    K/Q/k/q form, so file letters are mapped onto the side of the king they sit on. The
+    letters are emitted in the canonical KQkq order.
     """
-    if key not in "KQkq":
-        return False
-    params = {k: (c, ks, kd, rd, r) for k, c, ks, kd, rd, r in _CASTLING_DESTS}
-    color, kingside, king_dest, rook_dest, rank = params[key]
+    parts = fen.split()
+    if len(parts) < 3 or parts[2] == "-":
+        return fen
+    field = parts[2]
+    if all(c in "KQkq" for c in field):
+        return fen
+
+    board = chess.Board(fen, chess960=True)
+    rights: set[str] = set()
+    for c in field:
+        if c in "KQkq":
+            rights.add(c)
+            continue
+        if c in "ABCDEFGH":
+            color, keys = chess.WHITE, "KQ"
+        elif c in "abcdefgh":
+            color, keys = chess.BLACK, "kq"
+        else:
+            continue
+        king_sq = board.king(color)
+        if king_sq is None:
+            continue
+        rook_file = "abcdefgh".index(c.lower())
+        rights.add(keys[0] if rook_file > chess.square_file(king_sq) else keys[1])
+    parts[2] = "".join(k for k in "KQkq" if k in rights) or "-"
+    return " ".join(parts)
+
+
+def _castling_rights_in_fen(fen: str) -> set[str]:
+    """The castling rights present in a FEN, as a set of K/Q/k/q letters."""
+    return set(c for c in _normalize_castling_field(fen).split()[2] if c in "KQkq")
+
+
+def _with_castling_rights(fen: str, rights: set[str]) -> str:
+    """Return the FEN with its castling field replaced by the given set of K/Q/k/q letters."""
+    parts = fen.split()
+    parts[2] = "".join(k for k in "KQkq" if k in rights) or "-"
+    return " ".join(parts)
+
+
+def _king_can_hold_castling_rights(board: chess.Board, color: chess.Color) -> bool:
+    """
+    A king can only still hold a castling right if it is on its own back rank and not on the
+    a or h file. In Chess960 the king always starts somewhere between its two rooks, so it
+    never starts on a corner file, and a king that has moved has lost its rights.
+    """
     king_sq = board.king(color)
-    if king_sq is None or chess.square_rank(king_sq) != rank:
+    if king_sq is None:
         return False
-    kf = chess.square_file(king_sq)
-    rooks_on_rank = [
-        s for s in chess.SQUARES
-        if chess.square_rank(s) == rank
-        and board.piece_at(s) == chess.Piece(chess.ROOK, color)
-    ]
-    candidates = [s for s in rooks_on_rank if (chess.square_file(s) > kf if kingside else chess.square_file(s) < kf)]
-    return len(candidates) > 0
+    back_rank = 0 if color == chess.WHITE else 7
+    return chess.square_rank(king_sq) == back_rank and 0 < chess.square_file(king_sq) < 7
 
 
-def fix_castling_in_fen(fen_str: str) -> str:
+def _back_rank_rook_files(board: chess.Board, color: chess.Color, kingside: bool) -> set[int]:
     """
-    Return FEN with castling string pruned to only plausible rights. Only removes rights
-    that are no longer plausible; never adds castling. Call after any perturbation that
-    might have made castling implausible (e.g. king/rook moved, piece deleted, etc.).
+    The files of every rook of `color` standing on its back rank on the given side of its
+    king. Any one of them could be the castling rook as far as the FEN can tell. Empty if
+    the king is not on its back rank.
     """
-    parts = fen_str.split()
-    if len(parts) < 3:
-        return fen_str
-    current = set(c for c in parts[2] if c in "KQkq")
+    king_sq = board.king(color)
+    back_rank = 0 if color == chess.WHITE else 7
+    if king_sq is None or chess.square_rank(king_sq) != back_rank:
+        return set()
+    king_file = chess.square_file(king_sq)
+    files: set[int] = set()
+    for f in range(8):
+        if (f > king_file) if kingside else (f < king_file):
+            if board.piece_at(chess.square(f, back_rank)) == chess.Piece(chess.ROOK, color):
+                files.add(f)
+    return files
+
+
+def _reference_castling_files(reference_fen: str, kingside: bool) -> Optional[set[int]]:
+    """
+    From a trusted reference position, work out which files the castling rook for a given
+    side (kingside or queenside) could be on.
+
+    Both colors hold the right  -> the files where both have a rook (they must match).
+    One color holds the right   -> that color's rook files on that side.
+    Neither holds the right     -> None, meaning the reference says nothing about it.
+    """
+    board = chess.Board(reference_fen, chess960=True)
+    rights = _castling_rights_in_fen(reference_fen)
+    w_key, b_key = ("K", "k") if kingside else ("Q", "q")
+    w_files = _back_rank_rook_files(board, chess.WHITE, kingside) if w_key in rights else set()
+    b_files = _back_rank_rook_files(board, chess.BLACK, kingside) if b_key in rights else set()
+    if w_key in rights and b_key in rights:
+        common = w_files & b_files
+        return common if common else None
+    if w_key in rights:
+        return w_files or None
+    if b_key in rights:
+        return b_files or None
+    return None
+
+
+def _plausible_castling_rights(
+    board: chess.Board,
+    requested: set[str],
+    reference_fen: Optional[str] = None,
+    rng: Optional[random.Random] = None,
+) -> set[str]:
+    """
+    Return the largest subset of `requested` castling rights that is plausible on `board`.
+
+    A right is kept only if that king can still hold rights (back rank, not on a corner
+    file) and a rook of that color stands on its back rank on that side of the king. When
+    both colors hold the right on the same side, their candidate rooks must share a file,
+    because in Chess960 both players start with the same setup and a castling rook never
+    moves. When a reference position is supplied, the candidate files are additionally
+    restricted to the files the castling rook could have been on in that position, which
+    is how a perturbation that removes the real castling rook is told apart from one that
+    leaves a decoy rook on the same side.
+
+    If both colors hold a right on a side but no shared file remains and the reference
+    cannot resolve it, exactly one of the two rights must be bogus but there is no way to
+    tell which, so one of them is dropped at random.
+    """
+    rand = rng if rng is not None else random
+    kept: set[str] = set()
+    for kingside in (True, False):
+        w_key, b_key = ("K", "k") if kingside else ("Q", "q")
+        w_ok = w_key in requested and _king_can_hold_castling_rights(board, chess.WHITE)
+        b_ok = b_key in requested and _king_can_hold_castling_rights(board, chess.BLACK)
+        w_files = _back_rank_rook_files(board, chess.WHITE, kingside) if w_ok else set()
+        b_files = _back_rank_rook_files(board, chess.BLACK, kingside) if b_ok else set()
+
+        if reference_fen is not None:
+            allowed = _reference_castling_files(reference_fen, kingside)
+            if allowed is not None:
+                w_files &= allowed
+                b_files &= allowed
+
+        w_ok = w_ok and bool(w_files)
+        b_ok = b_ok and bool(b_files)
+
+        if w_ok and b_ok and not (w_files & b_files):
+            if rand.random() < 0.5:
+                w_ok = False
+            else:
+                b_ok = False
+
+        if w_ok:
+            kept.add(w_key)
+        if b_ok:
+            kept.add(b_key)
+    return kept
+
+
+def is_castling_right_plausible(
+    board: chess.Board,
+    key: str,
+    reference_fen: Optional[str] = None,
+) -> bool:
+    """
+    Return True if the castling right `key` (K, Q, k or q) could be added to this board
+    without contradicting anything: the king is on its back rank and not on a corner file,
+    a rook of that color stands on that side of the king, and if the other color already
+    holds the same-side right, the two candidate rooks share a file. Blocking pieces and
+    attacks are ignored, because the edge represents the right to castle rather than
+    whether castling is legal right now.
+    """
+    if key not in _CASTLING_KEYS:
+        return False
+    current = _castling_rights_in_fen(board.fen())
+    kept = _plausible_castling_rights(board, current | {key}, reference_fen)
+    return key in kept and current <= kept
+
+
+def fix_castling_in_fen(
+    fen_str: str,
+    reference_fen: Optional[str] = None,
+    rng: Optional[random.Random] = None,
+) -> str:
+    """
+    Return the FEN with its castling field pruned to the rights that are still plausible.
+    Never adds a right. Call this after any perturbation that could have moved or removed a
+    king or rook. Pass the unperturbed position as `reference_fen` so the pruning knows
+    which rooks were the castling rooks; see _plausible_castling_rights for the rules.
+    """
+    fen_str = _normalize_castling_field(fen_str)
+    current = _castling_rights_in_fen(fen_str)
     if not current:
         return fen_str
     board = chess.Board(fen_str, chess960=True)
-    plausible = {k for k in current if is_castling_right_plausible(board, k)}
-    new_castling = "".join(c for c in "KQkq" if c in plausible) if plausible else "-"
-    parts[2] = new_castling
-    return " ".join(parts)
+    kept = _plausible_castling_rights(board, current, reference_fen, rng)
+    return _with_castling_rights(fen_str, kept)
+
+
+def _align_castling_rooks(
+    board: chess.Board,
+    reference_fen: Optional[str] = None,
+    rng: Optional[random.Random] = None,
+) -> None:
+    """
+    Make python-chess's internal choice of castling rook agree with this project's rules.
+
+    A K/Q/k/q letter does not say which rook castles when two rooks stand on the same side
+    of the king; python-chess resolves it to the outermost one. This project instead requires
+    that when both colors hold the same-side right their castling rooks share a file, and
+    that the file agrees with the reference position. This rewrites board.castling_rights in
+    place so that legal move generation (which rook takes part in castling, and which rook's
+    move forfeits the right) follows the same rook the rest of the pipeline would choose.
+    Only positions with two rooks on one side of a king are affected; when several files
+    remain possible one is chosen at random, the same file for both colors.
+    """
+    rand = rng if rng is not None else random
+    rights = _castling_rights_in_fen(board.fen())
+    if not rights:
+        return
+
+    def current_file(color: chess.Color, kingside: bool) -> Optional[int]:
+        king_sq = board.king(color)
+        if king_sq is None:
+            return None
+        back = chess.BB_RANK_1 if color == chess.WHITE else chess.BB_RANK_8
+        king_file = chess.square_file(king_sq)
+        for sq in chess.scan_forward(board.castling_rights & back & board.occupied_co[color]):
+            f = chess.square_file(sq)
+            if (f > king_file) if kingside else (f < king_file):
+                return f
+        return None
+
+    new_rights = 0
+    for kingside in (True, False):
+        w_key, b_key = ("K", "k") if kingside else ("Q", "q")
+        w_has, b_has = w_key in rights, b_key in rights
+        if not (w_has or b_has):
+            continue
+        w_files = _back_rank_rook_files(board, chess.WHITE, kingside) if w_has else set()
+        b_files = _back_rank_rook_files(board, chess.BLACK, kingside) if b_has else set()
+        if reference_fen is not None:
+            allowed = _reference_castling_files(reference_fen, kingside)
+            if allowed is not None:
+                if w_files & allowed:
+                    w_files &= allowed
+                if b_files & allowed:
+                    b_files &= allowed
+        shared: Optional[set[int]] = None
+        if w_has and b_has and (w_files & b_files):
+            shared = w_files & b_files
+            w_files = b_files = shared
+
+        cw, cb = current_file(chess.WHITE, kingside), current_file(chess.BLACK, kingside)
+        if shared is not None:
+            if cw in shared and cb == cw:
+                fw = fb = cw
+            else:
+                fw = fb = rand.choice(sorted(shared))
+        else:
+            fw = cw if cw in w_files else (rand.choice(sorted(w_files)) if w_files else None)
+            fb = cb if cb in b_files else (rand.choice(sorted(b_files)) if b_files else None)
+        if fw is not None:
+            new_rights |= chess.BB_SQUARES[chess.square(fw, 0)]
+        if fb is not None:
+            new_rights |= chess.BB_SQUARES[chess.square(fb, 7)]
+    board.castling_rights = new_rights
+
+
+def _material_is_plausible(board: chess.Board) -> bool:
+    """
+    Each side must have exactly one king, at most 16 pieces and at most 8 pawns, and every
+    piece beyond the starting set (a second queen, a third rook or knight, a second bishop
+    on the same square color) must be accounted for by a promoted pawn, so the number of
+    such extras cannot exceed the number of pawns that side is missing.
+    """
+    for color in (chess.WHITE, chess.BLACK):
+        own = board.occupied_co[color]
+        if chess.popcount(own) > 16:
+            return False
+        if chess.popcount(own & board.kings) != 1:
+            return False
+        pawns = chess.popcount(own & board.pawns)
+        if pawns > 8:
+            return False
+        extras = (
+            max(0, chess.popcount(own & board.queens) - 1)
+            + max(0, chess.popcount(own & board.rooks) - 2)
+            + max(0, chess.popcount(own & board.knights) - 2)
+            + max(0, chess.popcount(own & board.bishops & chess.BB_LIGHT_SQUARES) - 1)
+            + max(0, chess.popcount(own & board.bishops & chess.BB_DARK_SQUARES) - 1)
+        )
+        if extras > 8 - pawns:
+            return False
+    return True
+
+
+def _added_piece_is_plausible(board: chess.Board, piece_type: chess.PieceType, color: chess.Color) -> bool:
+    """Would adding one more piece of this type and color keep the material plausible?"""
+    probe = board.copy(stack=False)
+    # Any empty square will do for the count check, except bishops, whose square color matters
+    # to the caller; they are re-checked on the real square.
+    for sq in chess.SQUARES:
+        if probe.piece_at(sq) is None:
+            probe.set_piece_at(sq, chess.Piece(piece_type, color))
+            return _material_is_plausible(probe)
+    return False
+
+
+def position_is_plausible(fen: str) -> bool:
+    """
+    The final gate every perturbation must pass. A position is plausible when:
+      - python-chess accepts it as valid: both kings present, no more than 16 pieces or 8
+        pawns per side, no pawn on the first or eighth rank, the side not to move is not in
+        check, the en passant square agrees with the side to move and is empty with an
+        empty square behind it, the castling rights point at real rooks, and the checks on
+        the side to move are geometrically possible;
+      - the material could have arisen from a real game (see _material_is_plausible);
+      - no king holds castling rights while standing on the a or h file;
+      - when both colors hold castling rights on the same side, their candidate rooks
+        share a file.
+    """
+    try:
+        board = chess.Board(fen, chess960=True)
+    except ValueError:
+        return False
+    if not board.is_valid():
+        return False
+    if not _material_is_plausible(board):
+        return False
+    rights = _castling_rights_in_fen(fen)
+    if rights:
+        if any(k in rights for k in "KQ") and not _king_can_hold_castling_rights(board, chess.WHITE):
+            return False
+        if any(k in rights for k in "kq") and not _king_can_hold_castling_rights(board, chess.BLACK):
+            return False
+        for kingside in (True, False):
+            w_key, b_key = ("K", "k") if kingside else ("Q", "q")
+            if w_key in rights and b_key in rights:
+                w_files = _back_rank_rook_files(board, chess.WHITE, kingside)
+                b_files = _back_rank_rook_files(board, chess.BLACK, kingside)
+                if not (w_files & b_files):
+                    return False
+    return True
+
+
+def mirror_fen_files(fen: str) -> str:
+    """
+    Reflect a position left to right, so the a file swaps with the h file, b with g, c with f
+    and d with e. Ranks are untouched. Each color's kingside and queenside castling rights
+    swap with each other, the castling rooks move with the board, and the en passant square
+    is mirrored. Because a Chess960 start position mirrored is still a Chess960 start
+    position, the mirror of a plausible position is always plausible. Applying this twice
+    returns the original position.
+    """
+    board = chess.Board(fen, chess960=True)
+    mirrored = board.transform(chess.flip_horizontal)
+    return _normalize_castling_field(mirrored.fen())
+
+
+def mirror_castling_rook_squares(
+    castling_rook_squares: Tuple[int, int, int, int],
+) -> Tuple[int, int, int, int]:
+    """
+    Mirror a (K, Q, k, q) tuple of castling rook squares to match mirror_fen_files. Each
+    square's file is reflected, and because kingside becomes queenside, the K and Q slots
+    swap, as do k and q. -1 entries stay -1. Use this so that the castling edges built for a
+    mirrored position pick the same rook as the original when there is more than one rook on
+    a side.
+    """
+    def mirror(sq: int) -> int:
+        return sq if sq < 0 else (sq // 8) * 8 + (7 - sq % 8)
+
+    k_rook, q_rook, k_rook_b, q_rook_b = castling_rook_squares
+    return (mirror(q_rook), mirror(k_rook), mirror(q_rook_b), mirror(k_rook_b))
+
+
+def _keep_move_counters(perturbed: str, original: str) -> str:
+    """
+    Copy the halfmove clock and fullmove number from the original onto the perturbed FEN.
+    The graph never looks at them, and keeping them fixed means a perturbed FEN differs from
+    the original only where the position itself differs.
+    """
+    p, o = perturbed.split(), original.split()
+    if len(p) >= 6 and len(o) >= 6:
+        p[4], p[5] = o[4], o[5]
+    return " ".join(p)
+
+
+# ##### ##### ##### ##### #####
+#   Perturbations
 
 
 def perturb_position(
@@ -120,32 +484,67 @@ def perturb_position(
     magnitude: int = 1,
     type_distribution: Optional[Union[torch.Tensor, Callable[[], int]]] = None,
     rng: Optional[random.Random] = None,
-) -> str:
+    max_attempts: int = 30,
+    fallback_to_other_types: bool = True,
+    return_type: bool = False,
+) -> Union[str, Tuple[str, int]]:
     """
     Return a perturbed position as a new FEN string.
 
+    The result is guaranteed to differ from the input and to pass position_is_plausible.
+    Each perturbation type is sampled up to `max_attempts` times until an acceptable result
+    appears; if a type cannot produce one (for example the castling perturbation on a
+    position with no castling rights and no rooks on the back rank), the remaining types are
+    tried in random order when `fallback_to_other_types` is True. If nothing works a
+    ValueError is raised rather than silently returning the original position, because an
+    unchanged "negative" would poison contrastive training.
+
+    Perturbation types:
+        0  Legal move: one piece (of either color) makes `magnitude` legal moves in a row.
+        1  Illegal move: one piece jumps to an empty square within `magnitude` king steps
+           that it could not legally reach.
+        2  Deletion: remove one non-king piece, or the en passant square.
+        3  Addition: add one piece on an empty square, or an en passant square where a
+           double pawn push could just have happened.
+        4  Swap: exchange two pieces that differ in type or color.
+        5  Piece change: change one non-king piece to a different type of the same color.
+        6  Color change: flip the color of one non-king piece.
+        7  Castling rights: remove one existing right or add one plausible right.
+        8  Mirror: reflect the whole position left to right (a file <-> h file).
+        9  Turn change: give the move to the other side; pieces stay put, en passant is
+           cleared. Impossible when the side that was to move is in check.
+
     :param fen: FEN string of the position to perturb.
-    :param perturb_type: Which perturbation to apply (0..7). If None, one is chosen
-        from type_distribution or uniformly at random.
-    :param magnitude: Interpretation depends on perturb_type, but it is the size
-        of a single perturbation, not the total number of perturbations.
+    :param perturb_type: Which perturbation to apply (0..9). If None, one is chosen from
+        type_distribution or uniformly at random.
+    :param magnitude: Interpretation depends on perturb_type, but it is the size of a
+        single perturbation, not the total number of perturbations.
     :param type_distribution: When perturb_type is None, how to choose the type.
-        - If a 1D tensor of shape (num_types,): if all values are in [0, 1], treated
-          as probabilities (normalized by sum); otherwise treated as logits (softmax).
+        - If a 1D tensor of shape (num_types,): if all values are in [0, 1], treated as
+          probabilities (normalized by sum); otherwise treated as logits (softmax).
           Sampled via torch.multinomial.
         - If a callable: call with no args to get an int in [0, num_types-1].
-    :param rng: Optional random.Random for reproducible sampling when using
-        type_distribution tensor.
-    :return: Perturbed position as a FEN string.
+    :param rng: Optional random.Random for reproducible sampling.
+    :param max_attempts: How many times to sample a type before giving up on it.
+    :param fallback_to_other_types: Try the other types if the requested one cannot
+        produce a plausible, different position.
+    :param return_type: When True, return (fen, type_used) instead of just the FEN, so the
+        caller can tell when a fallback happened.
+    :return: Perturbed position as a FEN string (or a (fen, type) tuple).
     """
+    rand = rng if rng is not None else random
+    fen = _normalize_castling_field(fen)
 
     def perturb_fen_piece_move_legal(fen_str: str) -> str:      # ----- Perturbation Type 0 -----
         # Do 'magnitude' legal moves of the same piece in a row. The piece can be of either color;
         # we temporarily set the board's turn to that piece's color to get legal moves, then restore
-        # the original turn after each move so the final FEN keeps e.g. white to move.
-        rand = rng if rng is not None else random
+        # the original turn after each move so the final FEN keeps e.g. white to move. Promotions
+        # are excluded so a pawn never lands on the first or eighth rank.
         n = max(1, int(magnitude))
         board = chess.Board(fen_str, chess960=True)
+        # When two rooks share a side of a king, castle with (and forfeit rights via) the rook that
+        # matches the other color's castling rook, rather than python-chess's default outermost one.
+        _align_castling_rooks(board, fen_str, rand)
         turn_white = board.turn  # turn to show in final FEN (unchanged by our moves)
         order = [s for s in chess.SQUARES if board.piece_at(s) is not None]
         rand.shuffle(order)
@@ -159,7 +558,7 @@ def perturb_position(
         ) -> Optional[str]:
             """Try to complete exactly `target` moves; at each step try all candidates (shuffled)."""
             if moves_done == target:
-                return fix_castling_in_fen(current.fen())
+                return fix_castling_in_fen(current.fen(), fen_str, rand)
             piece_color = current.color_at(piece_square)
             if piece_color is None:
                 return None
@@ -178,7 +577,7 @@ def perturb_position(
                 new_visited = visited | {new_sq}
                 if moves_done + 1 == target:
                     next_board.turn = turn_white
-                    return fix_castling_in_fen(next_board.fen())
+                    return fix_castling_in_fen(next_board.fen(), fen_str, rand)
                 next_board.turn = turn_white
                 result = try_complete_moves(next_board, new_sq, new_visited, moves_done + 1, target)
                 if result is not None:
@@ -200,8 +599,8 @@ def perturb_position(
     def perturb_fen_piece_move_illegal(fen_str: str) -> str:      # ----- Perturbation Type 1 -----
         # Pick a random piece, find unoccupied squares within magnitude (Chebyshev) radius,
         # exclude squares that are legal moves for that piece, then move the piece to a random
-        # illegal destination (starting square becomes empty).
-        rand = rng if rng is not None else random
+        # illegal destination (starting square becomes empty). Pawns are never placed on the
+        # first or eighth rank, and nothing is ever placed on the en passant square.
         board = chess.Board(fen_str, chess960=True)
         turn_white = board.turn
         radius = max(1, int(magnitude))
@@ -223,6 +622,10 @@ def perturb_position(
                             continue
                         if board.piece_at(sq) is not None:
                             continue
+                        if sq == board.ep_square:
+                            continue
+                        if piece.piece_type == chess.PAWN and r in (0, 7):
+                            continue
                         in_radius.append(sq)
             if not in_radius:
                 continue
@@ -236,17 +639,18 @@ def perturb_position(
             board.remove_piece_at(start_square)
             board.set_piece_at(to_square, chess.Piece(piece.piece_type, piece.color))
             board.turn = turn_white
-            return fix_castling_in_fen(board.fen())
+            return fix_castling_in_fen(board.fen(), fen_str, rand)
         board.turn = turn_white
         return fen_str
 
     def perturb_fen_piece_deletion(fen_str: str) -> str:      # ----- Perturbation Type 2 -----
-        # Delete exactly one "thing" at random: any piece (either color, including kings) or the
-        # en passant target square if present. Magnitude is ignored.
-        rand = rng if rng is not None else random
+        # Delete exactly one "thing" at random: any non-king piece of either color, or the en
+        # passant target square if present. Kings are never deleted because a position without
+        # both kings is not a chess position. Magnitude is ignored.
         board = chess.Board(fen_str, chess960=True)
         options: List[Optional[chess.Square]] = [
-            s for s in chess.SQUARES if board.piece_at(s) is not None
+            s for s in chess.SQUARES
+            if board.piece_at(s) is not None and board.piece_at(s).piece_type != chess.KING
         ]
         if board.ep_square is not None:
             options.append(None)  # sentinel: clear en passant
@@ -255,54 +659,61 @@ def perturb_position(
         choice = rand.choice(options)
         if choice is None:
             board.ep_square = None
-            return fix_castling_in_fen(board.fen())
         else:
             board.remove_piece_at(choice)
-            return fix_castling_in_fen(board.fen())
+        return fix_castling_in_fen(board.fen(), fen_str, rand)
 
     def perturb_fen_piece_addition(fen_str: str) -> str:      # ----- Perturbation Type 3 -----
-        # Add one thing at random: a piece (any type and color) on an empty square, or an en passant
-        # target. If en passant is not already set, possible ep squares are inferred from 4th/5th rank
-        # pawn pairs (adjacent files with one white and one black pawn). Magnitude is ignored.
-        rand = rng if rng is not None else random
+        # Add one thing at random: a piece (any non-king type and color) on an empty square, or an
+        # en passant target. Additions that would push a side past 16 pieces or 8 pawns, or that
+        # would need more promotions than that side has missing pawns, are not offered. Pawns are
+        # never added to the first or eighth rank and nothing is added on the en passant square.
+        # If en passant is not already set, possible ep squares are inferred from 4th/5th rank
+        # pawn pairs (adjacent files with one white and one black pawn), and the square the pawn
+        # would have come from must be empty. Magnitude is ignored.
         board = chess.Board(fen_str, chess960=True)
         options: List[Tuple[str, Any]] = []
 
-        # Possible en passant squares only when ep is not already set (each square at most once).
-        # Only consider the rank where the side to move could capture en passant: Black to move -> 4th rank (white just moved); White to move -> 5th rank (black just moved).
-        possible_ep_squares: set[chess.Square] = set()
+        # Only consider the rank where the side to move could capture en passant:
+        # Black to move -> a white pawn just double-pushed to the 4th rank, ep square on the 3rd.
+        # White to move -> a black pawn just double-pushed to the 5th rank, ep square on the 6th.
         if board.ep_square is None:
             if board.turn == chess.BLACK:
-                # 4th rank: white could have just moved two -> 3rd rank ep squares (Black captures)
-                for f in range(7):
-                    sq_a, sq_b = chess.square(f, 3), chess.square(f + 1, 3)
-                    pa, pb = board.piece_at(sq_a), board.piece_at(sq_b)
-                    if pa is not None and pb is not None and pa.piece_type == chess.PAWN and pb.piece_type == chess.PAWN:
-                        if pa.color != pb.color:
-                            ep_sq = chess.square(f, 2) if pa.color == chess.WHITE else chess.square(f + 1, 2)
-                            if board.piece_at(ep_sq) is None:
-                                possible_ep_squares.add(ep_sq)
+                pawn_rank, ep_rank, origin_rank, mover = 3, 2, 1, chess.WHITE
             else:
-                # 5th rank: black could have just moved two -> 6th rank ep squares (White captures)
-                for f in range(7):
-                    sq_a, sq_b = chess.square(f, 4), chess.square(f + 1, 4)
-                    pa, pb = board.piece_at(sq_a), board.piece_at(sq_b)
-                    if pa is not None and pb is not None and pa.piece_type == chess.PAWN and pb.piece_type == chess.PAWN:
-                        if pa.color != pb.color:
-                            ep_sq = chess.square(f, 5) if pa.color == chess.BLACK else chess.square(f + 1, 5)
-                            if board.piece_at(ep_sq) is None:
-                                possible_ep_squares.add(ep_sq)
+                pawn_rank, ep_rank, origin_rank, mover = 4, 5, 6, chess.BLACK
+            possible_ep_squares: set[chess.Square] = set()
+            for f in range(7):
+                sq_a, sq_b = chess.square(f, pawn_rank), chess.square(f + 1, pawn_rank)
+                pa, pb = board.piece_at(sq_a), board.piece_at(sq_b)
+                if pa is None or pb is None:
+                    continue
+                if pa.piece_type != chess.PAWN or pb.piece_type != chess.PAWN or pa.color == pb.color:
+                    continue
+                mover_file = f if pa.color == mover else f + 1
+                ep_sq = chess.square(mover_file, ep_rank)
+                origin_sq = chess.square(mover_file, origin_rank)
+                if board.piece_at(ep_sq) is None and board.piece_at(origin_sq) is None:
+                    possible_ep_squares.add(ep_sq)
             for ep_sq in possible_ep_squares:
                 options.append(("ep", ep_sq))
 
-        # All piece additions: each empty square × each (piece_type, color)
+        # Piece additions: only the (type, color) combinations that keep the material plausible
         piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
+        allowed: List[Tuple[chess.PieceType, chess.Color]] = [
+            (pt, color)
+            for pt in piece_types
+            for color in (chess.WHITE, chess.BLACK)
+            if _added_piece_is_plausible(board, pt, color)
+        ]
         for s in chess.SQUARES:
-            if board.piece_at(s) is not None:
+            if board.piece_at(s) is not None or s == board.ep_square:
                 continue
-            for pt in piece_types:
-                for color in (chess.WHITE, chess.BLACK):
-                    options.append(("piece", s, pt, color))
+            rank = chess.square_rank(s)
+            for pt, color in allowed:
+                if pt == chess.PAWN and rank in (0, 7):
+                    continue
+                options.append(("piece", s, pt, color))
 
         if not options:
             return fen_str
@@ -313,84 +724,119 @@ def perturb_position(
             return " ".join(parts)
         _tag, square, piece_type, color = choice
         board.set_piece_at(square, chess.Piece(piece_type, color))
-        return fix_castling_in_fen(board.fen())
+        return fix_castling_in_fen(board.fen(), fen_str, rand)
 
     def perturb_fen_piece_swap(fen_str: str) -> str:      # ----- Perturbation Type 4 -----
-        # Swap two randomly chosen pieces that differ in type or color (so the position actually changes).
-        # Magnitude ignored. No en passant.
-        rand = rng if rng is not None else random
+        # Swap two randomly chosen pieces that differ in type or color (so the position actually
+        # changes). Swaps that would leave a pawn on the first or eighth rank are not offered.
+        # Magnitude ignored. En passant is untouched because the ep square is always empty.
         board = chess.Board(fen_str, chess960=True)
         occupied = [s for s in chess.SQUARES if board.piece_at(s) is not None]
-        if len(occupied) < 2:
+        pairs: List[Tuple[chess.Square, chess.Square]] = []
+        for i, sq1 in enumerate(occupied):
+            p1 = board.piece_at(sq1)
+            for sq2 in occupied[i + 1:]:
+                p2 = board.piece_at(sq2)
+                if p1.piece_type == p2.piece_type and p1.color == p2.color:
+                    continue
+                if p1.piece_type == chess.PAWN and chess.square_rank(sq2) in (0, 7):
+                    continue
+                if p2.piece_type == chess.PAWN and chess.square_rank(sq1) in (0, 7):
+                    continue
+                pairs.append((sq1, sq2))
+        if not pairs:
             return fen_str
-        if len({(board.piece_at(s).piece_type, board.piece_at(s).color) for s in occupied}) < 2:
-            return fen_str
-        while True:
-            sq1, sq2 = rand.sample(occupied, 2)
-            p1, p2 = board.piece_at(sq1), board.piece_at(sq2)
-            if p1.piece_type != p2.piece_type or p1.color != p2.color:
-                break
+        sq1, sq2 = rand.choice(pairs)
+        p1, p2 = board.piece_at(sq1), board.piece_at(sq2)
         board.remove_piece_at(sq1)
         board.remove_piece_at(sq2)
         board.set_piece_at(sq1, p2)
         board.set_piece_at(sq2, p1)
-        return fix_castling_in_fen(board.fen())
+        return fix_castling_in_fen(board.fen(), fen_str, rand)
 
     def perturb_fen_piece_change(fen_str: str) -> str:      # ----- Perturbation Type 5 -----
-        # Pick a random piece on the board and change it to a random different piece type (same color).
-        # En passant not considered; all pieces except kings count. Magnitude ignored.
-        rand = rng if rng is not None else random
+        # Pick a random non-king piece and change it to a different piece type of the same color.
+        # A piece on the first or eighth rank is never turned into a pawn, and changes that would
+        # make the material implausible are not offered. Magnitude ignored.
         board = chess.Board(fen_str, chess960=True)
         piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
-        occupied = [s for s in chess.SQUARES if (board.piece_at(s) is not None and board.piece_at(s).piece_type != chess.KING)]
-        if not occupied:
+        options: List[Tuple[chess.Square, chess.PieceType]] = []
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece is None or piece.piece_type == chess.KING:
+                continue
+            for new_type in piece_types:
+                if new_type == piece.piece_type:
+                    continue
+                if new_type == chess.PAWN and chess.square_rank(square) in (0, 7):
+                    continue
+                probe = board.copy(stack=False)
+                probe.set_piece_at(square, chess.Piece(new_type, piece.color))
+                if _material_is_plausible(probe):
+                    options.append((square, new_type))
+        if not options:
             return fen_str
-        square = rand.choice(occupied)
-        piece = board.piece_at(square)
-        other_types = [t for t in piece_types if t != piece.piece_type]
-        new_type = rand.choice(other_types)
-        board.set_piece_at(square, chess.Piece(new_type, piece.color))
-        return fix_castling_in_fen(board.fen())
+        square, new_type = rand.choice(options)
+        board.set_piece_at(square, chess.Piece(new_type, board.piece_at(square).color))
+        return fix_castling_in_fen(board.fen(), fen_str, rand)
 
     def perturb_fen_piece_color_change(fen_str: str) -> str:      # ----- Perturbation Type 6 -----
-        # Pick a random piece (not a king; en passant not considered) and flip its color.
-        rand = rng if rng is not None else random
+        # Pick a random non-king piece and flip its color. Flips that would push the receiving
+        # side past 16 pieces or 8 pawns, or past what its missing pawns can account for, are
+        # not offered.
         board = chess.Board(fen_str, chess960=True)
-        swappable = [s for s in chess.SQUARES if board.piece_at(s) is not None and board.piece_at(s).piece_type != chess.KING]
-        if not swappable:
+        options: List[chess.Square] = []
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece is None or piece.piece_type == chess.KING:
+                continue
+            probe = board.copy(stack=False)
+            probe.set_piece_at(square, chess.Piece(piece.piece_type, not piece.color))
+            if _material_is_plausible(probe):
+                options.append(square)
+        if not options:
             return fen_str
-        square = rand.choice(swappable)
+        square = rand.choice(options)
         piece = board.piece_at(square)
-        new_color = chess.BLACK if piece.color == chess.WHITE else chess.WHITE
-        board.set_piece_at(square, chess.Piece(piece.piece_type, new_color))
-        return fix_castling_in_fen(board.fen())
+        board.set_piece_at(square, chess.Piece(piece.piece_type, not piece.color))
+        return fix_castling_in_fen(board.fen(), fen_str, rand)
 
     def perturb_fen_castling_rights_change(fen_str: str) -> str:     # ----- Perturbation Type 7 -----
-        # One of: remove an existing castling right, or add a castling right if sensical (Chess960-aware).
-        # Uses is_castling_right_plausible for add-check; final FEN is cleaned with fix_castling_in_fen.
-        rand = rng if rng is not None else random
+        # One of: remove an existing castling right, or add a castling right that is plausible
+        # (Chess960-aware, see is_castling_right_plausible). Removing and adding are weighted by
+        # how many options each has, so every individual option is equally likely.
         board = chess.Board(fen_str, chess960=True)
-
-        castling_str = board.fen().split()[2]
-        current = set(c for c in castling_str if c in "KQkq")
+        current = _castling_rights_in_fen(fen_str)
         actions: List[Tuple[str, str]] = []  # ('remove'|'add', 'K'|'Q'|'k'|'q')
         for key in "KQkq":
             if key in current:
                 actions.append(("remove", key))
-            elif is_castling_right_plausible(board, key):
+            elif is_castling_right_plausible(board, key, fen_str):
                 actions.append(("add", key))
-
         if not actions:
-            return fix_castling_in_fen(fen_str)
+            return fen_str
         op, key = rand.choice(actions)
-        if op == "remove":
-            new_set = current - {key}
-        else:
-            new_set = current | {key}
-        new_castling = "".join(c for c in "KQkq" if c in new_set) if new_set else "-"
-        parts = board.fen().split()
-        parts[2] = new_castling
-        return fix_castling_in_fen(" ".join(parts))
+        new_set = current - {key} if op == "remove" else current | {key}
+        return fix_castling_in_fen(_with_castling_rights(fen_str, new_set), fen_str, rand)
+
+    def perturb_fen_mirror_files(fen_str: str) -> str:     # ----- Perturbation Type 8 -----
+        # Reflect the board left to right. Castling rights swap sides for each color, the
+        # castling rooks move with the board, and the en passant square is mirrored. The result
+        # is only identical to the input for a perfectly left-right symmetric position, in which
+        # case perturb_position falls through to another type. Magnitude ignored.
+        return mirror_fen_files(fen_str)
+
+    def perturb_fen_turn_change(fen_str: str) -> str:     # ----- Perturbation Type 9 -----
+        # Hand the move to the other side without touching a single piece. The en passant square is
+        # cleared because it can only exist for the side that was about to move. From the encoder's
+        # point of view this reorients the whole board (the side to move is always at the bottom) and
+        # flips every hostility flag. If the side that was to move is in check, giving the move away
+        # would leave a king in check on the opponent's turn, which is illegal; the gate rejects that
+        # and perturb_position moves on to another type. Magnitude ignored.
+        parts = fen_str.split()
+        parts[1] = "b" if parts[1] == "w" else "w"
+        parts[3] = "-"
+        return " ".join(parts)
 
     perturbation_dispatch_table: Dict[int, Callable[[str], str]] = {
         0: perturb_fen_piece_move_legal,
@@ -401,14 +847,19 @@ def perturb_position(
         5: perturb_fen_piece_change,
         6: perturb_fen_piece_color_change,
         7: perturb_fen_castling_rights_change,
+        8: perturb_fen_mirror_files,
+        9: perturb_fen_turn_change,
     }
 
     num_types = len(perturbation_dispatch_table)
 
+    # These always give the same answer for a given position, so retrying them is pointless.
+    deterministic_types = {8, 9}
+
     # Choose perturbation type if not specified
     if perturb_type is None:
         if type_distribution is None:
-            perturb_type = random.randint(0, num_types - 1) if rng is None else rng.randint(0, num_types - 1)
+            perturb_type = rand.randint(0, num_types - 1)
         elif callable(type_distribution):
             perturb_type = type_distribution()
         else:
@@ -426,10 +877,28 @@ def perturb_position(
                     gen.manual_seed(rng.randint(0, 2**31 - 1))
                 perturb_type = int(torch.multinomial(probs, 1, generator=gen).item())
             else:
-                perturb_type = random.randint(0, num_types - 1) if rng is None else rng.randint(0, num_types - 1)
+                perturb_type = rand.randint(0, num_types - 1)
     perturb_type = int(perturb_type) % num_types
 
-    return perturbation_dispatch_table[perturb_type](fen)
+    # Try the requested type first, then (optionally) every other type in random order.
+    order = [perturb_type]
+    if fallback_to_other_types:
+        others = [t for t in range(num_types) if t != perturb_type]
+        rand.shuffle(others)
+        order += others
+
+    for this_type in order:
+        perturb = perturbation_dispatch_table[this_type]
+        attempts = 1 if this_type in deterministic_types else max(1, int(max_attempts))
+        for _ in range(attempts):
+            candidate = _keep_move_counters(perturb(fen), fen)
+            if candidate != fen and position_is_plausible(candidate):
+                return (candidate, this_type) if return_type else candidate
+
+    raise ValueError(
+        f"No perturbation could produce a different, plausible position from {fen!r} "
+        f"(tried types {order}, {max_attempts} attempts each)."
+    )
 
 
 def create_filled_chess_graphs(
@@ -470,8 +939,11 @@ def create_filled_chess_graphs(
         # Set the En Passant flag for this square
         node_features[position_vector.index(-0.5)][7] = 1
 
-    # Remove the decimals so that the integers can be used in calculating index values
-    position_vector: List[int] = list(map(math.floor, position_vector))
+    # Strip the fractional parts so the integers can be used as feature indices. This must truncate
+    # toward zero, not floor: floor(-0.5) is -1, which would turn the en passant marker into an enemy
+    # pawn, and floor(-6.3) is -7, which would give an enemy king with castling rights the en passant
+    # flag instead of the king flag. int() maps -0.5 -> 0 and -6.3 -> -6 as intended.
+    position_vector: List[int] = [int(value) for value in position_vector]
 
     # Loop through each of the 64 squares to set each node feature vector the correct piece vector
     square: int
@@ -684,6 +1156,11 @@ def get_castling_edges(
     # Black: king index and rights
     black_king = [i for i, pv in enumerate(board_vector) if int(pv) == -6 and pv % 1]
 
+    # A king on the a or h file can never hold castling rights: a Chess960 king starts between
+    # its rooks, so it never starts on a corner file, and a king that has moved has lost them.
+    white_king = [i for i in white_king if 0 < i % 8 < 7]
+    black_king = [i for i in black_king if 0 < i % 8 < 7]
+
     if castling_rook_squares is not None:
         # Use provided rook squares (K, Q, k, q); -1 means no right / skip
         k_rook, q_rook, k_rook_b, q_rook_b = castling_rook_squares
@@ -879,6 +1356,11 @@ def fen_to_vector(fen: str) -> List[float]:
     # Split the fen by spaces
     fen_parts: List[str] = fen.split(" ")
 
+    # X-FEN / Shredder-FEN may name a castling rook by its file letter (e.g. "Fd") when it is not
+    # the outermost rook. Everything below only understands K/Q/k/q, so map letters onto sides.
+    if len(fen_parts) > 2 and any(c in "ABCDEFGHabcdefgh" for c in fen_parts[2]):
+        fen_parts = _normalize_castling_field(fen).split(" ")
+
     # The first part is the board portion. Split it by '/' to get each row
     row_strings: List[str] = fen_parts[0].split("/")
 
@@ -993,9 +1475,15 @@ def fen_to_vector(fen: str) -> List[float]:
         return vector_version
 
     character_values = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7}
-    en_passant_square = ((int(fen_parts[3][1]) - 1) * 8) + character_values[fen_parts[3][0]]
+    ep_file: int = character_values[fen_parts[3][0]]
+    ep_rank: int = int(fen_parts[3][1]) - 1  # 0-based
     if black_mod == 1:
-        en_passant_square = 63 - en_passant_square
+        # Black to move: the board above was reflected vertically (rank 8 is row 0) with the files
+        # left alone, so the en passant square is reflected the same way. (63 - index would be a
+        # 180 degree rotation and would land on the mirrored file.)
+        en_passant_square = (7 - ep_rank) * 8 + ep_file
+    else:
+        en_passant_square = ep_rank * 8 + ep_file
 
     # noinspection PyTypeChecker
     vector_version[en_passant_square] = -0.5
