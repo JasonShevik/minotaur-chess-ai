@@ -13,6 +13,11 @@ from typing import List, Tuple, Callable, Dict, Any, Optional, Union
 # ##### ##### ##### ##### #####
 #       Core functions
 
+# Edge types, in the order create_filled_chess_graphs returns them:
+# 0 pawn move, 1 pawn attack, 2 knight, 3 bishop, 4 rook, 5 king, 6 queen, 7 castling
+NUM_EDGE_TYPES: int = 8
+NUM_NODE_FEATURES: int = 8   # hostile, pawn, knight, bishop, rook, queen, king, en passant
+
 def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     """
 
@@ -28,14 +33,15 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     ]
 
     # A list of lists of pairwise edges between chessboard squares 0 through 63
+    # Castling edges (type 7) depend on the position and are appended by create_filled_chess_graphs,
+    # so exactly 7 lists are built here and the caller ends up with 8, matching NUM_EDGE_TYPES.
     edges_lists: List[set[Tuple[int, int]]] = [get_pawn_move_edges(),    # 0 Pawn move
                                                get_pawn_attack_edges(),  # 1 Pawn attack
                                                (),                       # 2 Knight move
                                                (),                       # 3 Bishop move
                                                (),                       # 4 Rook move
                                                (),                       # 5 King move
-                                               (),                       # 6 Queen move
-                                               ()]                       # 7 Castle
+                                               ()]                       # 6 Queen move
 
     edges_index: int = 2
     # Go through the structure, calling each piece function and updating edges_list and edge_types_list
