@@ -283,11 +283,61 @@ def test_mirror_perturbation():
         b = chess.Board(fen, chess960=True)
         ambiguous = any(len(cg._back_rank_rook_files(b, c, ks)) > 1 for c in (chess.WHITE, chess.BLACK) for ks in (True, False))
         if not ambiguous:
-            expect = {(mirror_sq(s), dest_swap[d]) for s, d in e0[-1].t().tolist()}
+            # The graph is undirected, so take the castling relation (piece square -> destination) from
+            # get_castling_edges, mirror it, and compare both directions with the mirror's edge list.
+            directed = cg.get_castling_edges(cg.fen_to_vector(fen))
+            mirrored = {(mirror_sq(s), dest_swap[d]) for s, d in directed}
+            expect = mirrored | {(d, s) for s, d in mirrored}
             got = set(map(tuple, e1[-1].t().tolist()))
             assert expect == got, f"castling edges of the mirror must be the mirrored king/rook castling to the other side: {fen}"
     assert cg.mirror_castling_rook_squares((5, 3, 61, 59)) == (4, 2, 60, 58)
     assert cg.mirror_castling_rook_squares((7, -1, 63, -1)) == (-1, 0, -1, 56)
+
+
+def test_pawn_edges_split_by_side():
+    """Your pawns move and attack up the board, the opponent's down; double steps only from the home rank."""
+    for own, up in ((True, 1), (False, -1)):
+        moves, attacks = cg.get_pawn_move_edges(own=own), cg.get_pawn_attack_edges(own=own)
+        home = 1 if own else 6
+        for a, b in moves:
+            step = (b - a) * up
+            assert step in (8, 16), (own, a, b)
+            if step == 16:
+                assert a // 8 == home, f"double step must start on the home rank: {(own, a, b)}"
+        for a, b in attacks:
+            assert (b - a) * up in (7, 9) and abs(a % 8 - b % 8) == 1, (own, a, b)
+        assert len([e for e in moves if abs(e[1] - e[0]) == 16]) == 8
+    edges, _ = cg.create_filled_chess_graphs("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    assert len(edges) == cg.NUM_EDGE_TYPES == 10
+
+
+def test_board_orientation_is_recoverable():
+    """
+    The reason the pawn edges are split by side. With a single pawn-move type the graph was symmetric under
+    flipping the ranks, so a pawn on its home square and one about to promote were indistinguishable. Now:
+      * the rank flip is no longer a symmetry of the edge types, and
+      * edge-typed colour refinement (an upper bound on what message passing can tell apart) pins down every
+        square's rank within two hops, even on an empty board.
+    """
+    flip = [(7 - i // 8) * 8 + i % 8 for i in range(64)]
+    edges, _ = cg.create_filled_chess_graphs("8/8/8/8/8/8/8/8 w - - 0 1")
+    typed = [set(map(tuple, e.t().tolist())) for e in edges]
+    flipped = [{(flip[a], flip[b]) for a, b in t} for t in typed]
+    assert flipped != typed, "the graph must not look the same with the ranks flipped"
+
+    incoming = {v: [] for v in range(64)}
+    for t, es in enumerate(typed):
+        for a, b in es:
+            incoming[b].append((t, a))
+    colour = {v: 0 for v in range(64)}
+    for hop in range(1, 3):
+        sig = {v: (colour[v], tuple(sorted((t, colour[u]) for t, u in incoming[v]))) for v in range(64)}
+        ids = {s: i for i, s in enumerate(sorted(set(sig.values()), key=repr))}
+        colour = {v: ids[sig[v]] for v in range(64)}
+    ranks_per_colour = collections.defaultdict(set)
+    for v in range(64):
+        ranks_per_colour[colour[v]].add(v // 8)
+    assert all(len(r) == 1 for r in ranks_per_colour.values()), "some squares still cannot tell their rank after 2 hops"
 
 
 def test_node_features_match_the_board_exactly():

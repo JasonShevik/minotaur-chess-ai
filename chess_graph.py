@@ -14,8 +14,21 @@ from typing import List, Tuple, Callable, Dict, Any, Optional, Union
 #       Core functions
 
 # Edge types, in the order create_filled_chess_graphs returns them:
-# 0 pawn move, 1 pawn attack, 2 knight, 3 bishop, 4 rook, 5 king, 6 queen, 7 castling
-NUM_EDGE_TYPES: int = 8
+#   0 your pawn move      1 your pawn attack      2 opponent pawn move      3 opponent pawn attack
+#   4 knight              5 bishop                6 rook                    7 king
+#   8 queen               9 castling
+#
+# The chess graph is UNDIRECTED: every edge list holds each relation in both directions, the
+# PyTorch Geometric convention, so messages flow both ways along it.
+#
+# Pawn edges are split by side because the board is oriented with the side to move at the bottom
+# and nothing else tells the model which way is forward. With a single pawn-move and a single
+# pawn-attack type the whole graph is symmetric under flipping the ranks, so a pawn on its home
+# square and one about to promote produce identical encodings no matter how many hops are used.
+# With the four types, message passing can pin down every square's rank within two hops. The
+# "your" / "opponent" edges are static: they mark where a pawn of that side could move or capture,
+# and whether one actually can is decided by what stands on the squares.
+NUM_EDGE_TYPES: int = 10
 NUM_NODE_FEATURES: int = 8   # hostile, pawn, knight, bishop, rook, queen, king, en passant
 
 def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
@@ -33,17 +46,21 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     ]
 
     # A list of lists of pairwise edges between chessboard squares 0 through 63
-    # Castling edges (type 7) depend on the position and are appended by create_filled_chess_graphs,
-    # so exactly 7 lists are built here and the caller ends up with 8, matching NUM_EDGE_TYPES.
-    edges_lists: List[set[Tuple[int, int]]] = [get_pawn_move_edges(),    # 0 Pawn move
-                                               get_pawn_attack_edges(),  # 1 Pawn attack
-                                               (),                       # 2 Knight move
-                                               (),                       # 3 Bishop move
-                                               (),                       # 4 Rook move
-                                               (),                       # 5 King move
-                                               ()]                       # 6 Queen move
+    # Castling edges (type 9) depend on the position and are appended by create_filled_chess_graphs,
+    # so exactly 9 lists are built here and the caller ends up with NUM_EDGE_TYPES.
+    edges_lists: List[set[Tuple[int, int]]] = [get_pawn_move_edges(own=True),     # 0 Your pawn move
+                                               get_pawn_attack_edges(own=True),   # 1 Your pawn attack
+                                               get_pawn_move_edges(own=False),    # 2 Opponent pawn move
+                                               get_pawn_attack_edges(own=False),  # 3 Opponent pawn attack
+                                               (),                                # 4 Knight move
+                                               (),                                # 5 Bishop move
+                                               (),                                # 6 Rook move
+                                               (),                                # 7 King move
+                                               ()]                                # 8 Queen move
 
-    edges_index: int = 2
+    knight_index: int = 4
+    bishop_index: int = 5
+    edges_index: int = knight_index
     # Go through the structure, calling each piece function and updating edges_list and edge_types_list
     for neighbor_function in pieces_list:
         # Get the list of new edges that are specific to this piece_type
@@ -52,7 +69,7 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
                                                          edges=set(),
                                                          get_neighbors=neighbor_function)
         # If this is the bishop, we need to perform another search for the light squares
-        if edges_index == 3:
+        if edges_index == bishop_index:
             edges_lists[edges_index].update(depth_first_recursive(visited=[False for _ in range(64)],
                                                                   current_coordinates=(0, 1),
                                                                   edges=set(),
@@ -60,7 +77,7 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
         edges_index += 1
 
     # Queen move edges are the union of bishop and rook moves
-    edges_lists[6] = edges_lists[3].union(edges_lists[4])
+    edges_lists[8] = edges_lists[5].union(edges_lists[6])
 
     # Don't add any castling edges because their existence depends on the position
 
@@ -918,8 +935,9 @@ def create_filled_chess_graphs(
         castling rook on each side; use -1 for no right. When provided (e.g. from the DB column), castling
         edges use these squares; when None, rooks are inferred from the position (legacy behavior).
     :return: A tuple with the information needed for all of the graph networks. The first value in the tuple is
-        a list of edge index tensors, one for a graph for each piece movement type. The second value in the tuple
-        is the tensor with all of the node features, which includes piece locations and en passant information.
+        a list of NUM_EDGE_TYPES edge index tensors, one per piece movement type, each undirected: every edge
+        appears in both directions, sorted. The second value in the tuple is the tensor with all of the node
+        features, which includes piece locations and en passant information.
     """
     # Create a list of 64 floats that contains the information from the fen
     position_vector: List[float] = fen_to_vector(fen)
@@ -971,17 +989,14 @@ def create_filled_chess_graphs(
     # Initialize the list of edge tensors that will eventually be returned
     edges_tensors: List[torch.Tensor] = []
 
-    # Convert the pairwise edges to two lists for source and destination for compatibility with pytorch
+    # Convert the pairwise edges to [2, E] tensors. The graph is undirected, so each relation is stored in
+    # both directions (the PyTorch Geometric convention). Sorting keeps the edge order reproducible.
     this_type_edges: set[Tuple[int, int]]
     for this_type_edges in edges_lists:
-        x_list: List[int] = []
-        y_list: List[int] = []
-        for x, y in this_type_edges:
-            x_list.append(x)
-            y_list.append(y)
-
-        # Set this graph tuple
-        edges_tensors.append(torch.tensor(data=[x_list, y_list], dtype=torch.int64))
+        undirected: List[Tuple[int, int]] = sorted(set(this_type_edges) | {(b, a) for (a, b) in this_type_edges})
+        x_list: List[int] = [a for a, _ in undirected]
+        y_list: List[int] = [b for _, b in undirected]
+        edges_tensors.append(torch.tensor(data=[x_list, y_list], dtype=torch.int64).reshape(2, -1))
 
     # Create the node_features_tensor using the node_features list of lists
     node_features_tensor: torch.Tensor = torch.tensor(node_features, dtype=torch.float32)
@@ -993,72 +1008,72 @@ def create_filled_chess_graphs(
 #   Piece connection getters
 
 
-def get_pawn_move_edges() -> set[Tuple[int, int]]:
+def get_pawn_move_edges(own: bool) -> set[Tuple[int, int]]:
     """
-    Deterministically find all paths where pawns can move.
-    :return: A list of edges (tuples of start and end squares) that show where all pawn moves may be possible.
+    Deterministically find all paths where one side's pawns can move.
+
+    The board is oriented with the side to move at the bottom, so your pawns move up the board
+    (toward higher square indices) and the opponent's pawns move down.
+
+    :param own: True for your pawns (the side to move), False for the opponent's.
+    :return: A set of edges (start square, end square) where a pawn of that side may move, including
+        the two-square move from its starting rank.
     """
-    # Create the empty set of edges
     pawn_edges: set[Tuple[int, int]] = set()
 
-    # Light square 2 square moves
-    pawn_edges.update([(x, x + 16) for x in range(8, 16)])
-    # Dark square 2 square moves
-    pawn_edges.update([(x, x - 16) for x in range(48, 56)])
-
-    # Light square 1 square moves
-    for row_start in range(8, 49, 8):
-        for column_offset in range(0, 8):
-            origin_square = row_start + column_offset
-            pawn_edges.update([(origin_square, origin_square + 8)])
-
-    # Dark square 1 square moves
-    for row_start in range(48, 7, -8):
-        for column_offset in range(0, 8):
-            origin_square = row_start + column_offset
-            pawn_edges.update([(origin_square, origin_square - 8)])
+    if own:
+        # Two-square moves from your second rank
+        pawn_edges.update([(x, x + 16) for x in range(8, 16)])
+        # One-square moves up the board, from your second rank through your seventh
+        for row_start in range(8, 49, 8):
+            for column_offset in range(0, 8):
+                origin_square = row_start + column_offset
+                pawn_edges.add((origin_square, origin_square + 8))
+    else:
+        # Two-square moves from the opponent's second rank (your seventh)
+        pawn_edges.update([(x, x - 16) for x in range(48, 56)])
+        # One-square moves down the board
+        for row_start in range(48, 7, -8):
+            for column_offset in range(0, 8):
+                origin_square = row_start + column_offset
+                pawn_edges.add((origin_square, origin_square - 8))
 
     return pawn_edges
 
 
-def get_pawn_attack_edges() -> set[Tuple[int, int]]:
+def get_pawn_attack_edges(own: bool) -> set[Tuple[int, int]]:
     """
-    Deterministically find all paths where pawns can attack.
-    :return: A list of edges (tuples of start and end squares) that show where all pawn attacks may be possible.
+    Deterministically find all paths where one side's pawns can attack.
+
+    :param own: True for your pawns, which attack diagonally up the board; False for the opponent's,
+        which attack diagonally down.
+    :return: A set of edges (start square, attacked square).
     """
-    # Go through A through H for both sides.
     edges: set[Tuple[int, int]] = set()
-    # Front perspective
     spot: int
     row: int
-    for row in range(1, 7, 1):
-        spot = row * 8
-        edges.add((spot, spot + 9))
+    column: int
 
-        column: int
-        for column in range(1, 7, 1):
-            spot = (row * 8) + column
-            edges.add((spot, spot + 7))
+    if own:
+        for row in range(1, 7, 1):
+            spot = row * 8
             edges.add((spot, spot + 9))
-
-        spot = (row * 8) + 7
-        edges.add((spot, spot + 7))
-
-    # Back perspective
-    spot: int
-    row: int
-    for row in range(6, 0, -1):
-        spot = row * 8
-        edges.add((spot, spot - 7))
-
-        column: int
-        for column in range(1, 7, 1):
-            spot = (row * 8) + column
+            for column in range(1, 7, 1):
+                spot = (row * 8) + column
+                edges.add((spot, spot + 7))
+                edges.add((spot, spot + 9))
+            spot = (row * 8) + 7
+            edges.add((spot, spot + 7))
+    else:
+        for row in range(6, 0, -1):
+            spot = row * 8
             edges.add((spot, spot - 7))
+            for column in range(1, 7, 1):
+                spot = (row * 8) + column
+                edges.add((spot, spot - 7))
+                edges.add((spot, spot - 9))
+            spot = (row * 8) + 7
             edges.add((spot, spot - 9))
-
-        spot = (row * 8) + 7
-        edges.add((spot, spot - 9))
 
     return edges
 
@@ -1536,7 +1551,7 @@ if __name__ == "__main__":
     # 5 King move
     # 6 Queen move
 
-    #visualize_graph(get_chess_graph_edges()[2])
+    #visualize_graph(get_chess_graph_edges()[4])  # knight edges
     visualize_graph(get_castling_edges(fen_to_vector("rnr1k1nq/pp6/2p3p1/3P4/1b1PQ3/1PN1P3/P2N1P1P/R3KR2 b KQq - 0 15")))
 
 
