@@ -20,7 +20,7 @@ lichess-games/
 # ----- Run outputs -----
 *.log
 artifacts/
-dehb_unpool_out/
+dehb_unpool_out*/
 
 # ----- Python -----
 __pycache__/
