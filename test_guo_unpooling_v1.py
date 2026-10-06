@@ -1,9 +1,9 @@
 """
-Correctness tests for the unpooling layer in guo_et_al_unpooling.py.
+Correctness tests for the unpooling layer in guo_et_al_unpooling_v1.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_guo_unpooling.py
+    python test_guo_unpooling_v1.py
 
 The layer follows appendix A of Guo, Zou and Lerman for undirected graphs. These tests check it
 against the paper's rules, independently of how the layer is implemented, so they can serve as
@@ -27,7 +27,7 @@ from typing import Callable, Dict, List, Set, Tuple
 import torch
 
 import chess_graph as cg
-import guo_et_al_unpooling as gu
+import guo_et_al_unpooling_v1 as gu
 
 CHESS_FEN = "1q1rkr2/pp3pnp/2pn2pQ/3p4/3Pb3/2P2NP1/PP2P2P/3RKRNB b KQkq - 1 15"
 

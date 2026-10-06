@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 
 import chess_graph as cg
-import guo_et_al_unpooling as unpool
+import guo_et_al_unpooling_v1 as unpool
 
 
 # ##### ##### ##### ##### #####

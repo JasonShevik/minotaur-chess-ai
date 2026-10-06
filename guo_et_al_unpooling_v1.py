@@ -1233,7 +1233,7 @@ if __name__ == "__main__":
         summary = helper.run()
         print(json.dumps(summary, indent=2, default=str))
         print(f"\nBest config saved to {summary['best_config_path']}")
-        print("Re-train at full scale with:  UNPOOL_MODE=train python guo_et_al_unpooling.py")
+        print("Re-train at full scale with:  UNPOOL_MODE=train python guo_et_al_unpooling_v1.py")
 
     elif MODE == "train":
         import matplotlib.pyplot as plt
