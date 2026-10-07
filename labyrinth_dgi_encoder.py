@@ -15,8 +15,8 @@ The training loop is not here. What is here is designed so that the loop can be 
 without touching these classes: the summarizer reports the log-probability and entropy of
 the unpooling decisions it sampled (for a REINFORCE / PPO term, since those decisions are
 discrete) and can replay a recorded set of decisions exactly (for PPO's ratio), the encoder
-can process a list of positions as one disconnected graph, and the discriminator can score
-every node against every summary in one call.
+and the summarizer can both process a batch of positions as one disconnected graph, and the
+discriminator can score every node against every summary in one call.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 
 import chess_graph as cg
-import guo_et_al_unpooling_v1 as unpool
+import guo_et_al_unpooling_v2 as unpool
 
 
 # ##### ##### ##### ##### #####
@@ -235,20 +235,24 @@ class NodeEncoder(nn.Module):
 class SummaryOutput:
     """
     What the summarizer returns. Beyond the summary itself, everything the training loop
-    needs to apply a policy-gradient update to the unpooling decisions:
+    needs to apply a policy-gradient update to the unpooling decisions. Shapes are for one
+    position (forward) / a batch of B positions (forward_merged):
 
-    summary     [summary_dim]  the position summary
-    log_prob    scalar         log-probability of every unpooling decision that was sampled, summed
-    entropy     scalar         entropy of those decisions, summed (for an entropy bonus)
-    num_nodes   int            size of the enlarged graph before padding
-    actions     list           one record per unpooling layer; pass back as actions_to_replay
-                               to reproduce exactly the same enlarged graph under new parameters
+    summary     [summary_dim] / [B, summary_dim]   the position summaries
+    log_prob    scalar / [B]    log-probability of every unpooling decision that was sampled, summed per position
+    entropy     scalar / [B]    entropy of those decisions, summed per position (for an entropy bonus)
+    num_nodes   int / [B]       size of each enlarged graph before padding
+    actions     list            one unpool.UnpoolActions record per unpooling layer, covering every
+                                position; pass back as actions_to_replay to reproduce exactly the same
+                                enlarged graphs under new parameters. To replay only some positions of a
+                                batch (a PPO minibatch), pass [a.select(indices) for a in actions] along
+                                with those positions, in the same order.
     """
     summary: torch.Tensor
     log_prob: torch.Tensor
     entropy: torch.Tensor
-    num_nodes: int
-    actions: List[Dict[str, Any]]
+    num_nodes: int | torch.Tensor
+    actions: List[unpool.UnpoolActions]
 
 
 class GlobalSummarizer(nn.Module):
@@ -315,44 +319,72 @@ class GlobalSummarizer(nn.Module):
     def max_nodes(self) -> int:
         return self.config.max_unpooled_nodes
 
+    def forward_merged(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        batch: torch.Tensor,
+        num_graphs: Optional[int] = None,
+        rng: Optional[torch.Generator] = None,
+        actions_to_replay: Optional[List[unpool.UnpoolActions]] = None,
+    ) -> SummaryOutput:
+        """
+        Summarize a batch of positions stacked with batch_chess_graphs, all in one pass.
+
+        x [B*64, node_feature_dim], edge_index, edge_attr and batch [B*64] as batch_chess_graphs
+        returns them; num_graphs = B (default batch.max() + 1).
+        rng: generator for the unpooling decisions (reproducibility).
+        actions_to_replay: the `actions` of a previous SummaryOutput for these same positions, in
+            the same order, to rebuild those exact enlarged graphs (needed for PPO's probability ratio).
+        Returns a SummaryOutput with summary [B, summary_dim] and log_prob, entropy, num_nodes [B].
+        """
+        B = int(num_graphs) if num_graphs is not None else int(batch.max()) + 1
+        h = self.lift(x)
+
+        log_prob = h.new_zeros(B)
+        entropy = h.new_zeros(B)
+        actions: List[unpool.UnpoolActions] = []
+        for k, (unpool_layer, gat, norm) in enumerate(zip(self.unpool_layers, self.gat_layers, self.gat_norms)):
+            replay = actions_to_replay[k] if actions_to_replay is not None else None
+            out = unpool_layer(h, edge_index, edge_attr, actions_to_replay=replay, rng=rng,
+                               batch=batch, num_graphs=B)
+            h, edge_index, edge_attr, batch = out.y, out.edge_index, out.edge_attr, out.batch
+            log_prob = log_prob + out.log_prob
+            entropy = entropy + out.entropy
+            actions.append(out.actions)
+            h = F.leaky_relu(norm(gat(h, edge_index, edge_attr)), 0.05)
+
+        num_nodes = torch.bincount(batch, minlength=B)
+        if int(num_nodes.max()) > self.max_nodes:  # cannot happen (each layer at most doubles), guard anyway
+            raise RuntimeError(f"unpooled graph has {int(num_nodes.max())} nodes, above the bound {self.max_nodes}")
+
+        # Each position's enlarged graph goes in its own zero-padded block of max_nodes slots, then is flattened
+        flat = self.to_flat(h)                                        # [total nodes, flat_dim]
+        slot = torch.arange(flat.size(0), device=flat.device) - (torch.cumsum(num_nodes, 0) - num_nodes)[batch]
+        padded = flat.new_zeros(B, self.max_nodes, flat.size(1)).index_put((batch, slot), flat)
+        summary = self.head(padded.reshape(B, -1))                    # [B, summary_dim]
+        return SummaryOutput(summary, log_prob, entropy, num_nodes, actions)
+
     def forward(
         self,
         x: torch.Tensor,
         edge_index_list: Sequence[torch.Tensor],
         rng: Optional[torch.Generator] = None,
-        actions_to_replay: Optional[List[Dict[str, Any]]] = None,
+        actions_to_replay: Optional[List[unpool.UnpoolActions]] = None,
     ) -> SummaryOutput:
         """
-        x: [64, node_feature_dim]; edge_index_list from create_filled_chess_graphs.
+        One position. x: [64, node_feature_dim]; edge_index_list from create_filled_chess_graphs.
         rng: generator for the unpooling decisions (reproducibility).
         actions_to_replay: the `actions` of a previous SummaryOutput for this same position,
             to rebuild that exact enlarged graph (needed for PPO's probability ratio).
+        Returns a SummaryOutput with summary [summary_dim], scalar log_prob and entropy, int num_nodes.
         """
         x, edge_index, edge_attr = chess_graph_to_single(x, edge_index_list, self.config.num_edge_types)
-        h = self.lift(x)
-
-        log_prob = h.new_zeros(())
-        entropy = h.new_zeros(())
-        actions: List[Dict[str, Any]] = []
-        for k, (unpool_layer, gat, norm) in enumerate(zip(self.unpool_layers, self.gat_layers, self.gat_norms)):
-            replay = actions_to_replay[k] if actions_to_replay is not None else None
-            h, edge_index, edge_attr, lp, ent, _parent_map, _sets, recorded = unpool_layer(
-                h, edge_index, edge_attr, actions_to_replay=replay, rng=rng
-            )
-            log_prob = log_prob + lp
-            entropy = entropy + ent
-            actions.append(recorded)
-            h = F.leaky_relu(norm(gat(h, edge_index, edge_attr)), 0.05)
-
-        num_nodes = h.size(0)
-        if num_nodes > self.max_nodes:  # cannot happen (each layer at most doubles), guard anyway
-            raise RuntimeError(f"unpooled graph has {num_nodes} nodes, above the bound {self.max_nodes}")
-
-        flat = self.to_flat(h)                                        # [num_nodes, flat_dim]
-        padded = flat.new_zeros(self.max_nodes, flat.size(1))
-        padded[:num_nodes] = flat
-        summary = self.head(padded.reshape(-1))                       # [summary_dim]
-        return SummaryOutput(summary, log_prob, entropy, num_nodes, actions)
+        batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        out = self.forward_merged(x, edge_index, edge_attr, batch, num_graphs=1, rng=rng,
+                                  actions_to_replay=actions_to_replay)
+        return SummaryOutput(out.summary[0], out.log_prob[0], out.entropy[0], int(out.num_nodes[0]), out.actions)
 
 
 # ##### ##### ##### ##### #####
@@ -474,8 +506,12 @@ if __name__ == "__main__":
     replay = summarizer(x, edges, actions_to_replay=out.actions)
     scores = discriminator.score_matrix(h, out.summary.unsqueeze(0))
 
+    graphs = [(edges, x), cg.create_filled_chess_graphs("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")]
+    batched = summarizer.forward_merged(*batch_chess_graphs(graphs), rng=rng)
+
     print(f"\nnode embeddings     {tuple(h.shape)}")
     print(f"summary             {tuple(out.summary.shape)}  from {out.num_nodes} unpooled nodes "
           f"(bound {summarizer.max_nodes}), log_prob={out.log_prob.item():.2f}, entropy={out.entropy.item():.2f}")
     print(f"replay identical    {torch.allclose(replay.summary, out.summary)}")
     print(f"score matrix        {tuple(scores.shape)}")
+    print(f"batched summaries   {tuple(batched.summary.shape)}  from {batched.num_nodes.tolist()} unpooled nodes")

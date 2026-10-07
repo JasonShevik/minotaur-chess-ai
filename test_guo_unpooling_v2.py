@@ -13,7 +13,7 @@ v1 (guo_et_al_unpooling_v1.py) is the reference. These tests check that v2 is th
   * sampling is calibrated, including step 2b, which v2 samples with the Gumbel-max trick;
   * the paper's rules, connectivity and output conventions hold, as in v1's tests;
   * action records can be split, selected and collated, and replay detects a different graph;
-  * v1 checkpoints load, the encoder's summarizer works with v2 swapped in, and the harness runs.
+  * v1 checkpoints load, the encoder's summarizer is built on v2, and the harness runs.
 """
 import collections
 import random
@@ -360,25 +360,20 @@ def test_batched_replay_is_differentiable():
             assert any(g is not None and g.abs().sum() > 0 for g in grads), f"no gradient reached {head}"
 
 
-def test_summarizer_works_with_v2_swapped_in():
-    """The encoder's GlobalSummarizer, built on v2 instead of v1, runs and replays unchanged."""
+def test_summarizer_is_built_on_v2():
+    """The encoder's GlobalSummarizer uses v2, and runs and replays (its batching is tested in test_encoder.py)."""
     import labyrinth_dgi_encoder as lde
-    old = lde.unpool
-    try:
-        lde.unpool = gu2
-        cfg = lde.DGIConfig(sum_in_dim=16, sum_unpool_hidden=32, sum_edge_dim=8, sum_flat_dim=4,
-                            sum_mlp_hidden=64, summary_dim=32)
-        summarizer = lde.GlobalSummarizer(cfg).eval()
-        assert isinstance(summarizer.unpool_layers[0], gu2.GuoUnpool)
-        edges, x = cg.create_filled_chess_graphs(CHESS_FEN)
-        with torch.no_grad():
-            first = summarizer(x, edges, rng=torch.Generator().manual_seed(0))
-        again = summarizer(x, edges, actions_to_replay=first.actions)
-        assert torch.allclose(first.summary, again.summary, atol=1e-5)
-        assert torch.allclose(first.log_prob, again.log_prob, atol=1e-4)
-        again.log_prob.backward()
-    finally:
-        lde.unpool = old
+    cfg = lde.DGIConfig(sum_in_dim=16, sum_unpool_hidden=32, sum_edge_dim=8, sum_flat_dim=4,
+                        sum_mlp_hidden=64, summary_dim=32)
+    summarizer = lde.GlobalSummarizer(cfg).eval()
+    assert isinstance(summarizer.unpool_layers[0], gu2.GuoUnpool)
+    edges, x = cg.create_filled_chess_graphs(CHESS_FEN)
+    with torch.no_grad():
+        first = summarizer(x, edges, rng=torch.Generator().manual_seed(0))
+    again = summarizer(x, edges, actions_to_replay=first.actions)
+    assert torch.allclose(first.summary, again.summary, atol=1e-5)
+    assert torch.allclose(first.log_prob, again.log_prob, atol=1e-4)
+    again.log_prob.backward()
 
 
 def test_runs_on_gpu_when_available():

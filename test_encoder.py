@@ -7,7 +7,8 @@ Run with plain Python (no pytest needed):
 
 These check shapes and contracts rather than learning: that every model builds from a config,
 that the summarizer can replay its own unpooling decisions exactly, that stacking positions
-into one disconnected graph encodes them identically to one at a time, that the discriminator's
+into one disconnected graph encodes and summarizes them identically to one at a time (including
+replaying any subset of a batch, as a PPO minibatch does), that the discriminator's
 paired and matrix scoring agree, and that configurations sampled from the DEHB search space
 build and run.
 """
@@ -88,6 +89,45 @@ def test_batching_matches_single_encoding():
     assert batch.tolist() == sorted(batch.tolist())
     assert batch.bincount().tolist() == [64] * len(GRAPHS)
     assert torch.allclose(single, stacked, atol=1e-5)
+
+
+def test_batched_summaries_match_single_positions():
+    cfg = lde.DGIConfig(sum_in_dim=32, sum_unpool_hidden=64, summary_dim=512, sum_mlp_hidden=256)
+    summ = lde.GlobalSummarizer(cfg).eval()
+    x, ei, ea, batch = lde.batch_chess_graphs(GRAPHS)
+    with torch.no_grad():
+        # sampled as a batch, each position replayed on its own
+        out = summ.forward_merged(x, ei, ea, batch, rng=torch.Generator().manual_seed(1))
+        assert out.summary.shape == (len(GRAPHS), cfg.summary_dim)
+        assert out.log_prob.shape == out.entropy.shape == out.num_nodes.shape == (len(GRAPHS),)
+        for b, (edges, xb) in enumerate(GRAPHS):
+            single = summ(xb, edges, actions_to_replay=[a.select([b]) for a in out.actions])
+            assert single.num_nodes == int(out.num_nodes[b])
+            assert torch.allclose(single.summary, out.summary[b], atol=1e-4)
+            assert torch.allclose(single.log_prob, out.log_prob[b], atol=1e-3)
+        # sampled one at a time, replayed as a batch
+        singles = [summ(xb, edges, rng=torch.Generator().manual_seed(10 + b)) for b, (edges, xb) in enumerate(GRAPHS)]
+        records = [lde.unpool.UnpoolActions.collate([s.actions[k] for s in singles]) for k in range(cfg.sum_num_unpool)]
+        again = summ.forward_merged(x, ei, ea, batch, actions_to_replay=records)
+    for b, s in enumerate(singles):
+        assert torch.allclose(again.summary[b], s.summary, atol=1e-4)
+        assert torch.allclose(again.log_prob[b], s.log_prob, atol=1e-3)
+
+
+def test_minibatch_replay_of_a_batch_is_differentiable():
+    """What a PPO update does: replay some positions of a rollout batch, in any order, and backpropagate."""
+    cfg = lde.DGIConfig(sum_in_dim=32, sum_unpool_hidden=64, summary_dim=256, sum_mlp_hidden=128)
+    summ = lde.GlobalSummarizer(cfg)
+    with torch.no_grad():
+        rollout = summ.forward_merged(*lde.batch_chess_graphs(GRAPHS), rng=torch.Generator().manual_seed(0))
+    pick = [3, 1]
+    replay = summ.forward_merged(*lde.batch_chess_graphs([GRAPHS[i] for i in pick]),
+                                 actions_to_replay=[a.select(pick) for a in rollout.actions])
+    assert torch.allclose(replay.log_prob.detach(), rollout.log_prob[pick], atol=1e-3)
+    assert torch.allclose(replay.summary.detach(), rollout.summary[pick], atol=1e-4)
+    (replay.summary.sum() + replay.log_prob.sum()).backward()
+    assert summ.unpool_layers[0].mlp_r[0].weight.grad is not None
+    assert summ.head[0].weight.grad is not None
 
 
 def test_discriminator_paired_equals_matrix_diagonal():
