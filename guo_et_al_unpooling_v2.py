@@ -856,7 +856,9 @@ def random_undirected_graph_with_features(
     if device is None:
         device = cpu
     if rng is None:
-        rng = torch.Generator(device=cpu).manual_seed(torch.seed())
+        # torch's global generator, so torch.manual_seed makes this reproducible. (This used to be
+        # torch.seed(), which re-seeds that generator non-deterministically on every call.)
+        rng = torch.default_generator
 
     pairs = set()
     # Connectivity: random spanning tree
@@ -1075,7 +1077,10 @@ class Critic(nn.Module):
 
 def make_dataset(n_graphs: int, *, n_min_nodes: int, n_max_nodes: int,
                  node_feat_dim: int, desc_dim: int, include_degree_feats: bool,
-                 edge_feat_dim: int, p_extra: float, device):
+                 edge_feat_dim: int, p_extra: float, device,
+                 rng: Optional[torch.Generator] = None):
+    """n_graphs random target graphs. Graph sizes come from Python's random module and everything
+    else from rng (a CPU generator), so seeding both makes the dataset reproducible."""
     ds = []
     for _ in range(n_graphs):
         n = random.randint(n_min_nodes, n_max_nodes)
@@ -1088,6 +1093,7 @@ def make_dataset(n_graphs: int, *, n_min_nodes: int, n_max_nodes: int,
             edge_feat_dim=edge_feat_dim,
             edge_feat_style="gaussian",
             device=device,
+            rng=rng,
         )
         ds.append((x, ei, ea, meta))
     return ds
@@ -1113,17 +1119,20 @@ def build_training_context(
     """Builds datasets + lossless seed featurization exactly as v1 does, and returns everything the
     objective needs. Also stacks every graph's seed features ("train_seeds" / "val_seeds" [n, n_seed, dx])
     for batched rollouts."""
+    # data_seed alone determines the datasets: graph sizes come from Python's random module and
+    # everything else from one CPU generator, drawn train set first, then validation set
     random.seed(data_seed)
     torch.manual_seed(data_seed)
+    data_rng = torch.Generator(device="cpu").manual_seed(data_seed)
 
     raw_train = make_dataset(n_train, n_min_nodes=n_min_nodes, n_max_nodes=n_max_nodes,
                              node_feat_dim=node_feat_dim, desc_dim=desc_dim,
                              include_degree_feats=include_degree_feats,
-                             edge_feat_dim=edge_feat_dim, p_extra=p_extra, device=device)
+                             edge_feat_dim=edge_feat_dim, p_extra=p_extra, device=device, rng=data_rng)
     raw_val = make_dataset(n_val, n_min_nodes=n_min_nodes, n_max_nodes=n_max_nodes,
                            node_feat_dim=node_feat_dim, desc_dim=desc_dim,
                            include_degree_feats=include_degree_feats,
-                           edge_feat_dim=edge_feat_dim, p_extra=p_extra, device=device)
+                           edge_feat_dim=edge_feat_dim, p_extra=p_extra, device=device, rng=data_rng)
 
     capN = n_max_nodes
     raw_node_dim = raw_train[0][0].size(1)

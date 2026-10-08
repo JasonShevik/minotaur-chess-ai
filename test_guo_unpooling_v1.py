@@ -336,6 +336,21 @@ def test_replay_ignores_the_rng():
     assert torch.equal(first[1], again[1]) and torch.allclose(first[3], again[3])
 
 
+def test_datasets_are_reproducible_from_data_seed():
+    """build_training_context must give the same graphs for the same data_seed, and different ones otherwise."""
+    def fingerprint(ctx):
+        return [(x.tolist(), ei.tolist(), ea.tolist()) for _, x, ei, ea in ctx["train_set"] + ctx["val_set"]]
+    a = gu.build_training_context(n_train=5, n_val=3, data_seed=11)
+    torch.manual_seed(999); random.seed(999)          # unrelated global seeding must not matter
+    b = gu.build_training_context(n_train=5, n_val=3, data_seed=11)
+    c = gu.build_training_context(n_train=5, n_val=3, data_seed=12)
+    assert fingerprint(a) == fingerprint(b), "same data_seed, different datasets"
+    assert fingerprint(a) != fingerprint(c), "different data_seed, same datasets"
+    train_graphs = {str(ei.tolist()) + str(x.tolist()) for _, x, ei, _ in a["train_set"]}
+    assert not any(str(ei.tolist()) + str(x.tolist()) in train_graphs for _, x, ei, _ in a["val_set"]), \
+        "validation graphs must differ from training graphs"
+
+
 def test_harness_runs_end_to_end():
     """The standalone PPO harness (undirected targets, both scoring rules) still trains and evaluates."""
     ctx = gu.build_training_context(n_train=6, n_val=4, data_seed=5)
