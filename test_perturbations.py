@@ -424,6 +424,99 @@ def test_xfen_letters_are_understood():
     assert all(c in "KQkq" for c in cg.perturb_position(fen, perturb_type=7, rng=random.Random(0)).split()[2].replace("-", ""))
 
 
+def _random_game_positions(n_starts: int, seed: int) -> List[chess.Board]:
+    """Boards reached by random play from standard and Chess960 starts: varied castling rights, both sides to move."""
+    rnd = random.Random(seed)
+    boards = []
+    for i in range(n_starts):
+        board = chess.Board() if i == 0 else chess.Board.from_chess960_pos(rnd.randrange(960))
+        for _ in range(12):
+            boards.append(board.copy(stack=False))
+            for _ in range(rnd.randint(1, 6)):
+                moves = list(board.legal_moves)
+                if not moves:
+                    break
+                board.push(rnd.choice(moves))
+    return boards
+
+
+def _expected_castling_edges(board: chess.Board):
+    """The castling edges, worked out directly from python-chess: for each right, the king to its destination
+    and the rook to its destination, on the board oriented with the side to move at the bottom."""
+    orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+    edges = set()
+    for rook in chess.scan_forward(board.clean_castling_rights()):
+        color = chess.WHITE if rook < 8 else chess.BLACK
+        king = board.king(color)
+        kingside = chess.square_file(rook) > chess.square_file(king)
+        rank = 0 if color == board.turn else 7
+        edges.add((orient(king), rank * 8 + (6 if kingside else 2)))
+        edges.add((orient(rook), rank * 8 + (5 if kingside else 3)))
+    return {(min(a, b), max(a, b)) for a, b in edges}
+
+
+def test_static_edges_are_cached_safely():
+    """The 9 static edge types are built once; modifying what a call returns must not affect the next call."""
+    first, _ = cg.create_filled_chess_graphs(BUILT_IN_FENS[0])
+    first[4][0, 0] = 63
+    second, _ = cg.create_filled_chess_graphs(BUILT_IN_FENS[0])
+    assert int(second[4][0, 0]) != 63, "a returned edge tensor shares memory with the cache"
+    lists = cg.get_chess_graph_edges()
+    lists[4].clear()
+    assert len(cg.get_chess_graph_edges()[4]) > 0, "get_chess_graph_edges must return copies"
+
+
+def test_castling_rook_squares_are_oriented_with_the_board():
+    """
+    Rook squares passed to create_filled_chess_graphs are ordinary board squares. With black to move they
+    used to be applied as if white were at the bottom, which dropped the edges when only black could castle.
+    """
+    checked = {"w": 0, "b": 0}
+    for board in _random_game_positions(60, seed=5) + [chess.Board("r3k2r/8/8/8/8/8/8/R3K2R b k - 0 1")]:
+        if not board.clean_castling_rights():
+            continue
+        squares = cg.castling_rook_squares_from_board(board)
+        edges, _ = cg.create_filled_chess_graphs(board.fen(), squares)
+        got = {(min(a, b), max(a, b)) for a, b in edges[9].t().tolist()}
+        assert got == _expected_castling_edges(board), board.fen()
+        checked["w" if board.turn == chess.WHITE else "b"] += 1
+    assert checked["w"] > 20 and checked["b"] > 20, checked
+
+
+def test_sample_legal_move():
+    rng = random.Random(0)
+    n_castling = n_promotion = 0
+    boards = _random_game_positions(40, seed=9) + [chess.Board("8/P6k/8/8/8/8/8/K7 w - - 0 1"),
+                                                   chess.Board("r3k2r/8/8/8/8/8/8/R3K2R b kq - 0 1")]
+    for board in boards:
+        fen = board.fen()
+        transitions = cg.legal_move_transitions(fen)
+        assert len(transitions) == board.legal_moves.count()
+        for t in transitions:
+            move = chess.Move.from_uci(t.move)
+            after = board.copy(stack=False)
+            after.push(move)
+            assert t.next_fen == after.fen() and t.fen == fen
+            # from/to index the nodes of the graph of fen: the mover's own piece sits on from_square
+            _, x = cg.create_filled_chess_graphs(fen, t.castling_rook_squares)
+            assert x[t.from_square, 0] == 0 and x[t.from_square, 1:7].sum() == 1, "from_square must hold an own piece"
+            if t.is_castling:
+                n_castling += 1
+                assert x[t.to_square, 4] == 1 and x[t.to_square, 0] == 0, "castling to_square is the own rook"
+            if t.promotion:
+                n_promotion += 1
+                assert t.promotion == move.promotion
+            assert t.next_castling_rook_squares == cg.castling_rook_squares_from_board(after)
+        picked = cg.sample_legal_move(fen, rng)
+        assert picked in transitions
+    assert n_castling > 0 and n_promotion > 0, (n_castling, n_promotion)
+    # reproducible with a seeded rng, and None when there is no legal move
+    fen = boards[3].fen()
+    assert cg.sample_legal_move(fen, random.Random(7)) == cg.sample_legal_move(fen, random.Random(7))
+    assert cg.sample_legal_move("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1") is None        # checkmate
+    assert cg.sample_legal_move("7k/8/6QK/8/8/8/8/8 b - - 0 1") is None          # stalemate
+
+
 # ##### ##### ##### ##### #####
 #   Runner
 

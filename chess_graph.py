@@ -1,13 +1,14 @@
 import chess.engine
 import chess
 import torch
+import functools
 import math
 import random
 import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils import to_networkx
 from torch_geometric.data import Data
-from typing import List, Tuple, Callable, Dict, Any, Optional, Union
+from typing import List, Tuple, Callable, Dict, Any, NamedTuple, Optional, Union
 
 
 # ##### ##### ##### ##### #####
@@ -33,9 +34,16 @@ NUM_NODE_FEATURES: int = 8   # hostile, pawn, knight, bishop, rook, queen, king,
 
 def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
     """
-
-    :return:
+    The 9 position-independent edge lists (types 0 to 8; castling, type 9, depends on the position).
+    Each is a set of (from, to) square pairs. They are computed once and cached; every call returns
+    fresh copies, so callers may modify them.
     """
+    return [set(edges) for edges in _static_edge_sets()]
+
+
+@functools.lru_cache(maxsize=1)
+def _static_edge_sets() -> Tuple[frozenset, ...]:
+    """Builds the 9 static edge lists by depth-first search over each piece's moves. Run once."""
     # Neighborhood functions for different pieces, used for depth first search to get edges
     pieces_list: List[Callable[Tuple[int, int],
                                set[Tuple[int, int]]]] = [
@@ -81,7 +89,19 @@ def get_chess_graph_edges() -> List[set[Tuple[int, int]]]:
 
     # Don't add any castling edges because their existence depends on the position
 
-    return edges_lists
+    return tuple(frozenset(edges) for edges in edges_lists)
+
+
+def _undirected_edge_tensor(edges: set[Tuple[int, int]]) -> torch.Tensor:
+    """[2, E] tensor holding every edge in both directions, sorted so the order is reproducible."""
+    undirected: List[Tuple[int, int]] = sorted(set(edges) | {(b, a) for (a, b) in edges})
+    return torch.tensor(data=[[a for a, _ in undirected], [b for _, b in undirected]], dtype=torch.int64).reshape(2, -1)
+
+
+@functools.lru_cache(maxsize=1)
+def _static_edge_tensors() -> Tuple[torch.Tensor, ...]:
+    """The 9 static edge lists as undirected [2, E] tensors. Built once; create_filled_chess_graphs hands out clones."""
+    return tuple(_undirected_edge_tensor(set(edges)) for edges in _static_edge_sets())
 
 
 # Castling destination squares (standard / Chess960): king g1/f1, c1/d1; g8/f8, c8/d8
@@ -483,6 +503,93 @@ def mirror_castling_rook_squares(
 
     k_rook, q_rook, k_rook_b, q_rook_b = castling_rook_squares
     return (mirror(q_rook), mirror(k_rook), mirror(q_rook_b), mirror(k_rook_b))
+
+
+def castling_rook_squares_from_board(board: chess.Board) -> Tuple[int, int, int, int]:
+    """
+    The castling rook squares (K, Q, k, q; -1 for no right) exactly as python-chess interprets the
+    position, which is also what decides which castling moves are legal. An X-FEN "K" or "Q" with more
+    than one rook on that side means the outermost rook. Kingside is toward the h file.
+    """
+    result = [-1, -1, -1, -1]
+    for slot, color, kingside in ((0, chess.WHITE, True), (1, chess.WHITE, False),
+                                  (2, chess.BLACK, True), (3, chess.BLACK, False)):
+        king = board.king(color)
+        if king is None:
+            continue
+        back_rank = chess.BB_RANK_1 if color == chess.WHITE else chess.BB_RANK_8
+        for rook in chess.scan_forward(board.clean_castling_rights() & back_rank):
+            if (chess.square_file(rook) > chess.square_file(king)) == kingside:
+                result[slot] = rook
+    return result[0], result[1], result[2], result[3]
+
+
+class MoveTransition(NamedTuple):
+    """
+    One legal move and the position it leads to, with everything needed to build both graphs
+    consistently and to tell a model which move was played.
+
+    fen / next_fen           the position before and after the move (python-chess X-FEN)
+    move                     the move in UCI, Chess960 style (castling is written king-takes-own-rook)
+    from_square, to_square   the move's squares as node indices of the graph of `fen`, which shows the
+                             side to move at the bottom (black to move: squares reflected vertically).
+                             For castling, to_square is the rook's square, as in the UCI move.
+    promotion                0 for no promotion, else the chess piece type promoted to (2 = knight ... 5 = queen)
+    is_castling, is_capture, is_en_passant
+    castling_rook_squares, next_castling_rook_squares
+                             (K, Q, k, q) rook squares for each position as python-chess reads them; pass
+                             them to create_filled_chess_graphs so both graphs agree on which rook castles
+    """
+    fen: str
+    move: str
+    next_fen: str
+    from_square: int
+    to_square: int
+    promotion: int
+    is_castling: bool
+    is_capture: bool
+    is_en_passant: bool
+    castling_rook_squares: Tuple[int, int, int, int]
+    next_castling_rook_squares: Tuple[int, int, int, int]
+
+
+def _transition(board: chess.Board, move: chess.Move, rook_squares: Tuple[int, int, int, int]) -> MoveTransition:
+    orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+    after = board.copy(stack=False)
+    after.push(move)
+    return MoveTransition(
+        fen=board.fen(),
+        move=move.uci(),
+        next_fen=after.fen(),
+        from_square=orient(move.from_square),
+        to_square=orient(move.to_square),
+        promotion=move.promotion or 0,
+        is_castling=board.is_castling(move),
+        is_capture=board.is_capture(move),
+        is_en_passant=board.is_en_passant(move),
+        castling_rook_squares=rook_squares,
+        next_castling_rook_squares=castling_rook_squares_from_board(after),
+    )
+
+
+def legal_move_transitions(fen: str) -> List[MoveTransition]:
+    """Every legal move of the position, in python-chess's move order. Empty when there are none (mate or stalemate)."""
+    board = chess.Board(fen, chess960=True)
+    rook_squares = castling_rook_squares_from_board(board)
+    return [_transition(board, move, rook_squares) for move in board.legal_moves]
+
+
+def sample_legal_move(fen: str, rng: Optional[random.Random] = None) -> Optional[MoveTransition]:
+    """
+    One legal move chosen uniformly at random, and the position it leads to. Returns None when the
+    position has no legal moves (checkmate or stalemate). rng: a random.Random, for reproducibility.
+    """
+    board = chess.Board(fen, chess960=True)
+    moves = list(board.legal_moves)
+    if not moves:
+        return None
+    move = (rng or random).choice(moves)
+    return _transition(board, move, castling_rook_squares_from_board(board))
 
 
 def _keep_move_counters(perturbed: str, original: str) -> str:
@@ -932,8 +1039,9 @@ def create_filled_chess_graphs(
     A function to get the graph representations of all piece interactions for a specified chess position.
     :param fen: The string that identifies the position to make graphs for.
     :param castling_rook_squares: Optional tuple of 4 square indices (0-63) in order K, Q, k, q for the
-        castling rook on each side; use -1 for no right. When provided (e.g. from the DB column), castling
-        edges use these squares; when None, rooks are inferred from the position (legacy behavior).
+        castling rook on each side; use -1 for no right. These are ordinary board squares (a1 = 0, h8 = 63,
+        as python-chess and the DB column use), whichever side is to move. When provided, castling edges use
+        these squares; when None, rooks are inferred from the position (legacy behavior).
     :return: A tuple with the information needed for all of the graph networks. The first value in the tuple is
         a list of NUM_EDGE_TYPES edge index tensors, one per piece movement type, each undirected: every edge
         appears in both directions, sorted. The second value in the tuple is the tensor with all of the node
@@ -942,10 +1050,18 @@ def create_filled_chess_graphs(
     # Create a list of 64 floats that contains the information from the fen
     position_vector: List[float] = fen_to_vector(fen)
 
-    # Initialize the working variables that I will eventually return
-    edges_lists: List[set[Tuple[int, int]]] = get_chess_graph_edges()
-    # Add the castling edges
-    edges_lists.append(get_castling_edges(position_vector, castling_rook_squares))
+    # The castling edges are the only position-dependent ones. get_castling_edges works on the
+    # oriented board (side to move at the bottom, called "white" there), so the rook squares are
+    # reoriented to match: with black to move, black's rooks belong to the bottom king and every
+    # square is reflected vertically, the same way fen_to_vector reflects the board.
+    if castling_rook_squares is not None and fen.split(" ")[1] == "b":
+        k_rook, q_rook, k_rook_b, q_rook_b = castling_rook_squares
+
+        def reflect(sq: int) -> int:
+            return sq if sq < 0 else sq ^ 56
+
+        castling_rook_squares = (reflect(k_rook_b), reflect(q_rook_b), reflect(k_rook), reflect(q_rook))
+    castling_edges: set[Tuple[int, int]] = get_castling_edges(position_vector, castling_rook_squares)
 
     # node_features indices mean the following:
     # 0: Enemy controlled square flag
@@ -986,17 +1102,11 @@ def create_filled_chess_graphs(
         # We know there is a piece since we would have continued earlier
         node_features[square][abs(position_vector[square])] = 1
 
-    # Initialize the list of edge tensors that will eventually be returned
-    edges_tensors: List[torch.Tensor] = []
-
-    # Convert the pairwise edges to [2, E] tensors. The graph is undirected, so each relation is stored in
-    # both directions (the PyTorch Geometric convention). Sorting keeps the edge order reproducible.
-    this_type_edges: set[Tuple[int, int]]
-    for this_type_edges in edges_lists:
-        undirected: List[Tuple[int, int]] = sorted(set(this_type_edges) | {(b, a) for (a, b) in this_type_edges})
-        x_list: List[int] = [a for a, _ in undirected]
-        y_list: List[int] = [b for _, b in undirected]
-        edges_tensors.append(torch.tensor(data=[x_list, y_list], dtype=torch.int64).reshape(2, -1))
+    # The edges as [2, E] tensors. The graph is undirected, so each relation is stored in both directions
+    # (the PyTorch Geometric convention), sorted so the edge order is reproducible. The 9 static types are
+    # built once and cloned, so a caller modifying a returned tensor cannot corrupt the cache.
+    edges_tensors: List[torch.Tensor] = [t.clone() for t in _static_edge_tensors()]
+    edges_tensors.append(_undirected_edge_tensor(castling_edges))
 
     # Create the node_features_tensor using the node_features list of lists
     node_features_tensor: torch.Tensor = torch.tensor(node_features, dtype=torch.float32)
