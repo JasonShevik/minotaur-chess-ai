@@ -489,14 +489,14 @@ def test_sample_legal_move():
     boards = _random_game_positions(40, seed=9) + [chess.Board("8/P6k/8/8/8/8/8/K7 w - - 0 1"),
                                                    chess.Board("r3k2r/8/8/8/8/8/8/R3K2R b kq - 0 1")]
     for board in boards:
-        fen = board.fen()
+        fen = board.fen(en_passant="xfen")
         transitions = cg.legal_move_transitions(fen)
         assert len(transitions) == board.legal_moves.count()
         for t in transitions:
             move = chess.Move.from_uci(t.move)
             after = board.copy(stack=False)
             after.push(move)
-            assert t.next_fen == after.fen() and t.fen == fen
+            assert t.next_fen == after.fen(en_passant="xfen") and t.fen == board.fen(en_passant="xfen")
             # from/to index the nodes of the graph of fen: the mover's own piece sits on from_square
             _, x = cg.create_filled_chess_graphs(fen, t.castling_rook_squares)
             assert x[t.from_square, 0] == 0 and x[t.from_square, 1:7].sum() == 1, "from_square must hold an own piece"

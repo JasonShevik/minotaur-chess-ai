@@ -529,7 +529,10 @@ class MoveTransition(NamedTuple):
     One legal move and the position it leads to, with everything needed to build both graphs
     consistently and to tell a model which move was played.
 
-    fen / next_fen           the position before and after the move (python-chess X-FEN)
+    fen / next_fen           the position before and after the move, as python-chess X-FEN: Chess960 castling
+                             letters, and an en passant square whenever a pawn could capture there, pins
+                             ignored (python-chess's default writes it only when the capture is fully legal,
+                             which depends on the whole board)
     move                     the move in UCI, Chess960 style (castling is written king-takes-own-rook)
     from_square, to_square   the move's squares as node indices of the graph of `fen`, which shows the
                              side to move at the bottom (black to move: squares reflected vertically).
@@ -553,14 +556,14 @@ class MoveTransition(NamedTuple):
     next_castling_rook_squares: Tuple[int, int, int, int]
 
 
-def _transition(board: chess.Board, move: chess.Move, rook_squares: Tuple[int, int, int, int]) -> MoveTransition:
+def move_transition(board: chess.Board, move: chess.Move, rook_squares: Tuple[int, int, int, int]) -> MoveTransition:
     orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
     after = board.copy(stack=False)
     after.push(move)
     return MoveTransition(
-        fen=board.fen(),
+        fen=board.fen(en_passant="xfen"),
         move=move.uci(),
-        next_fen=after.fen(),
+        next_fen=after.fen(en_passant="xfen"),
         from_square=orient(move.from_square),
         to_square=orient(move.to_square),
         promotion=move.promotion or 0,
@@ -576,7 +579,7 @@ def legal_move_transitions(fen: str) -> List[MoveTransition]:
     """Every legal move of the position, in python-chess's move order. Empty when there are none (mate or stalemate)."""
     board = chess.Board(fen, chess960=True)
     rook_squares = castling_rook_squares_from_board(board)
-    return [_transition(board, move, rook_squares) for move in board.legal_moves]
+    return [move_transition(board, move, rook_squares) for move in board.legal_moves]
 
 
 def sample_legal_move(fen: str, rng: Optional[random.Random] = None) -> Optional[MoveTransition]:
@@ -589,7 +592,7 @@ def sample_legal_move(fen: str, rng: Optional[random.Random] = None) -> Optional
     if not moves:
         return None
     move = (rng or random).choice(moves)
-    return _transition(board, move, castling_rook_squares_from_board(board))
+    return move_transition(board, move, castling_rook_squares_from_board(board))
 
 
 def _keep_move_counters(perturbed: str, original: str) -> str:

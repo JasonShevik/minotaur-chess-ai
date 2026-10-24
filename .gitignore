@@ -21,6 +21,7 @@ lichess-games/
 *.log
 artifacts/
 dehb_unpool_out*/
+labyrinth_data_cache/
 
 # ----- Python -----
 __pycache__/
