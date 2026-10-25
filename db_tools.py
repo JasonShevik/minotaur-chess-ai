@@ -2,6 +2,7 @@ import pandas as pd
 import sqlite3
 import random
 import chess
+import os
 from os.path import exists
 from typing import Dict, List, Tuple, Callable, Optional
 
@@ -65,6 +66,65 @@ def add_positions(db_name: str, filepaths: List[str]) -> None:
             ''', fen_list)
         conn.commit()
     conn.close()
+
+
+# Positions for self-supervised training (the Labyrinth encoder): no engine labels, just positions,
+# kept apart from the engine-labeled "960_position_data" table.
+SSL_TABLE: str = "ssl_positions"
+
+
+def _check_table_name(table: str) -> None:
+    if not table or '"' in table:
+        raise ValueError(f"invalid table name: {table!r}")
+
+
+def create_ssl_table(db_name: str, table: str = SSL_TABLE) -> None:
+    """
+    Create the table of self-supervised training positions if it does not exist: one row per FEN,
+    with the file it was loaded from.
+    """
+    _check_table_name(table)
+    with sqlite3.connect(f"{db_name}.db") as conn:
+        conn.execute(f'''
+            CREATE TABLE IF NOT EXISTS "{table}" (
+            fen TEXT PRIMARY KEY,
+            source TEXT
+            )
+        ''')
+        conn.commit()
+
+
+def add_ssl_positions(db_name: str, filepaths: List[str], table: str = SSL_TABLE, batch_size: int = 100_000) -> int:
+    """
+    Load FEN text files (one FEN per line, as lichess_position_grabber.py writes them) into the
+    self-supervised positions table, creating it if needed. FENs already in the table are skipped.
+    Reads in batches, so files of tens of millions of lines are fine. Returns how many rows were added.
+    """
+    _check_table_name(table)
+    create_ssl_table(db_name, table)
+    added = 0
+    with sqlite3.connect(f"{db_name}.db") as conn:
+        for filepath in filepaths:
+            source = os.path.basename(filepath)
+            print(f"Adding from {filepath}")
+            before = conn.total_changes
+            with open(filepath, "r", encoding="utf-8") as f:
+                batch: List[Tuple[str, str]] = []
+                for line in f:
+                    fen = line.strip()
+                    if not fen or fen.startswith("#"):
+                        continue
+                    batch.append((fen, source))
+                    if len(batch) >= batch_size:
+                        conn.executemany(f'INSERT INTO "{table}" (fen, source) VALUES (?, ?) ON CONFLICT(fen) DO NOTHING', batch)
+                        batch.clear()
+                if batch:
+                    conn.executemany(f'INSERT INTO "{table}" (fen, source) VALUES (?, ?) ON CONFLICT(fen) DO NOTHING', batch)
+            conn.commit()
+            file_added = conn.total_changes - before
+            added += file_added
+            print(f"  {file_added:,} new positions")
+    return added
 
 
 def add_historical_labels(db_name: str, filepaths: List[str]) -> None:

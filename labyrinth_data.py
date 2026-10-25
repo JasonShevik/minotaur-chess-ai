@@ -7,9 +7,11 @@ DataLoader worker processes so the GPU never waits.
         positions, assigns each to train / val / test by a hash of the position, and writes one
         memory-mappable file per split, plus engine labels when the source has them (for the probe
         benchmark only, never for training). Two sources feed it:
-          build_position_cache(db_path, cache_dir)        minotaur_data.db, with its engine labels
-          build_position_cache_from_file(path, cache_dir) a text file with one FEN per line
-        (python labyrinth_data.py build --db ... / --fens ...). Because the split depends only on the
+          build_position_cache(db_path, cache_dir, table)  a table of the database: the self-supervised
+                                                           positions (db_tools.SSL_TABLE), or the
+                                                           engine-labeled table with its labels
+          build_position_cache_from_file(path, cache_dir)  a text file with one FEN per line
+        (python labyrinth_data.py build --db ... [--table ...] / --fens ...). Because the split depends only on the
         position, a position lands in the same split whichever source it comes from, so positions held
         out for evaluation in one dataset stay held out of training in another.
 
@@ -215,6 +217,9 @@ def build_position_cache_from_fens(
     return meta
 
 
+LABEL_COLUMNS = ("is_analyzed", "engine_name", "depth", "score", "is_forced_checkmate", "best_move")
+
+
 def build_position_cache(
     db_path: str = DEFAULT_DB,
     cache_dir: str = DEFAULT_CACHE_DIR,
@@ -222,24 +227,38 @@ def build_position_cache(
     test_fraction: float = 0.01,
     limit: Optional[int] = None,
     verbose: bool = True,
+    table: str = TABLE,
 ) -> Dict[str, object]:
-    """The position cache of minotaur_data.db, with the engine labels of its analyzed rows (read first,
-    so a duplicate keeps its label)."""
+    """
+    The position cache of one table of the database. A table with engine-label columns (the default
+    "960_position_data") contributes its analyzed rows' labels, read first so a duplicate keeps its
+    label; any other table with a fen column (such as db_tools.SSL_TABLE) contributes positions only.
+    """
+    if not table or '"' in table:
+        raise ValueError(f"invalid table name: {table!r}")
     t0 = time.time()
     uri = "file:" + os.path.abspath(db_path).replace("\\", "/") + "?mode=ro"
     with sqlite3.connect(uri, uri=True) as conn:
-        query = (f'SELECT fen, is_analyzed, engine_name, depth, score, is_forced_checkmate, best_move '
-                 f'FROM "{TABLE}" ORDER BY is_analyzed DESC')
+        columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+        if "fen" not in columns:
+            raise ValueError(f'table "{table}" in {db_path} does not exist or has no fen column')
+        labeled = set(LABEL_COLUMNS) <= columns
+        if labeled:
+            query = f'SELECT fen, {", ".join(LABEL_COLUMNS)} FROM "{table}" ORDER BY is_analyzed DESC'
+        else:
+            query = f'SELECT fen FROM "{table}"'
         if limit is not None:
             query += f" LIMIT {int(limit)}"
         rows = conn.execute(query).fetchall()
     if verbose:
-        print(f"read {len(rows):,} rows in {time.time() - t0:.1f}s; normalizing...")
-    labels = [EngineLabel(engine_name or "", int(depth or 0), str(score), bool(is_mate), best_move or "")
-              if is_analyzed else None
-              for _, is_analyzed, engine_name, depth, score, is_mate, best_move in rows]
+        print(f"read {len(rows):,} rows from {table} in {time.time() - t0:.1f}s; normalizing...")
+    labels = None
+    if labeled:
+        labels = [EngineLabel(engine_name or "", int(depth or 0), str(score), bool(is_mate), best_move or "")
+                  if is_analyzed else None
+                  for _, is_analyzed, engine_name, depth, score, is_mate, best_move in rows]
     return build_position_cache_from_fens((r[0] for r in rows), cache_dir, labels, val_fraction, test_fraction,
-                                          source=os.path.abspath(db_path), verbose=verbose)
+                                          source=f"{os.path.abspath(db_path)}:{table}", verbose=verbose)
 
 
 def build_position_cache_from_file(
@@ -630,6 +649,8 @@ if __name__ == "__main__":
     source = b.add_mutually_exclusive_group()
     source.add_argument("--db", default=None, help=f"SQLite database (default {DEFAULT_DB})")
     source.add_argument("--fens", default=None, help="text file with one FEN per line")
+    b.add_argument("--table", default=TABLE, help=f'database table (default "{TABLE}"; '
+                                                   'the self-supervised positions are in "ssl_positions")')
     b.add_argument("--out", default=DEFAULT_CACHE_DIR)
     b.add_argument("--val", type=float, default=0.01)
     b.add_argument("--test", type=float, default=0.01)
@@ -644,6 +665,6 @@ if __name__ == "__main__":
     if args.command == "build" and args.fens:
         build_position_cache_from_file(args.fens, args.out, args.val, args.test)
     elif args.command == "build":
-        build_position_cache(args.db or DEFAULT_DB, args.out, args.val, args.test, args.limit)
+        build_position_cache(args.db or DEFAULT_DB, args.out, args.val, args.test, args.limit, table=args.table)
     else:
         _benchmark(args.cache, args.split, args.batch_size, args.workers, args.batches)
