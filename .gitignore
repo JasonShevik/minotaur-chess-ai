@@ -22,6 +22,8 @@ lichess-games/
 artifacts/
 dehb_unpool_out*/
 labyrinth_data_cache/
+dehb_jepa_out*/
+runs/
 
 # ----- Python -----
 __pycache__/
