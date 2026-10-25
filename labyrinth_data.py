@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import random
@@ -137,6 +138,38 @@ class EngineLabel(NamedTuple):
     best_move: str             # UCI
 
 
+def _position_digest(norm: str) -> int:
+    """64-bit hash of the position key: the same digest split_of uses, so it also decides the split."""
+    return int.from_bytes(hashlib.blake2b(position_key(norm).encode(), digest_size=8).digest(), "big")
+
+
+def _normalize_chunk(job: Tuple[List[str], float, float]) -> List[Optional[Tuple[str, int, int]]]:
+    """For each FEN: None if invalid, else (normalized FEN, position digest, split index)."""
+    fens, val_fraction, test_fraction = job
+    out: List[Optional[Tuple[str, int, int]]] = []
+    for fen in fens:
+        norm = normalize_fen(fen.strip())
+        if norm is None:
+            out.append(None)
+            continue
+        digest = _position_digest(norm)
+        u = digest / 2 ** 64
+        split = 2 if u < test_fraction else 1 if u < test_fraction + val_fraction else 0
+        out.append((norm, digest, split))
+    return out
+
+
+def _chunks(fens: Iterable[str], size: int) -> Iterator[List[str]]:
+    chunk: List[str] = []
+    for fen in fens:
+        chunk.append(fen)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
 def build_position_cache_from_fens(
     fens: Iterable[str],
     cache_dir: str = DEFAULT_CACHE_DIR,
@@ -145,6 +178,8 @@ def build_position_cache_from_fens(
     test_fraction: float = 0.01,
     source: str = "",
     verbose: bool = True,
+    workers: int = 1,
+    chunk_size: int = 20_000,
 ) -> Dict[str, object]:
     """
     Normalize every FEN, drop invalid positions and duplicates (the same position with different move
@@ -154,50 +189,133 @@ def build_position_cache_from_fens(
         meta.json               the source, the fractions used and the counts
     labels: one EngineLabel or None per FEN, in the same order, when the source has engine analysis.
     Returns the contents of meta.json.
+
+    Streaming, so it scales to hundreds of millions of positions: FENs are normalized in `workers`
+    processes, chunk by chunk, and written straight to temporary per-split files along with a 64-bit
+    hash of each position. Duplicates are then found from the hashes alone (8 bytes per position, about
+    25 bytes at peak while they are sorted), and the kept positions are copied into the final files. Two
+    different positions share a 64-bit hash with probability about n^2 / 2^65 (under 0.1% for 150
+    million positions, and then only one position would be dropped). Labels are held in memory, which
+    suits sources whose labeled positions number in the millions or fewer.
     """
     t0 = time.time()
-    seen: set = set()
-    positions: Dict[str, List[str]] = {s: [] for s in SPLITS}
-    label_cols: Dict[str, Dict[str, list]] = {s: {k: [] for k in LabeledPositions._fields} for s in SPLITS}
-    read = invalid = duplicates = 0
-    label_iter = iter(labels) if labels is not None else None
-    for fen in fens:
-        read += 1
-        label = next(label_iter) if label_iter is not None else None
-        norm = normalize_fen(fen.strip())
-        if norm is None:
-            invalid += 1
-            continue
-        key = position_key(norm)
-        if key in seen:
-            duplicates += 1
-            continue
-        seen.add(key)
-        split = split_of(norm, val_fraction, test_fraction)
-        positions[split].append(norm)
-        if label is not None:
-            col = label_cols[split]
-            col["fen"].append(norm)
-            col["engine_name"].append(label.engine_name)
-            col["depth"].append(label.depth)
-            col["score"].append(label.score)
-            col["is_forced_checkmate"].append(label.is_forced_checkmate)
-            col["best_move"].append(label.best_move)
-    labels = label_cols
-
     os.makedirs(cache_dir, exist_ok=True)
-    for split in SPLITS:
-        np.save(os.path.join(cache_dir, f"positions_{split}.npy"), np.array(positions[split], dtype=np.bytes_))
-        lab = labels[split]
+    tmp_dir = os.path.join(cache_dir, "_building")
+    os.makedirs(tmp_dir, exist_ok=True)
+    text_files = [open(os.path.join(tmp_dir, f"{name}.txt"), "w", encoding="utf-8", newline="\n") for name in SPLITS]
+    hash_files = [open(os.path.join(tmp_dir, f"{name}.u64"), "wb") for name in SPLITS]
+    counts = [0, 0, 0]                  # rows written to each split's temporary file
+    widths = [1, 1, 1]                  # longest FEN in each split, in bytes
+    pending_labels: List[List[Tuple[int, str, EngineLabel]]] = [[], [], []]   # (row in split, fen, label)
+    read = invalid = 0
+
+    label_iter = iter(labels) if labels is not None else None
+    chunk_labels: List[List[Optional[EngineLabel]]] = []
+
+    def jobs() -> Iterator[Tuple[List[str], float, float]]:
+        for chunk in _chunks(fens, chunk_size):
+            chunk_labels.append([next(label_iter) for _ in chunk] if label_iter is not None else [])
+            yield chunk, val_fraction, test_fraction
+
+    def results() -> Iterator[List[Optional[Tuple[str, int, int]]]]:
+        """Chunk results in input order, so first occurrences stay first. The input is read here, in the
+        main thread (a SQLite cursor must be), with at most 2 * workers chunks in flight, so memory stays
+        bounded however large the input."""
+        if workers <= 1:
+            yield from map(_normalize_chunk, jobs())
+            return
+        from collections import deque
+        from multiprocessing import Pool
+        pool = Pool(workers)
+        in_flight: deque = deque()
+        try:
+            for job in jobs():
+                in_flight.append(pool.apply_async(_normalize_chunk, (job,)))
+                if len(in_flight) >= 2 * workers:
+                    yield in_flight.popleft().get()
+            while in_flight:
+                yield in_flight.popleft().get()
+        finally:
+            pool.terminate()
+            pool.join()
+
+    try:
+        for n_chunk, result in enumerate(results()):
+            labs = chunk_labels.pop(0)
+            hashes: List[List[int]] = [[], [], []]
+            for i, item in enumerate(result):
+                read += 1
+                if item is None:
+                    invalid += 1
+                    continue
+                norm, digest, split = item
+                text_files[split].write(norm + "\n")
+                hashes[split].append(digest)
+                widths[split] = max(widths[split], len(norm))
+                if labs and labs[i] is not None:
+                    pending_labels[split].append((counts[split], norm, labs[i]))
+                counts[split] += 1
+            for split in range(3):
+                if hashes[split]:
+                    np.asarray(hashes[split], dtype=np.uint64).tofile(hash_files[split])
+            if verbose and n_chunk % 50 == 49:
+                print(f"  {read:,} read, {sum(counts):,} valid ({time.time() - t0:.0f}s)")
+    finally:
+        for f in text_files + hash_files:
+            f.close()
+
+    kept_counts, label_counts, duplicates = {}, {}, 0
+    for split, name in enumerate(SPLITS):
+        hashes = np.fromfile(os.path.join(tmp_dir, f"{name}.u64"), dtype=np.uint64)
+        if hashes.size:
+            _, first = np.unique(hashes, return_index=True)       # index of each position's first occurrence
+            del _
+            keep = np.zeros(hashes.size, dtype=bool)
+            keep[first] = True
+            del first
+        else:
+            keep = np.zeros(0, dtype=bool)
+        del hashes
+        n_keep = int(keep.sum())
+        duplicates += counts[split] - n_keep
+        kept_counts[name] = n_keep
+
+        out_path = os.path.join(cache_dir, f"positions_{name}.npy")
+        if n_keep == 0:
+            np.save(out_path, np.array([], dtype=np.bytes_))
+        else:
+            out = np.lib.format.open_memmap(out_path, mode="w+", dtype=f"S{widths[split]}", shape=(n_keep,))
+            j = 0
+            buffer: List[bytes] = []
+            with open(os.path.join(tmp_dir, f"{name}.txt"), encoding="utf-8") as f:
+                for row, line in enumerate(f):
+                    if keep[row]:
+                        buffer.append(line.rstrip("\n").encode("utf-8"))
+                        if len(buffer) >= 100_000:
+                            out[j:j + len(buffer)] = buffer
+                            j += len(buffer)
+                            buffer.clear()
+            if buffer:
+                out[j:j + len(buffer)] = buffer
+                j += len(buffer)
+            out.flush()
+            del out
+
+        lab = [(fen, label) for row, fen, label in pending_labels[split] if keep[row]]
+        label_counts[name] = len(lab)
         np.savez(
-            os.path.join(cache_dir, f"labels_{split}.npz"),
-            fen=np.array(lab["fen"], dtype=np.bytes_),
-            engine_name=np.array(lab["engine_name"], dtype=np.bytes_),
-            depth=np.array(lab["depth"], dtype=np.int32),
-            score=np.array(lab["score"], dtype=np.bytes_),
-            is_forced_checkmate=np.array(lab["is_forced_checkmate"], dtype=bool),
-            best_move=np.array(lab["best_move"], dtype=np.bytes_),
+            os.path.join(cache_dir, f"labels_{name}.npz"),
+            fen=np.array([f for f, _ in lab], dtype=np.bytes_),
+            engine_name=np.array([l.engine_name for _, l in lab], dtype=np.bytes_),
+            depth=np.array([l.depth for _, l in lab], dtype=np.int32),
+            score=np.array([l.score for _, l in lab], dtype=np.bytes_),
+            is_forced_checkmate=np.array([l.is_forced_checkmate for _, l in lab], dtype=bool),
+            best_move=np.array([l.best_move for _, l in lab], dtype=np.bytes_),
         )
+        os.remove(os.path.join(tmp_dir, f"{name}.txt"))
+        os.remove(os.path.join(tmp_dir, f"{name}.u64"))
+    os.rmdir(tmp_dir)
+
     meta = {
         "source": source,
         "val_fraction": val_fraction,
@@ -205,8 +323,8 @@ def build_position_cache_from_fens(
         "rows_read": read,
         "invalid": invalid,
         "duplicates": duplicates,
-        "positions": {s: len(positions[s]) for s in SPLITS},
-        "labeled": {s: len(labels[s]["fen"]) for s in SPLITS},
+        "positions": kept_counts,
+        "labeled": label_counts,
         "built_unix": time.time(),
     }
     with open(os.path.join(cache_dir, "meta.json"), "w") as f:
@@ -228,17 +346,19 @@ def build_position_cache(
     limit: Optional[int] = None,
     verbose: bool = True,
     table: str = TABLE,
+    workers: int = 1,
 ) -> Dict[str, object]:
     """
     The position cache of one table of the database. A table with engine-label columns (the default
     "960_position_data") contributes its analyzed rows' labels, read first so a duplicate keeps its
     label; any other table with a fen column (such as db_tools.SSL_TABLE) contributes positions only.
+    Rows are streamed from the database, never all held in memory.
     """
     if not table or '"' in table:
         raise ValueError(f"invalid table name: {table!r}")
-    t0 = time.time()
     uri = "file:" + os.path.abspath(db_path).replace("\\", "/") + "?mode=ro"
-    with sqlite3.connect(uri, uri=True) as conn:
+    conn = sqlite3.connect(uri, uri=True)
+    try:
         columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
         if "fen" not in columns:
             raise ValueError(f'table "{table}" in {db_path} does not exist or has no fen column')
@@ -249,16 +369,21 @@ def build_position_cache(
             query = f'SELECT fen FROM "{table}"'
         if limit is not None:
             query += f" LIMIT {int(limit)}"
-        rows = conn.execute(query).fetchall()
-    if verbose:
-        print(f"read {len(rows):,} rows from {table} in {time.time() - t0:.1f}s; normalizing...")
-    labels = None
-    if labeled:
-        labels = [EngineLabel(engine_name or "", int(depth or 0), str(score), bool(is_mate), best_move or "")
-                  if is_analyzed else None
-                  for _, is_analyzed, engine_name, depth, score, is_mate, best_move in rows]
-    return build_position_cache_from_fens((r[0] for r in rows), cache_dir, labels, val_fraction, test_fraction,
-                                          source=f"{os.path.abspath(db_path)}:{table}", verbose=verbose)
+        if verbose:
+            print(f"reading {table} from {db_path}...")
+        # One pass over the cursor feeds both the FENs and their labels; tee buffers at most one chunk
+        rows_for_fens, rows_for_labels = itertools.tee(conn.execute(query))
+        fens = (row[0] for row in rows_for_fens)
+        labels = None
+        if labeled:
+            labels = (EngineLabel(engine_name or "", int(depth or 0), str(score), bool(is_mate), best_move or "")
+                      if is_analyzed else None
+                      for _, is_analyzed, engine_name, depth, score, is_mate, best_move in rows_for_labels)
+        return build_position_cache_from_fens(fens, cache_dir, labels, val_fraction, test_fraction,
+                                              source=f"{os.path.abspath(db_path)}:{table}", verbose=verbose,
+                                              workers=workers)
+    finally:
+        conn.close()
 
 
 def build_position_cache_from_file(
@@ -267,6 +392,7 @@ def build_position_cache_from_file(
     val_fraction: float = 0.01,
     test_fraction: float = 0.01,
     verbose: bool = True,
+    workers: int = 1,
 ) -> Dict[str, object]:
     """The position cache of a text file with one FEN per line (blank lines and lines starting with # are skipped)."""
     def lines() -> Iterator[str]:
@@ -276,7 +402,7 @@ def build_position_cache_from_file(
                 if line and not line.startswith("#"):
                     yield line
     return build_position_cache_from_fens(lines(), cache_dir, None, val_fraction, test_fraction,
-                                          source=os.path.abspath(path), verbose=verbose)
+                                          source=os.path.abspath(path), verbose=verbose, workers=workers)
 
 
 def load_labels(cache_dir: str, split: str) -> LabeledPositions:
@@ -655,6 +781,8 @@ if __name__ == "__main__":
     b.add_argument("--val", type=float, default=0.01)
     b.add_argument("--test", type=float, default=0.01)
     b.add_argument("--limit", type=int, default=None)
+    b.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)),
+                   help="processes normalizing positions")
     m = sub.add_parser("bench", help="measure how many positions per second the loader prepares")
     m.add_argument("--cache", default=DEFAULT_CACHE_DIR)
     m.add_argument("--split", default="train")
@@ -663,8 +791,9 @@ if __name__ == "__main__":
     m.add_argument("--batches", type=int, default=20)
     args = parser.parse_args()
     if args.command == "build" and args.fens:
-        build_position_cache_from_file(args.fens, args.out, args.val, args.test)
+        build_position_cache_from_file(args.fens, args.out, args.val, args.test, workers=args.workers)
     elif args.command == "build":
-        build_position_cache(args.db or DEFAULT_DB, args.out, args.val, args.test, args.limit, table=args.table)
+        build_position_cache(args.db or DEFAULT_DB, args.out, args.val, args.test, args.limit, table=args.table,
+                             workers=args.workers)
     else:
         _benchmark(args.cache, args.split, args.batch_size, args.workers, args.batches)

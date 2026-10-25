@@ -264,6 +264,64 @@ def test_loader_is_reproducible_and_epochs_differ():
         assert pickle.loads(pickle.dumps(ds))._positions is None
 
 
+def test_streaming_builder_matches_a_simple_reference():
+    """
+    The streaming, parallel builder must give exactly what the obvious in-memory algorithm gives:
+    normalize, keep the first occurrence of each position, split by hash, keep the kept rows' labels.
+    Small chunks exercise many chunks and the order of results from several workers.
+    """
+    boards = random_positions(25, seed=11)
+    fens = [b.fen(en_passant="xfen") for b in boards]
+    rows = []
+    for i, fen in enumerate(fens):
+        rows.append(fen)
+        if i % 4 == 0:                                   # the same position again, other move counters
+            rows.append(" ".join(fen.split()[:4] + ["9", "99"]))
+        if i % 9 == 0:
+            rows.append("garbage " + str(i))
+    labels = [ld.EngineLabel("Stockfish 19", 20, str(i), False, "e2e4") if i % 3 == 0 else None
+              for i in range(len(rows))]
+
+    expected = {s: [] for s in ld.SPLITS}
+    expected_labels = {s: [] for s in ld.SPLITS}
+    seen = set()
+    for row, label in zip(rows, labels):
+        norm = ld.normalize_fen(row)
+        if norm is None or ld.position_key(norm) in seen:
+            continue
+        seen.add(ld.position_key(norm))
+        split = ld.split_of(norm, 0.2, 0.2)
+        expected[split].append(norm)
+        if label is not None:
+            expected_labels[split].append((norm, label.score))
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        for workers in (1, 2):
+            cache = os.path.join(tmp, f"w{workers}")
+            meta = ld.build_position_cache_from_fens(rows, cache, labels, 0.2, 0.2, verbose=False,
+                                                     workers=workers, chunk_size=7)
+            assert not os.path.exists(os.path.join(cache, "_building")), "temporary files left behind"
+            assert meta["invalid"] == sum(1 for r in rows if ld.normalize_fen(r) is None)
+            assert meta["rows_read"] == len(rows)
+            for split in ld.SPLITS:
+                ds = ld.PositionDataset(cache, split)
+                assert [ds.fen(i) for i in range(len(ds))] == expected[split], (workers, split)
+                lab = ld.load_labels(cache, split)
+                assert list(zip(lab.fen, lab.score)) == expected_labels[split], (workers, split)
+
+
+def test_database_source_streams_with_several_workers():
+    """The database cursor is read in the main thread even when workers normalize the positions."""
+    fens = [b.fen(en_passant="xfen") for b in random_positions(15, seed=12)]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = os.path.join(tmp, "test.db")
+        make_database(db, fens)
+        one = ld.build_position_cache(db, os.path.join(tmp, "one"), 0.2, 0.2, verbose=False, workers=1)
+        two = ld.build_position_cache(db, os.path.join(tmp, "two"), 0.2, 0.2, verbose=False, workers=2)
+        for key in ("rows_read", "invalid", "duplicates", "positions", "labeled"):
+            assert one[key] == two[key], key
+
+
 # ##### ##### ##### ##### #####
 #   Runner
 
