@@ -124,12 +124,19 @@ def check_memory_budget(peak_bytes: int, total_bytes: int, budget: float) -> Non
 @torch.no_grad()
 def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optional[ld.JEPALoader],
              run: RunConfig, device: torch.device) -> Dict[str, float]:
-    """Label-free metrics of the target encoder on fixed validation positions, and validation losses."""
+    """
+    Label-free metrics on fixed validation positions, of the target encoder (the plain keys: the encoder
+    that is kept) and of the online encoder ("online_" keys: over short runs the moving-average target
+    still lags far behind it), and validation losses.
+    """
     was_training = model.training
     model.eval()
     mask = ld.MaskConfig(run.eval_mask_min_ratio, run.eval_mask_max_ratio, 1) if run.eval_mask_max_ratio > 0 else None
     metrics = lje.representation_report(model.target, eval_fens, samples=run.eval_samples, mask_config=mask,
                                         seed=run.seed)
+    online = lje.representation_report(model.encoder, eval_fens, samples=run.eval_samples, mask_config=mask,
+                                       seed=run.seed)
+    metrics.update({f"online_{k}": v for k, v in online.items()})
     if val_loader is not None:
         val_loader.set_epoch(0)
         gen = torch.Generator(device=device).manual_seed(run.seed + 12345)
@@ -231,6 +238,8 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
         metrics = evaluate(model, eval_fens, val_loader, run, device)
         record({"step": step, "eval": metrics})
         log(f"[{step:>7}] eval  lidar={metrics['lidar']:.1f}  rankme={metrics['rankme']:.1f}  "
+            f"rankme_centered={metrics['rankme_centered']:.1f}  online_lidar={metrics['online_lidar']:.1f}  "
+            f"online_rankme_centered={metrics['online_rankme_centered']:.1f}  "
             f"self_consistency={metrics['self_consistency']:.3f}  "
             f"val_mask={metrics.get('val_loss_mask', float('nan')):.4f}  val_next={metrics.get('val_loss_next', float('nan')):.4f}")
         if metrics["lidar"] > best_lidar:
@@ -285,7 +294,8 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                 entry["gpu_peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
             record(entry)
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
-                f"z_std={entry['z_std']:.3f} lr={entry['lr']:.2e} {entry['positions_per_s']:.0f} pos/s")
+                f"reg={entry['anticollapse']:.3f} z_std={entry['z_std']:.3f} z_cos={entry['z_mean_cosine']:.3f} "
+                f"lr={entry['lr']:.2e} {entry['positions_per_s']:.0f} pos/s")
             t_last, positions_since = now, 0
 
         if run.eval_every and step % run.eval_every == 0 and step < run.total_steps:
@@ -335,7 +345,9 @@ def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
                 return ObjectiveResult(metric=0.0, info={"failed": "diverged", "error": str(e)})
             final = result["final"]
             return ObjectiveResult(metric=float(final["lidar"]), info={
-                "rankme": final["rankme"], "self_consistency": final["self_consistency"],
+                "rankme": final["rankme"], "rankme_centered": final.get("rankme_centered"),
+                "online_lidar": final.get("online_lidar"),
+                "self_consistency": final["self_consistency"],
                 "val_loss_mask": final.get("val_loss_mask"), "val_loss_next": final.get("val_loss_next"),
                 "batch_size": batch_size, "steps": result["steps"]})
         return ObjectiveResult(metric=0.0, info={"failed": "memory"})
@@ -370,7 +382,8 @@ def _plot(history: List[Dict[str, Any]], out_dir: str) -> None:
     axes[0].plot([h["step"] for h in steps], [h["loss_next"] for h in steps], label="next position")
     axes[0].set_title("Training losses"); axes[0].set_xlabel("step"); axes[0].legend()
     axes[1].plot([h["step"] for h in evals], [h["eval"]["lidar"] for h in evals], marker="o", label="LiDAR")
-    axes[1].plot([h["step"] for h in evals], [h["eval"]["rankme"] for h in evals], marker="o", label="RankMe")
+    axes[1].plot([h["step"] for h in evals], [h["eval"]["rankme_centered"] for h in evals], marker="o",
+                 label="RankMe (centred)")
     axes[1].set_title("Representation rank (target encoder)"); axes[1].set_xlabel("step"); axes[1].legend()
     axes[2].plot([h["step"] for h in evals], [h["eval"]["self_consistency"] for h in evals], marker="o")
     axes[2].set_title("Self-consistency (lower = more consistent)"); axes[2].set_xlabel("step")

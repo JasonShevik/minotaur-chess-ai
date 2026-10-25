@@ -183,12 +183,51 @@ def test_representation_report_runs():
         cfg = small_config(variant)
         enc = lje.LabyrinthEncoder(cfg)
         report = lje.representation_report(enc, FENS * 4, samples=3)
-        assert set(report) == {"lidar", "rankme", "rankme_single_sample", "self_consistency"}
+        assert set(report) == {"lidar", "rankme", "rankme_centered", "rankme_single_sample", "self_consistency"}
         assert all(v == v for v in report.values())
         if variant == "squares":      # deterministic encoder: every sample of a position is identical
             assert report["self_consistency"] < 1e-5
         masked = lje.representation_report(enc, FENS * 4, samples=2, mask_config=ld.MaskConfig(0.05, 0.1))
         assert masked["self_consistency"] > 0
+
+
+def test_anticollapse_regularizers():
+    g = lambda seed: torch.Generator().manual_seed(seed)
+    torch.manual_seed(0)
+    gauss = torch.randn(256, 64)
+    collapsed = 0.5 + 0.01 * torch.randn(256, 64)
+    shifted = torch.randn(256, 64) + 2.0
+    # SIGReg: near its sampling-noise floor for a standard normal, large for anything else
+    assert float(lje.sigreg(gauss, g(1))) < 3
+    for bad in (collapsed, shifted, 0.1 * torch.randn(256, 64)):
+        assert float(lje.sigreg(bad, g(1))) > 50
+    # new random directions each call, the same ones for the same generator state
+    assert float(lje.sigreg(gauss, g(1))) == float(lje.sigreg(gauss, g(1)))
+    assert float(lje.sigreg(gauss, g(1))) != float(lje.sigreg(gauss, g(2)))
+    # VICReg: the variance hinge fires on collapse, not on a standard normal (it ignores a shared offset)
+    assert float(lje.vicreg_terms(collapsed)[0]) > 0.9 and float(lje.vicreg_terms(gauss)[0]) < 0.05
+    assert float(lje.vicreg_terms(shifted)[0]) < 0.05
+    # both are differentiable
+    for fn in (lambda z: lje.sigreg(z, g(0)), lambda z: sum(lje.vicreg_terms(z))):
+        z = collapsed.clone().requires_grad_(True)
+        fn(z).backward()
+        assert float(z.grad.abs().sum()) > 0
+
+
+def test_each_anticollapse_option_trains_the_encoder():
+    for option in lje.ANTICOLLAPSE:
+        for squares in (False, True):
+            cfg = small_config("registers", anticollapse=option, anticollapse_squares=squares)
+            model = lje.LabyrinthJEPA(cfg)
+            losses = model.losses(make_batch(cfg), rng=torch.Generator().manual_seed(0))
+            assert torch.isfinite(losses.total) and "z_mean_cosine" in losses.stats
+            if option == "none":
+                assert float(losses.anticollapse) == 0
+                continue
+            losses.anticollapse.backward()
+            assert any(p.grad is not None and float(p.grad.abs().sum()) > 0
+                       for p in model.encoder.readout_proj.parameters()), option
+            assert all(p.grad is None for p in model.target.parameters())
 
 
 def test_dehb_search_space_samples_build():

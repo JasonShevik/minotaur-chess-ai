@@ -26,6 +26,16 @@ The encoder:
     readout    readout_queries learned queries attend over the final tokens; their outputs are
                concatenated and projected to z (z_dim)
 
+Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
+positions get different vectors: the untrained encoder already maps every position to nearly the same
+z, and the predictors then win by learning that shared vector. An anti-collapse term on z fixes this:
+  "sigreg"  LeJEPA's SIGReg (Balestriero & LeCun, 2025), the default: random 1-D projections of the
+            batch of embeddings are each tested against a standard normal (Epps-Pulley statistic), which
+            pushes the embeddings towards an isotropic Gaussian, with no shared component and every
+            direction used;
+  "vicreg"  VICReg's variance and covariance terms: every dimension keeps a spread of at least 1 across
+            the batch, and dimensions are decorrelated.
+
 The three variants share everything else, so comparing them answers whether the unpooling layers
 earn their place. The unpooling decisions are sampled everywhere, in the target encoder too; their
 log-probability is returned per position and trained with REINFORCE (reward: minus that
@@ -58,6 +68,7 @@ import guo_et_al_unpooling_v2 as unpool
 import labyrinth_data as ld
 
 TOKEN_VARIANTS = ("squares", "registers", "unpool")
+ANTICOLLAPSE = ("sigreg", "vicreg", "none")
 
 
 # ##### ##### ##### ##### #####
@@ -112,6 +123,16 @@ class JEPAConfig:
     mask_weight: float = 1.0
     next_weight: float = 1.0
     loss_type: str = "smooth_l1"     # "smooth_l1" | "mse", on layer-normalized targets
+
+    # ----- Anti-collapse regularization on z -----
+    anticollapse: str = "sigreg"     # "sigreg" | "vicreg" | "none"
+    sigreg_weight: float = 0.05      # LeJEPA's default lambda
+    vicreg_weight: float = 1.0       # VICReg's variance weight equals its invariance weight; our losses play that role
+    anticollapse_squares: bool = False   # also regularize the square tokens (not only z)
+    sigreg_slices: int = 256         # random 1-D projections per step
+    sigreg_points: int = 17          # quadrature points of the Epps-Pulley integral on [0, sigreg_t_max]
+    sigreg_t_max: float = 3.0
+    vicreg_cov_ratio: float = 0.04   # covariance weight relative to the variance term (VICReg's 1 : 25)
 
     # ----- Unpooling decisions (REINFORCE) -----
     unpool_rl: bool = True           # False freezes the decision policy; everything else still trains
@@ -171,6 +192,8 @@ class JEPAConfig:
             raise ValueError("the registers variant needs num_registers >= 1")
         if self.loss_type not in ("smooth_l1", "mse"):
             raise ValueError("loss_type must be smooth_l1 or mse")
+        if self.anticollapse not in ANTICOLLAPSE:
+            raise ValueError(f"anticollapse must be one of {ANTICOLLAPSE}")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
             raise ValueError("need 0 <= mask_min_ratio <= mask_max_ratio <= 1")
 
@@ -374,6 +397,50 @@ class NextPredictor(nn.Module):
 
 
 # ##### ##### ##### ##### #####
+#       Anti-collapse regularizers
+
+
+def sigreg(z: torch.Tensor, generator: Optional[torch.Generator] = None, slices: int = 256, points: int = 17,
+           t_max: float = 3.0) -> torch.Tensor:
+    """
+    SIGReg, the regularizer of LeJEPA (Balestriero & LeCun, 2025). z [N, D] is projected onto `slices`
+    random unit directions; each 1-D projection is compared with a standard normal by the Epps-Pulley
+    statistic, N times the integral of |empirical characteristic function - exp(-t^2/2)|^2 under a
+    Gaussian window, computed with the trapezoid rule on [0, t_max] (the integrand is even). The mean
+    over directions is 0 for an isotropic standard Gaussian and grows with any shared offset, collapsed
+    or unused direction, or non-Gaussian shape. New directions every call.
+    """
+    N, D = z.shape
+    dirs = torch.randn(D, slices, device=z.device, dtype=z.dtype, generator=generator)
+    dirs = dirs / dirs.norm(dim=0, keepdim=True)
+    proj = z @ dirs                                                     # [N, slices]
+    t = torch.linspace(0, t_max, points, device=z.device, dtype=z.dtype)
+    phi = torch.exp(-0.5 * t ** 2)                                      # characteristic function of N(0, 1)
+    dt = t_max / (points - 1)
+    weights = torch.full_like(t, 2 * dt)                                # trapezoid on [0, t_max], doubled for [-t_max, t_max]
+    weights[0] = weights[-1] = dt
+    weights = weights * phi                                             # Gaussian window
+    xt = proj.unsqueeze(-1) * t                                         # [N, slices, points]
+    err = (torch.cos(xt).mean(0) - phi) ** 2 + torch.sin(xt).mean(0) ** 2
+    return (err @ weights).mean() * N
+
+
+def vicreg_terms(z: torch.Tensor, eps: float = 1e-4) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    VICReg's (Bardes, Ponce & LeCun, 2022) variance and covariance terms for z [N, D]: the mean hinge
+    loss keeping every dimension's standard deviation across the batch at 1 or more, and the sum of
+    squared off-diagonal covariances divided by D.
+    """
+    N, D = z.shape
+    z = z - z.mean(0)
+    std = torch.sqrt(z.var(0) + eps)
+    variance = F.relu(1 - std).mean()
+    cov = (z.t() @ z) / max(1, N - 1)
+    off_diagonal = cov - torch.diag(torch.diag(cov))
+    return variance, off_diagonal.pow(2).sum() / D
+
+
+# ##### ##### ##### ##### #####
 #       The JEPA
 
 
@@ -383,6 +450,7 @@ class JEPALosses:
     mask: torch.Tensor          # mean masked-square loss
     next: torch.Tensor          # mean next-position loss
     rl: torch.Tensor            # REINFORCE + baseline + entropy terms (0 without unpooling or with unpool_rl off)
+    anticollapse: torch.Tensor  # the SIGReg / VICReg term (0 with anticollapse = "none")
     stats: Dict[str, float]     # diagnostics for logging
 
 
@@ -459,6 +527,26 @@ class LabyrinthJEPA(nn.Module):
 
         total = c.mask_weight * mask_loss + c.next_weight * next_loss
 
+        # ---- anti-collapse regularization on the online encoder's embeddings ----
+        anticollapse = total.new_zeros(())
+        if c.anticollapse != "none":
+            embeddings = [ctx_masked.z] + ([ctx_full.z] if ctx_full is not None else [])
+            if c.anticollapse_squares:
+                squares = ctx_masked.squares.reshape(-1, c.d_model)
+                if squares.size(0) > 4096:     # a random subset keeps the cost bounded
+                    keep = torch.randperm(squares.size(0), device=squares.device, generator=rng)[:4096]
+                    squares = squares[keep]
+                embeddings.append(squares)
+            terms = []
+            for e in embeddings:
+                if c.anticollapse == "sigreg":
+                    terms.append(sigreg(e, rng, c.sigreg_slices, c.sigreg_points, c.sigreg_t_max))
+                else:
+                    variance, covariance = vicreg_terms(e)
+                    terms.append(variance + c.vicreg_cov_ratio * covariance)
+            anticollapse = torch.stack(terms).mean()
+            total = total + (c.sigreg_weight if c.anticollapse == "sigreg" else c.vicreg_weight) * anticollapse
+
         # ---- unpooling decisions: REINFORCE with learned baselines ----
         # A position involves thousands of decisions, so its log-probability and entropy are averaged per
         # decision: the same gradient direction, on a scale comparable with the prediction losses.
@@ -484,11 +572,13 @@ class LabyrinthJEPA(nn.Module):
             stats.update({
                 "loss_mask": float(mask_loss), "loss_next": float(next_loss),
                 "z_std": float(z.std(0).mean()),                         # falls toward 0 on collapse
+                "z_mean_cosine": float(F.cosine_similarity(z, z.mean(0, keepdim=True)).mean()),  # near 1: all z alike
+                "anticollapse": float(anticollapse),
                 "target_z_std": float(target_full.z.std(0).mean()),
                 "tokens": float(ctx_masked.num_tokens.float().mean()),
                 "unpool_entropy_per_decision": float((ctx_masked.entropy / ctx_masked.num_decisions.clamp_min(1)).mean()),
             })
-        return JEPALosses(total, mask_loss, next_loss, rl, stats)
+        return JEPALosses(total, mask_loss, next_loss, rl, anticollapse, stats)
 
 
 def build_jepa(config: JEPAConfig) -> LabyrinthJEPA:
@@ -602,6 +692,7 @@ def representation_report(encoder: LabyrinthEncoder, fens: Sequence[str], *, sam
     return {
         "lidar": lidar(z),
         "rankme": rankme(z.mean(1)),
+        "rankme_centered": rankme(z.mean(1) - z.mean(1).mean(0)),   # without the component every position shares
         "rankme_single_sample": rankme(z[:, 0]),
         "self_consistency": self_consistency(z),
     }
@@ -659,14 +750,20 @@ def build_jepa_configspace(seed: int = 0, include_training: bool = True):
     if include_training:
         rl_coef = U("rl_coef", lower=1e-3, upper=1e-1, log=True)
         rl_entropy = U("rl_entropy_coef", lower=1e-5, upper=1e-2, log=True)
+        anticollapse = H("anticollapse", choices=["sigreg", "vicreg"])
+        sigreg_weight = U("sigreg_weight", lower=0.005, upper=0.5, log=True)
+        vicreg_weight = U("vicreg_weight", lower=0.1, upper=10.0, log=True)
         cs.add_hyperparameters([
             U("lr", lower=5e-5, upper=1e-3, log=True),
             U("weight_decay", lower=1e-3, upper=0.2, log=True),
             U("ema_start", lower=0.99, upper=0.999),
             U("next_weight", lower=0.25, upper=4.0, log=True),   # relative to mask_weight = 1
+            anticollapse, sigreg_weight, vicreg_weight,
             rl_coef, rl_entropy,
         ])
         cs.add_conditions([
+            CS.EqualsCondition(sigreg_weight, anticollapse, "sigreg"),
+            CS.EqualsCondition(vicreg_weight, anticollapse, "vicreg"),
             CS.EqualsCondition(rl_coef, variant, "unpool"),
             CS.EqualsCondition(rl_entropy, variant, "unpool"),
         ])
