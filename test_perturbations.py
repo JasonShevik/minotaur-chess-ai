@@ -517,6 +517,25 @@ def test_sample_legal_move():
     assert cg.sample_legal_move("7k/8/6QK/8/8/8/8/8 b - - 0 1") is None          # stalemate
 
 
+def test_single_graph_merges_edge_types_without_losing_any():
+    """One edge per square pair whose multi-hot lists exactly the relation types joining it."""
+    for fen in BUILT_IN_FENS[:5]:
+        edges, x = cg.create_filled_chess_graphs(fen)
+        _, ei, ea = cg.to_single_graph(edges, x)
+        _, ei_typed, ea_typed = cg.to_single_graph(edges, x, merge=False)
+        expected = {}
+        for (a, b), onehot in zip(ei_typed.t().tolist(), ea_typed.tolist()):
+            prev = expected.get((a, b), [0.0] * cg.NUM_EDGE_TYPES)
+            expected[(a, b)] = [max(p, o) for p, o in zip(prev, onehot)]
+        got = {tuple(e): row for e, row in zip(ei.t().tolist(), ea.tolist())}
+        assert got == expected and ei.size(1) == len(expected) < ei_typed.size(1)
+        assert ei.t().tolist() == sorted(ei.t().tolist()), "merged edges are sorted by (from, to)"
+        assert all((b, a) in got for a, b in got), "still undirected"
+    xb, eib, eab, batch = cg.batch_graphs([cg.create_filled_chess_graphs(f) for f in BUILT_IN_FENS[:3]])
+    assert xb.shape == (192, cg.NUM_NODE_FEATURES) and batch.bincount().tolist() == [64] * 3
+    assert torch.equal(batch[eib[0]], batch[eib[1]]), "no edge between positions"
+
+
 # ##### ##### ##### ##### #####
 #   Runner
 

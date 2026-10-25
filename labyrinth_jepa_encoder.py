@@ -52,7 +52,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
-from torch_geometric.utils import coalesce
 
 import chess_graph as cg
 import guo_et_al_unpooling_v2 as unpool
@@ -80,8 +79,6 @@ class JEPAConfig:
     gat_heads: int = 4
     gat_layers: int = 3              # at least 2, so every square can tell which way the board faces
     gat_dropout: float = 0.0
-    merge_edge_types: bool = True    # one edge per square pair, its edge types as a multi-hot feature
-                                     # (False: one edge per type; about 2.4x the edges, memory and time)
 
     # ----- Extra tokens -----
     token_variant: str = "unpool"    # "squares" | "registers" | "unpool"
@@ -187,17 +184,6 @@ def _mlp(sizes: Sequence[int]) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
-def merge_edge_types(edge_index: torch.Tensor, edge_attr: torch.Tensor, num_nodes: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """One edge per (from, to) pair; the one-hot types of its parallel edges combine into a multi-hot."""
-    return coalesce(edge_index, edge_attr, num_nodes=num_nodes, reduce="max")
-
-
-def _graph_edges(graphs: ld.GraphBatch, config: JEPAConfig) -> Tuple[torch.Tensor, torch.Tensor]:
-    if config.merge_edge_types:
-        return merge_edge_types(graphs.edge_index, graphs.edge_attr, graphs.x.size(0))
-    return graphs.edge_index, graphs.edge_attr
-
-
 class _GATBlock(nn.Module):
     """A residual GAT layer, h + GELU(LayerNorm(GAT(h))), its width split across the heads."""
 
@@ -289,7 +275,7 @@ class LabyrinthEncoder(nn.Module):
         """
         c = self.config
         B = graphs.num_graphs
-        square_edges, square_attr = _graph_edges(graphs, c)
+        square_edges, square_attr = graphs.edge_index, graphs.edge_attr     # one multi-hot edge per square pair
         h = self.input_proj(graphs.x)
         if mask is not None:
             h = torch.where(mask.unsqueeze(-1), self.mask_token.expand_as(h), h)
@@ -365,7 +351,7 @@ class MaskPredictor(nn.Module):
         """squares [B, 64, d_model], mask [B*64] -> predictions [B*64, d_model] (meaningful on masked squares)."""
         h = self.inp(squares.reshape(-1, squares.size(-1)))
         h = h + mask.unsqueeze(-1).to(h.dtype) * self.target_flag
-        edge_index, edge_attr = _graph_edges(graphs, self.config)
+        edge_index, edge_attr = graphs.edge_index, graphs.edge_attr
         for block in self.gats:
             h = block(h, edge_index, edge_attr)
         return self.out(h)

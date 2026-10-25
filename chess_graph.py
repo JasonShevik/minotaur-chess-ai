@@ -8,7 +8,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils import to_networkx
 from torch_geometric.data import Data
-from typing import List, Tuple, Callable, Dict, Any, NamedTuple, Optional, Union
+from typing import List, Tuple, Callable, Dict, Any, NamedTuple, Optional, Sequence, Union
 
 
 # ##### ##### ##### ##### #####
@@ -1115,6 +1115,62 @@ def create_filled_chess_graphs(
     node_features_tensor: torch.Tensor = torch.tensor(node_features, dtype=torch.float32)
 
     return edges_tensors, node_features_tensor
+
+
+def to_single_graph(
+    edges: Sequence[torch.Tensor],
+    x: torch.Tensor,
+    merge: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Turn the per-type edge lists of create_filled_chess_graphs into the single graph a model reads.
+
+    merge=True (the format the Labyrinth models use): one edge per (from, to) square pair, whose
+        feature is a multi-hot over the NUM_EDGE_TYPES relation types joining that pair. Nothing is
+        lost, every relation is still listed, and there are far fewer edges (about 1,800 instead of
+        4,200 per position), because many pairs are joined by several types (every queen edge is also a
+        bishop or rook edge, every king edge also a queen edge).
+    merge=False: one edge per relation, with a one-hot feature.
+
+    Returns (x, edge_index [2, E], edge_attr [E, NUM_EDGE_TYPES]), all on x's device. Merged edges are
+    sorted by (from, to).
+    """
+    device, dtype = x.device, x.dtype
+    num_types = len(edges)
+    parts = [e.to(device) for e in edges if e.numel()]
+    if not parts:
+        return x, torch.empty(2, 0, dtype=torch.long, device=device), torch.empty(0, num_types, dtype=dtype, device=device)
+    edge_index = torch.cat(parts, dim=1)
+    edge_type = torch.cat([torch.full((e.size(1),), t, dtype=torch.long, device=device)
+                           for t, e in enumerate(edges) if e.numel()])
+    if not merge:
+        return x, edge_index, torch.nn.functional.one_hot(edge_type, num_types).to(dtype)
+    n = x.size(0)
+    keys, pair = torch.unique(edge_index[0] * n + edge_index[1], sorted=True, return_inverse=True)
+    edge_attr = torch.zeros(keys.numel(), num_types, dtype=dtype, device=device)
+    edge_attr[pair, edge_type] = 1
+    return x, torch.stack([keys // n, keys % n]), edge_attr
+
+
+def batch_graphs(
+    graphs: Sequence[Tuple[Sequence[torch.Tensor], torch.Tensor]],
+    merge: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Several positions as one disconnected graph, the way PyTorch Geometric batches graphs.
+    graphs: (edge lists, x) pairs exactly as create_filled_chess_graphs returns them.
+    Returns (x [B*64, F], edge_index [2, E], edge_attr [E, NUM_EDGE_TYPES], batch [B*64]).
+    """
+    xs, eis, eas, batch = [], [], [], []
+    offset = 0
+    for b, (edges, x) in enumerate(graphs):
+        x, ei, ea = to_single_graph(edges, x, merge)
+        xs.append(x)
+        eis.append(ei + offset)
+        eas.append(ea)
+        batch.append(torch.full((x.size(0),), b, dtype=torch.long, device=x.device))
+        offset += x.size(0)
+    return torch.cat(xs), torch.cat(eis, dim=1), torch.cat(eas), torch.cat(batch)
 
 
 # ##### ##### ##### ##### #####

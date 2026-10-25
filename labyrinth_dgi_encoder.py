@@ -53,7 +53,7 @@ class DGIConfig:
     # ----- NodeEncoder: the local encoder -----
     enc_num_hops: int = 3          # GAT layers; each hop lets a square hear from one more ring of neighbors
     enc_hidden_dim: int = 128      # width of every hop except the last
-    enc_heads: int = 4             # attention heads per hop (averaged, not concatenated)
+    enc_heads: int = 4             # attention heads per hop; they split the width and are concatenated
     enc_dropout: float = 0.1
     node_dim: int = 512            # width of the final node embedding, and of the discriminator's node input
 
@@ -106,6 +106,11 @@ class DGIConfig:
             raise ValueError("sum_num_unpool must be at least 1")
         if self.enc_num_hops < 1:
             raise ValueError("enc_num_hops must be at least 1")
+        # GAT layers split their width across the heads
+        if self.enc_hidden_dim % self.enc_heads or self.node_dim % self.enc_heads:
+            raise ValueError("enc_hidden_dim and node_dim must be divisible by enc_heads")
+        if self.sum_in_dim % self.sum_gat_heads:
+            raise ValueError("sum_in_dim must be divisible by sum_gat_heads")
 
 
 def _mlp(sizes: Sequence[int], dropout: float = 0.0) -> nn.Sequential:
@@ -129,34 +134,13 @@ def chess_graph_to_single(
     num_edge_types: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Merge the per-type edge lists from chess_graph.create_filled_chess_graphs into one
-    edge_index with a one-hot edge type as the edge feature.
-
-    x: [N, node_feature_dim]; edge_index_list: one [2, E_i] tensor per edge type.
+    The single graph a model reads, from the per-type edge lists of create_filled_chess_graphs:
+    one edge per square pair with a multi-hot of its relation types (chess_graph.to_single_graph).
     Returns (x, edge_index [2, E], edge_attr [E, num_edge_types]).
-
-    A pair of squares joined by several edge types (e2-e3 is both a pawn move and a king
-    move) keeps one edge per type, each with its own one-hot, so the GAT and the unpooling
-    layers see one message per relation rather than a multi-hot blend.
     """
-    if num_edge_types is None:
-        num_edge_types = len(edge_index_list)
-    if len(edge_index_list) != num_edge_types:
+    if num_edge_types is not None and len(edge_index_list) != num_edge_types:
         raise ValueError(f"expected {num_edge_types} edge lists, got {len(edge_index_list)}")
-    device, dtype = x.device, x.dtype
-    parts_index: List[torch.Tensor] = []
-    parts_attr: List[torch.Tensor] = []
-    for i, ei in enumerate(edge_index_list):
-        if ei.numel() == 0:
-            continue
-        ei = ei.to(device)
-        parts_index.append(ei)
-        parts_attr.append(
-            F.one_hot(torch.full((ei.size(1),), i, dtype=torch.long, device=device), num_edge_types).to(dtype)
-        )
-    if not parts_index:
-        return x, torch.empty(2, 0, dtype=torch.long, device=device), torch.empty(0, num_edge_types, dtype=dtype, device=device)
-    return x, torch.cat(parts_index, dim=1), torch.cat(parts_attr, dim=0)
+    return cg.to_single_graph(edge_index_list, x)
 
 
 def batch_chess_graphs(
@@ -164,22 +148,13 @@ def batch_chess_graphs(
     num_edge_types: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Stack several positions into one disconnected graph, the way PyG batches graphs.
-
-    graphs: a sequence of (edge_index_list, x) pairs exactly as create_filled_chess_graphs
-    returns them. Returns (x [B*64, F], edge_index [2, E], edge_attr [E, T], batch [B*64])
-    where batch[i] is the index of the position node i belongs to.
+    Several positions as one disconnected graph (chess_graph.batch_graphs).
+    graphs: (edge_index_list, x) pairs exactly as create_filled_chess_graphs returns them.
+    Returns (x [B*64, F], edge_index [2, E], edge_attr [E, T], batch [B*64]).
     """
-    xs, eis, eas, batch = [], [], [], []
-    offset = 0
-    for b, (edge_index_list, x) in enumerate(graphs):
-        x, ei, ea = chess_graph_to_single(x, edge_index_list, num_edge_types)
-        xs.append(x)
-        eis.append(ei + offset)
-        eas.append(ea)
-        batch.append(torch.full((x.size(0),), b, dtype=torch.long, device=x.device))
-        offset += x.size(0)
-    return torch.cat(xs), torch.cat(eis, dim=1), torch.cat(eas), torch.cat(batch)
+    if num_edge_types is not None and any(len(edges) != num_edge_types for edges, _ in graphs):
+        raise ValueError(f"expected {num_edge_types} edge lists per position")
+    return cg.batch_graphs(graphs)
 
 
 # ##### ##### ##### ##### #####
@@ -188,10 +163,11 @@ def batch_chess_graphs(
 
 class NodeEncoder(nn.Module):
     """
-    Encodes the 64 squares into node embeddings with a stack of GAT layers over the merged
-    chess graph. Edge types enter as one-hot edge features, so attention can weigh a knight
-    relation differently from a pawn attack. After enc_num_hops layers every square has
-    heard from every other square along several paths.
+    Encodes the 64 squares into node embeddings with a stack of GAT layers over the chess graph.
+    Each edge carries the multi-hot set of relation types joining its two squares, so attention
+    can weigh a knight relation differently from a pawn attack. Every layer splits its width
+    across the attention heads and places their outputs side by side (no averaging of heads).
+    After enc_num_hops layers every square has heard from every other square along several paths.
     """
 
     def __init__(self, config: DGIConfig):
@@ -201,8 +177,8 @@ class NodeEncoder(nn.Module):
         widths = [config.node_feature_dim] + [config.enc_hidden_dim] * (config.enc_num_hops - 1) + [config.node_dim]
         self.layers = nn.ModuleList(
             GATConv(
-                widths[i], widths[i + 1],
-                heads=config.enc_heads, concat=False,
+                widths[i], widths[i + 1] // config.enc_heads,
+                heads=config.enc_heads, concat=True,
                 dropout=config.enc_dropout, edge_dim=config.num_edge_types,
             )
             for i in range(config.enc_num_hops)
@@ -290,7 +266,7 @@ class GlobalSummarizer(nn.Module):
         self.unpool_layers = nn.ModuleList()
         self.gat_layers = nn.ModuleList()
         self.gat_norms = nn.ModuleList()
-        edge_in = c.num_edge_types  # the first layer consumes the one-hot edge types
+        edge_in = c.num_edge_types  # the first layer consumes the multi-hot edge types
         for _ in range(c.sum_num_unpool):
             self.unpool_layers.append(
                 unpool.GuoUnpool(
@@ -301,7 +277,7 @@ class GlobalSummarizer(nn.Module):
             )
             self.gat_layers.append(
                 GATConv(
-                    c.sum_in_dim, c.sum_in_dim, heads=c.sum_gat_heads, concat=False,
+                    c.sum_in_dim, c.sum_in_dim // c.sum_gat_heads, heads=c.sum_gat_heads, concat=True,
                     dropout=c.sum_gat_dropout, edge_dim=c.sum_edge_dim,
                 )
             )

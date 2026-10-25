@@ -56,7 +56,6 @@ from typing import Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequenc
 import chess
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 import chess_graph as cg
@@ -336,25 +335,23 @@ def _clear_hidden_en_passant(x: torch.Tensor, mask: torch.Tensor) -> None:
             x[ep, 7] = 0
 
 
-def _merge_types(edges: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-type edge lists -> (edge_index [2, E], edge_type [E]), types in order, as chess_graph_to_single does."""
-    parts = [e for e in edges if e.numel()]
-    types = [torch.full((e.size(1),), t, dtype=torch.long) for t, e in enumerate(edges) if e.numel()]
-    if not parts:
-        return torch.empty(2, 0, dtype=torch.long), torch.empty(0, dtype=torch.long)
-    return torch.cat(parts, dim=1), torch.cat(types)
-
-
 # ##### ##### ##### ##### #####
 #       Samples
 
 
 @dataclass
 class GraphView:
-    """One chess graph: x [64, F], edge_index [2, E], edge_type [E] (index into the chess edge types)."""
+    """
+    One chess graph as the models read it (chess_graph.to_single_graph): x [64, F], edge_index [2, E]
+    with one edge per square pair, edge_attr [E, NUM_EDGE_TYPES] the multi-hot of its relation types.
+    """
     x: torch.Tensor
     edge_index: torch.Tensor
-    edge_type: torch.Tensor
+    edge_attr: torch.Tensor
+
+    @classmethod
+    def from_edge_lists(cls, edges: Sequence[torch.Tensor], x: torch.Tensor) -> "GraphView":
+        return cls(*cg.to_single_graph(edges, x))
 
 
 @dataclass
@@ -386,14 +383,14 @@ def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, che
     board = chess.Board(fen, chess960=True)
     rook_squares = cg.castling_rook_squares_from_board(board)
     edges, x = cg.create_filled_chess_graphs(fen, rook_squares)
-    full = GraphView(x, *_merge_types(edges))
+    full = GraphView.from_edge_lists(edges, x)
 
     context_x = x.clone()
     context_x[mask] = 0
     _clear_hidden_en_passant(context_x, mask)
     ctx_rooks = masked_castling_rook_squares(board, rook_squares, mask)
     context_edges = edges if ctx_rooks == rook_squares else cg.create_filled_chess_graphs(fen, ctx_rooks)[0]
-    return full, GraphView(context_x, *_merge_types(context_edges)), board, rook_squares
+    return full, GraphView.from_edge_lists(context_edges, context_x), board, rook_squares
 
 
 def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskConfig(),
@@ -413,7 +410,7 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
         next_edges, next_x = cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares)
         nxt = NextPosition(t.move, t.next_fen, t.from_square, t.to_square, t.promotion,
                            (t.is_castling, t.is_capture, t.is_en_passant),
-                           GraphView(next_x, *_merge_types(next_edges)))
+                           GraphView.from_edge_lists(next_edges, next_x))
     return JEPASample(fen, full, context, mask, nxt)
 
 
@@ -426,7 +423,7 @@ class GraphBatch:
     """Several chess graphs as one disconnected graph, the PyTorch Geometric way."""
     x: torch.Tensor            # [B*64, F]
     edge_index: torch.Tensor   # [2, E]
-    edge_attr: torch.Tensor    # [E, NUM_EDGE_TYPES] one-hot edge type
+    edge_attr: torch.Tensor    # [E, NUM_EDGE_TYPES] multi-hot relation types, one edge per square pair
     batch: torch.Tensor        # [B*64] which graph each node belongs to
     num_graphs: int
 
@@ -442,8 +439,7 @@ def pack_views(views: Sequence[GraphView]) -> GraphBatch:
     offsets = torch.arange(len(views)) * n
     x = torch.cat([v.x for v in views])
     edge_index = torch.cat([v.edge_index + off for v, off in zip(views, offsets.tolist())], dim=1)
-    edge_type = torch.cat([v.edge_type for v in views])
-    edge_attr = F.one_hot(edge_type, cg.NUM_EDGE_TYPES).to(x.dtype)
+    edge_attr = torch.cat([v.edge_attr for v in views])
     batch = torch.arange(len(views)).repeat_interleave(n)
     return GraphBatch(x, edge_index, edge_attr, batch, len(views))
 

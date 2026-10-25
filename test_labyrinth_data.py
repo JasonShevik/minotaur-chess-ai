@@ -65,9 +65,20 @@ def make_database(path: str, fens: List[str], analyzed_every: int = 3) -> None:
                           str(i) if analyzed else None, 0, "e2e4" if analyzed else None))
 
 
-def edge_set(view: ld.GraphView, edge_type: int = None):
-    keep = torch.ones(view.edge_type.numel(), dtype=torch.bool) if edge_type is None else view.edge_type == edge_type
-    return {(int(t), a, b) for t, (a, b) in zip(view.edge_type[keep].tolist(), view.edge_index[:, keep].t().tolist())}
+def edge_set(view: ld.GraphView):
+    """{(from, to): tuple of relation-type flags} for a graph with one multi-hot edge per square pair."""
+    return {(a, b): tuple(int(v) for v in attr) for (a, b), attr in zip(view.edge_index.t().tolist(), view.edge_attr.tolist())}
+
+
+def typed_edge_set(edges):
+    """The same, built directly from create_filled_chess_graphs's per-type lists."""
+    out = {}
+    for t, e in enumerate(edges):
+        for a, b in e.t().tolist():
+            flags = list(out.get((a, b), (0,) * len(edges)))
+            flags[t] = 1
+            out[(a, b)] = tuple(flags)
+    return out
 
 
 # ##### ##### ##### ##### #####
@@ -147,11 +158,14 @@ def test_masked_view_follows_the_rules():
         # the only difference allowed on unmasked squares is a cleared en passant flag
         assert torch.all(ep_diff[:, :7] == 0)
         saw_ep_clear += int(ep_diff[:, 7].sum())
-        # every edge type except castling is untouched; castling edges only ever disappear
-        for t in range(cg.NUM_EDGE_TYPES - 1):
-            assert edge_set(ctx, t) == edge_set(full, t)
-        assert edge_set(ctx, 9) <= edge_set(full, 9)
-        saw_castling_drop += edge_set(ctx, 9) != edge_set(full, 9)
+        # every relation type except castling is untouched; castling flags only ever disappear
+        full_edges, ctx_edges = edge_set(full), edge_set(ctx)
+        for pair, flags in full_edges.items():
+            kept = ctx_edges.get(pair, (0,) * cg.NUM_EDGE_TYPES)
+            assert kept[:9] == flags[:9], (fen, pair)
+            assert kept[9] <= flags[9]
+            saw_castling_drop += kept[9] < flags[9]
+        assert set(ctx_edges) <= set(full_edges)
     assert saw_castling_drop > 0 and saw_ep_clear > 0, (saw_castling_drop, saw_ep_clear)
 
 
@@ -198,7 +212,7 @@ def test_next_position_matches_the_move_sampler():
         assert s.next.next_fen == after.fen(en_passant="xfen")
         edges, x = cg.create_filled_chess_graphs(after.fen(en_passant="xfen"), cg.castling_rook_squares_from_board(after))
         assert torch.equal(s.next.view.x, x)
-        assert edge_set(s.next.view) == {(t, a, b) for t, e in enumerate(edges) for a, b in e.t().tolist()}
+        assert edge_set(s.next.view) == typed_edge_set(edges)
         assert s.full.x[s.next.from_square, 0] == 0 and s.full.x[s.next.from_square, 1:7].sum() == 1
 
 
@@ -208,8 +222,11 @@ def test_batches_line_up_with_the_encoder_batching():
     fens = [b.fen(en_passant="xfen") for b in random_positions(6, seed=6, per_start=2)] + ["7k/6Q1/6K1/8/8/8/8/8 b - - 0 1"]
     samples = [ld.build_sample(f, rng) for f in fens]
     batch = ld.collate_jepa(samples)
-    reference = lde.batch_chess_graphs([cg.create_filled_chess_graphs(f, cg.castling_rook_squares_from_board(
+    reference = cg.batch_graphs([cg.create_filled_chess_graphs(f, cg.castling_rook_squares_from_board(
         chess.Board(f, chess960=True))) for f in fens])
+    dgi = lde.batch_chess_graphs([cg.create_filled_chess_graphs(f, cg.castling_rook_squares_from_board(
+        chess.Board(f, chess960=True))) for f in fens])
+    assert all(torch.equal(a, b) for a, b in zip(reference, dgi)), "the DGI encoder must read the same graph format"
     assert torch.equal(batch.full.x, reference[0]) and torch.equal(batch.full.edge_index, reference[1])
     assert torch.equal(batch.full.edge_attr, reference[2]) and torch.equal(batch.full.batch, reference[3])
     assert batch.mask.shape == (len(fens) * 64,) and batch.context.x.shape == batch.full.x.shape
