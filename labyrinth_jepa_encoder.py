@@ -132,6 +132,7 @@ class JEPAConfig:
     sigreg_slices: int = 256         # random 1-D projections per step
     sigreg_points: int = 17          # quadrature points of the Epps-Pulley integral on [0, sigreg_t_max]
     sigreg_t_max: float = 3.0
+    sigreg_unbiased: bool = True     # finite-sample-unbiased Epps-Pulley statistic (see sigreg)
     vicreg_cov_ratio: float = 0.04   # covariance weight relative to the variance term (VICReg's 1 : 25)
 
     # ----- Unpooling decisions (REINFORCE) -----
@@ -208,11 +209,16 @@ def _mlp(sizes: Sequence[int]) -> nn.Sequential:
 
 
 class _GATBlock(nn.Module):
-    """A residual GAT layer, h + GELU(LayerNorm(GAT(h))), its width split across the heads."""
+    """
+    A residual GAT layer, h + GELU(LayerNorm(GAT(h))), its width split across the heads.
+    add_self_loops=False for the chess graph, which brings its own self-loops (some carry castling
+    flags; see chess_graph.to_single_graph); True for unpooled graphs, which have none.
+    """
 
-    def __init__(self, dim: int, heads: int, edge_dim: int, dropout: float):
+    def __init__(self, dim: int, heads: int, edge_dim: int, dropout: float, add_self_loops: bool = True):
         super().__init__()
-        self.gat = GATConv(dim, dim // heads, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim)
+        self.gat = GATConv(dim, dim // heads, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
+                           add_self_loops=add_self_loops)
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
@@ -254,7 +260,8 @@ class LabyrinthEncoder(nn.Module):
 
         self.input_proj = nn.Linear(c.node_feature_dim, c.gat_dim)
         self.mask_token = nn.Parameter(torch.randn(c.gat_dim) * 0.02)
-        self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.num_edge_types, c.gat_dropout)
+        self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.num_edge_types, c.gat_dropout,
+                                                   add_self_loops=False)
                                          for _ in range(c.gat_layers))
 
         self.unpool_layers = nn.ModuleList()
@@ -366,7 +373,7 @@ class MaskPredictor(nn.Module):
         self.config = c = config
         self.inp = nn.Linear(c.d_model, c.pred_dim)
         self.target_flag = nn.Parameter(torch.randn(c.pred_dim) * 0.02)
-        self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.num_edge_types, 0.0)
+        self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.num_edge_types, 0.0, add_self_loops=False)
                                   for _ in range(c.pred_gat_layers))
         self.out = nn.Sequential(nn.LayerNorm(c.pred_dim), nn.Linear(c.pred_dim, c.d_model))
 
@@ -401,7 +408,7 @@ class NextPredictor(nn.Module):
 
 
 def sigreg(z: torch.Tensor, generator: Optional[torch.Generator] = None, slices: int = 256, points: int = 17,
-           t_max: float = 3.0) -> torch.Tensor:
+           t_max: float = 3.0, unbiased: bool = True) -> torch.Tensor:
     """
     SIGReg, the regularizer of LeJEPA (Balestriero & LeCun, 2025). z [N, D] is projected onto `slices`
     random unit directions; each 1-D projection is compared with a standard normal by the Epps-Pulley
@@ -409,6 +416,11 @@ def sigreg(z: torch.Tensor, generator: Optional[torch.Generator] = None, slices:
     Gaussian window, computed with the trapezoid rule on [0, t_max] (the integrand is even). The mean
     over directions is 0 for an isotropic standard Gaussian and grows with any shared offset, collapsed
     or unused direction, or non-Gaussian shape. New directions every call.
+
+    unbiased=True (the default here) estimates the squared characteristic-function gap without its
+    finite-sample bias, which matters most at small batches: the plain form (unbiased=False, as in the
+    LeJEPA paper) has an expected extra term that nudges embeddings to narrow. Unbiased, a standard
+    Gaussian scores about 0 on average (single values can be slightly negative).
     """
     N, D = z.shape
     dirs = torch.randn(D, slices, device=z.device, dtype=z.dtype, generator=generator)
@@ -421,7 +433,15 @@ def sigreg(z: torch.Tensor, generator: Optional[torch.Generator] = None, slices:
     weights[0] = weights[-1] = dt
     weights = weights * phi                                             # Gaussian window
     xt = proj.unsqueeze(-1) * t                                         # [N, slices, points]
-    err = (torch.cos(xt).mean(0) - phi) ** 2 + torch.sin(xt).mean(0) ** 2
+    cos_mean, sin_mean = torch.cos(xt).mean(0), torch.sin(xt).mean(0)
+    if unbiased and N > 1:
+        # |phi_hat - phi|^2 = |phi_hat|^2 - 2 phi Re(phi_hat) + phi^2, but E|phi_hat|^2 = |phi_X|^2 + (1 - |phi_X|^2) / N:
+        # the plain statistic carries an extra (1 - |phi_X|^2), which does not shrink with N and whose gradient
+        # favours narrower distributions. (N |phi_hat|^2 - 1) / (N - 1) estimates |phi_X|^2 without that bias.
+        sq = (N * (cos_mean ** 2 + sin_mean ** 2) - 1) / (N - 1)
+        err = sq - 2 * phi * cos_mean + phi ** 2
+    else:
+        err = (cos_mean - phi) ** 2 + sin_mean ** 2
     return (err @ weights).mean() * N
 
 
@@ -540,7 +560,7 @@ class LabyrinthJEPA(nn.Module):
             terms = []
             for e in embeddings:
                 if c.anticollapse == "sigreg":
-                    terms.append(sigreg(e, rng, c.sigreg_slices, c.sigreg_points, c.sigreg_t_max))
+                    terms.append(sigreg(e, rng, c.sigreg_slices, c.sigreg_points, c.sigreg_t_max, c.sigreg_unbiased))
                 else:
                     variance, covariance = vicreg_terms(e)
                     terms.append(variance + c.vicreg_cov_ratio * covariance)
@@ -702,71 +722,74 @@ def representation_report(encoder: LabyrinthEncoder, fens: Sequence[str], *, sam
 #       The DEHB search space
 
 
-def build_jepa_configspace(seed: int = 0, include_training: bool = True):
+def build_jepa_configspace(seed: int = 0, include_training: bool = True, fixed: Optional[Dict[str, Any]] = None):
     """
     The DEHB search space over the architecture (and, with include_training, the training knobs).
     z_dim is deliberately not searched: LiDAR grows with the dimension, so scores are only comparable
     at a fixed z_dim. Choose it separately and keep it fixed for a search.
+
+    fixed: JEPAConfig values that are not searched. Their hyperparameters are left out, and one that only
+    applies under a particular value of a fixed hyperparameter (unpool_layers under token_variant =
+    "unpool") is kept, unconditionally, only when the fixed value is that one.
     """
     import ConfigSpace as CS
-    cs = CS.ConfigurationSpace(seed=seed)
+    fixed = fixed or {}
     H = CS.CategoricalHyperparameter
     I = CS.UniformIntegerHyperparameter
     U = CS.UniformFloatHyperparameter
 
-    variant = H("token_variant", choices=list(TOKEN_VARIANTS))
-    registers = H("num_registers", choices=[16, 32, 64])
-    unpool_layers = I("unpool_layers", lower=1, upper=3)
-    unpool_hidden = H("unpool_hidden", choices=[64, 128, 256])
-    unpool_edge = H("unpool_edge_dim", choices=[8, 16, 32])
-    cs.add_hyperparameters([
+    # (hyperparameter, None or (the hyperparameter it depends on, the value it needs))
+    specs = [
         # square stage
-        I("gat_layers", lower=2, upper=4),
-        H("gat_dim", choices=[64, 128, 256]),
-        H("gat_heads", choices=[2, 4, 8]),
+        (I("gat_layers", lower=2, upper=4), None),
+        (H("gat_dim", choices=[64, 128, 256]), None),
+        (H("gat_heads", choices=[2, 4, 8]), None),
         # extra tokens
-        variant, registers, unpool_layers, unpool_hidden, unpool_edge,
+        (H("token_variant", choices=list(TOKEN_VARIANTS)), None),
+        (H("num_registers", choices=[16, 32, 64]), ("token_variant", "registers")),
+        (I("unpool_layers", lower=1, upper=3), ("token_variant", "unpool")),
+        (H("unpool_hidden", choices=[64, 128, 256]), ("token_variant", "unpool")),
+        (H("unpool_edge_dim", choices=[8, 16, 32]), ("token_variant", "unpool")),
         # transformer and readout
-        H("d_model", choices=[128, 256, 384]),
-        I("transformer_layers", lower=2, upper=6),
-        H("transformer_heads", choices=[4, 8]),
-        H("readout_queries", choices=[4, 8, 16, 32]),
+        (H("d_model", choices=[128, 256, 384]), None),
+        (I("transformer_layers", lower=2, upper=6), None),
+        (H("transformer_heads", choices=[4, 8]), None),
+        (H("readout_queries", choices=[4, 8, 16, 32]), None),
         # predictors
-        H("pred_dim", choices=[64, 128, 256]),
-        I("pred_gat_layers", lower=2, upper=4),
-        H("next_hidden", choices=[512, 1024, 2048]),
-        I("next_layers", lower=1, upper=3),
+        (H("pred_dim", choices=[64, 128, 256]), None),
+        (I("pred_gat_layers", lower=2, upper=4), None),
+        (H("next_hidden", choices=[512, 1024, 2048]), None),
+        (I("next_layers", lower=1, upper=3), None),
         # masks
-        U("mask_min_ratio", lower=0.05, upper=0.25),
-        U("mask_max_ratio", lower=0.30, upper=0.60),
-        I("mask_max_block_radius", lower=0, upper=2),
-    ])
-    cs.add_conditions([
-        CS.EqualsCondition(registers, variant, "registers"),
-        CS.EqualsCondition(unpool_layers, variant, "unpool"),
-        CS.EqualsCondition(unpool_hidden, variant, "unpool"),
-        CS.EqualsCondition(unpool_edge, variant, "unpool"),
-    ])
+        (U("mask_min_ratio", lower=0.05, upper=0.25), None),
+        (U("mask_max_ratio", lower=0.30, upper=0.60), None),
+        (I("mask_max_block_radius", lower=0, upper=2), None),
+    ]
     if include_training:
-        rl_coef = U("rl_coef", lower=1e-3, upper=1e-1, log=True)
-        rl_entropy = U("rl_entropy_coef", lower=1e-5, upper=1e-2, log=True)
-        anticollapse = H("anticollapse", choices=["sigreg", "vicreg"])
-        sigreg_weight = U("sigreg_weight", lower=0.005, upper=0.5, log=True)
-        vicreg_weight = U("vicreg_weight", lower=0.1, upper=10.0, log=True)
-        cs.add_hyperparameters([
-            U("lr", lower=5e-5, upper=1e-3, log=True),
-            U("weight_decay", lower=1e-3, upper=0.2, log=True),
-            U("ema_start", lower=0.99, upper=0.999),
-            U("next_weight", lower=0.25, upper=4.0, log=True),   # relative to mask_weight = 1
-            anticollapse, sigreg_weight, vicreg_weight,
-            rl_coef, rl_entropy,
-        ])
-        cs.add_conditions([
-            CS.EqualsCondition(sigreg_weight, anticollapse, "sigreg"),
-            CS.EqualsCondition(vicreg_weight, anticollapse, "vicreg"),
-            CS.EqualsCondition(rl_coef, variant, "unpool"),
-            CS.EqualsCondition(rl_entropy, variant, "unpool"),
-        ])
+        specs += [
+            (U("lr", lower=5e-5, upper=1e-3, log=True), None),
+            (U("weight_decay", lower=1e-3, upper=0.2, log=True), None),
+            (U("ema_start", lower=0.99, upper=0.999), None),
+            (U("next_weight", lower=0.25, upper=4.0, log=True), None),     # relative to mask_weight = 1
+            (H("anticollapse", choices=["sigreg", "vicreg"]), None),
+            (U("sigreg_weight", lower=0.005, upper=0.5, log=True), ("anticollapse", "sigreg")),
+            (U("vicreg_weight", lower=0.1, upper=10.0, log=True), ("anticollapse", "vicreg")),
+            (U("rl_coef", lower=1e-3, upper=1e-1, log=True), ("token_variant", "unpool")),
+            (U("rl_entropy_coef", lower=1e-5, upper=1e-2, log=True), ("token_variant", "unpool")),
+        ]
+
+    cs = CS.ConfigurationSpace(seed=seed)
+    kept: Dict[str, Tuple[Any, Optional[Tuple[str, Any]]]] = {}
+    for hp, condition in specs:
+        if hp.name in fixed:
+            continue
+        if condition is not None and condition[0] in fixed and fixed[condition[0]] != condition[1]:
+            continue                       # it only applies under a value the fixed setting rules out
+        cs.add_hyperparameter(hp)
+        kept[hp.name] = (hp, condition)
+    for hp, condition in kept.values():
+        if condition is not None and condition[0] in kept:
+            cs.add_condition(CS.EqualsCondition(hp, kept[condition[0]][0], condition[1]))
     return cs
 
 

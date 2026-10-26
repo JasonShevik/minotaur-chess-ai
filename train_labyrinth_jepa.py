@@ -13,15 +13,19 @@ train(model_config, run_config) is one training run:
   * non-finite losses or gradients skip the step (too many in a row stop the run);
   * a memory guard: on Windows a GPU that runs out of memory does not fail, it silently spills into
     system memory and slows down a hundredfold, so a run whose peak memory exceeds memory_budget of the
-    card stops with MemoryBudgetExceeded instead;
+    card stops with MemoryBudgetExceeded instead. It checks at step 3 and every memory_check_every steps,
+    since the unpool variant's graphs grow as it learns to split more nodes;
   * every eval_every steps: LiDAR, RankMe and the self-consistency ratio of the target encoder on a fixed
     set of validation positions, plus the losses on validation batches;
   * logs (history.jsonl), last.pt every checkpoint_every steps and at the end, best.pt by LiDAR, and
     resuming from last.pt.
 
 tune runs DEHB over build_jepa_configspace(). Each evaluation trains from scratch on `fidelity`
-thousand positions and reports the target encoder's LiDAR on the validation positions (higher is
-better). A configuration that does not fit in memory is retried once at half the batch size; one that
+thousand positions and reports the ONLINE encoder's LiDAR on the validation positions (higher is
+better; RunConfig.objective_metric). Not the target's: its moving average is stretched over the run, so
+over DEHB's short runs the target is still largely its initial weights. Values given with --config or
+--variant are fixed: they are left out of the search space. A configuration that does not fit in memory
+(MemoryBudgetExceeded, or a CUDA out-of-memory error) is retried once at half the batch size; one that
 still does not fit, or diverges, scores 0.
 """
 from __future__ import annotations
@@ -78,6 +82,8 @@ class RunConfig:
     seed: int = 0
     device: Optional[str] = None                     # None: cuda if available
     memory_budget: float = 0.9                       # fraction of the GPU's memory a run may use
+    memory_check_every: int = 100                    # also check the budget every this many steps (0: only at step 3)
+    objective_metric: str = "online_lidar"           # what the DEHB objective reports from the final evaluation
     max_consecutive_skips: int = 50
 
     def to_dict(self) -> Dict[str, Any]:
@@ -281,7 +287,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                 raise TrainingDiverged(f"{skips} consecutive steps with a non-finite loss or gradient at step {step}")
             continue
 
-        if device.type == "cuda" and step == 3:
+        if device.type == "cuda" and (step == 3 or (run.memory_check_every and step % run.memory_check_every == 0)):
             check_memory_budget(torch.cuda.max_memory_allocated(device),
                                 torch.cuda.get_device_properties(device).total_memory, run.memory_budget)
 
@@ -317,34 +323,47 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
 #       DEHB
 
 
+def _release_gpu_memory() -> None:
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
                    train_fn: Callable[..., Dict[str, Any]] = train, log: Callable[[str], None] = print):
     """
-    The DEHB objective: config dict and fidelity (thousands of training positions) -> LiDAR of the target
-    encoder. Fidelity counts positions rather than steps so configurations with different batch sizes
-    get the same amount of data. fixed: JEPAConfig values every evaluation shares (e.g. z_dim).
+    The DEHB objective: config dict and fidelity (thousands of training positions) -> base_run's
+    objective_metric (the online encoder's LiDAR). Fidelity counts positions rather than steps so
+    configurations with different batch sizes get the same amount of data. fixed: JEPAConfig values every
+    evaluation shares (e.g. z_dim, or a token_variant); they override anything sampled.
     """
     from dehb_helper import ObjectiveResult
 
     def objective(cfg: Dict[str, Any], fidelity: float) -> ObjectiveResult:
-        config = lje.JEPAConfig.from_dict({**(fixed or {}), **cfg})
+        config = lje.JEPAConfig.from_dict({**cfg, **(fixed or {})})
         batch_size = base_run.batch_size or DEFAULT_BATCH_SIZE[config.token_variant]
         positions = int(round(fidelity * 1000))
         for attempt in range(2):
             run = replace(base_run, out_dir=None, resume=False, eval_every=0, checkpoint_every=0,
                           batch_size=batch_size, total_steps=max(1, positions // batch_size))
+            failure = None
             try:
                 result = train_fn(config, run, log=log)
-            except MemoryBudgetExceeded as e:
-                log(f"  does not fit at batch size {batch_size}: {e}")
+            except (MemoryBudgetExceeded, torch.cuda.OutOfMemoryError) as e:
+                failure = f"{type(e).__name__}: {e}"
+            except TrainingDiverged as e:
+                return ObjectiveResult(metric=0.0, info={"failed": "diverged", "error": str(e)})
+            if failure is not None:
+                _release_gpu_memory()      # outside the except block, once the failed run's frames are gone
+                log(f"  does not fit at batch size {batch_size}: {failure}")
                 if attempt == 0 and batch_size >= 16:
                     batch_size //= 2
                     continue
                 return ObjectiveResult(metric=0.0, info={"failed": "memory", "batch_size": batch_size})
-            except TrainingDiverged as e:
-                return ObjectiveResult(metric=0.0, info={"failed": "diverged", "error": str(e)})
             final = result["final"]
-            return ObjectiveResult(metric=float(final["lidar"]), info={
+            return ObjectiveResult(metric=float(final[base_run.objective_metric]), info={
+                "target_lidar": final.get("lidar"),
                 "rankme": final["rankme"], "rankme_centered": final.get("rankme_centered"),
                 "online_lidar": final.get("online_lidar"),
                 "self_consistency": final["self_consistency"],
@@ -431,11 +450,17 @@ def main() -> None:
         print(json.dumps({"final": result["final"], "best_lidar": result["best_lidar"]}, indent=2))
     else:
         from dehb_helper import DEHBHelper, DEHBRunConfig
+        known = {f.name for f in dataclasses.fields(lje.JEPAConfig)}
+        unknown = sorted(set(values) - known)
+        if unknown:
+            raise SystemExit(f"--config has keys JEPAConfig does not know: {unknown}")
+        if values:
+            print(f"Fixed for this search (not searched): {values}")
         resume = os.path.exists(os.path.join(args.out, "evals.jsonl"))
         if resume:
             print(f"Found previous search state in {args.out}/ - resuming (delete it to start fresh).")
         helper = DEHBHelper(
-            configspace=lje.build_jepa_configspace(seed=args.seed),
+            configspace=lje.build_jepa_configspace(seed=args.seed, fixed=values),
             objective=make_objective(run, fixed=values),
             direction="maximize",
             run_cfg=DEHBRunConfig(min_fidelity=args.min_fidelity, max_fidelity=args.max_fidelity, eta=3,

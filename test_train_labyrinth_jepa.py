@@ -162,10 +162,34 @@ def test_dehb_objective_scores_runs_and_handles_failures():
             calls.append(run.batch_size)
             if run.batch_size > 16:
                 raise tj.MemoryBudgetExceeded("too big")
-            return {"final": {"lidar": 7.0, "rankme": 9.0, "self_consistency": 0.1}, "steps": run.total_steps}
+            return {"final": {"lidar": 7.0, "online_lidar": 11.0, "rankme": 9.0, "self_consistency": 0.1},
+                    "steps": run.total_steps}
         calls.clear()
         result = tj.make_objective(replace(base, batch_size=32), log=quiet, train_fn=fits_at_half)({}, 1.6)
-        assert calls == [32, 16] and result.metric == 7.0 and result.info["steps"] == 100   # 1,600 positions / 16
+        assert calls == [32, 16] and result.info["steps"] == 100   # 1,600 positions / 16
+        assert result.metric == 11.0 and result.info["target_lidar"] == 7.0, "the objective scores the online encoder"
+
+        # a real CUDA out-of-memory error is handled like the memory guard, not allowed to end the search
+        calls.clear()
+
+        def cuda_oom_then_fits(config, run, log=None):
+            calls.append(run.batch_size)
+            if run.batch_size > 16:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return fits_at_half(config, run)
+        calls_before = len(calls)
+        result = tj.make_objective(replace(base, batch_size=32), log=quiet, train_fn=cuda_oom_then_fits)({}, 1.6)
+        assert result.metric == 11.0 and 16 in calls
+
+        # fixed values win over anything DEHB samples
+        seen = []
+
+        def record(config, run, log=None):
+            seen.append(config.token_variant)
+            return fits_at_half(config, replace(run, batch_size=16))
+        tj.make_objective(replace(base, batch_size=16), fixed={"token_variant": "squares"}, log=quiet,
+                          train_fn=record)({"token_variant": "unpool"}, 1.6)
+        assert seen == ["squares"]
 
         def diverges(config, run, log=None):
             raise tj.TrainingDiverged("nan")

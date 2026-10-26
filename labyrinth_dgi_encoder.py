@@ -180,6 +180,7 @@ class NodeEncoder(nn.Module):
                 widths[i], widths[i + 1] // config.enc_heads,
                 heads=config.enc_heads, concat=True,
                 dropout=config.enc_dropout, edge_dim=config.num_edge_types,
+                add_self_loops=False,   # the chess graph brings its own (see chess_graph.to_single_graph)
             )
             for i in range(config.enc_num_hops)
         )

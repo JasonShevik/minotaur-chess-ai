@@ -71,8 +71,8 @@ def edge_set(view: ld.GraphView):
 
 
 def typed_edge_set(edges):
-    """The same, built directly from create_filled_chess_graphs's per-type lists."""
-    out = {}
+    """The same, built directly from create_filled_chess_graphs's per-type lists (plus every square's self-loop)."""
+    out = {(i, i): (0,) * len(edges) for i in range(64)}
     for t, e in enumerate(edges):
         for a, b in e.t().tolist():
             flags = list(out.get((a, b), (0,) * len(edges)))

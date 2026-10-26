@@ -536,6 +536,28 @@ def test_single_graph_merges_edge_types_without_losing_any():
     assert torch.equal(batch[eib[0]], batch[eib[1]]), "no edge between positions"
 
 
+def test_castling_self_loops_carry_their_flag():
+    """
+    Every square has a self-loop; a Chess960 king already on its castling square (or a rook on its own)
+    makes the castling edge a self-loop, and that square's self-loop must carry the castling flag.
+    """
+    fen = "rnbqrbkr/pppppppp/8/8/8/8/PPPPPPPP/RNBQRBKR w KQkq - 0 1"      # kings on g1 / g8
+    board = chess.Board(fen, chess960=True)
+    edges, x = cg.create_filled_chess_graphs(fen, cg.castling_rook_squares_from_board(board))
+    for merge in (True, False):
+        _, ei, ea = cg.to_single_graph(edges, x, merge=merge)
+        loops = [(int(ei[0, i]), ea[i]) for i in range(ei.size(1)) if ei[0, i] == ei[1, i]]
+        squares = sorted({sq for sq, _ in loops})
+        assert squares == list(range(64)), "every square needs a self-loop"
+        if merge:     # merged: exactly one per square; unmerged: the castling self-loop is a separate edge
+            assert len(loops) == 64
+        flagged = sorted({sq for sq, attr in loops if attr[9] == 1})
+        assert flagged == [6, 62], (merge, flagged)
+        assert all(float(attr[:9].sum()) == 0 for _, attr in loops), "self-loops carry no other relation type"
+    _, ei, _ = cg.to_single_graph(edges, x, self_loops=False)
+    assert sorted(int(a) for a, b in ei.t().tolist() if a == b) == [6, 62], "without added self-loops only castling ones remain"
+
+
 # ##### ##### ##### ##### #####
 #   Runner
 

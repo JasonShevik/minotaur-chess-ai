@@ -230,6 +230,61 @@ def test_each_anticollapse_option_trains_the_encoder():
             assert all(p.grad is None for p in model.target.parameters())
 
 
+def test_castling_self_loop_reaches_the_gat_layers():
+    """
+    The castling flag on a king's self-loop must change what the chess-graph GAT layers compute. PyG's
+    default (add_self_loops=True) would delete that self-loop and the flag with it.
+    """
+    import labyrinth_dgi_encoder as lde
+    fen = ld.normalize_fen("rnbqrbkr/pppppppp/8/8/8/8/PPPPPPPP/RNBQRBKR w KQkq - 0 1")   # kings on g1 / g8
+    full, _, _, _ = ld.build_views(fen, torch.zeros(64, dtype=torch.bool))
+    graphs = ld.pack_views([full])
+    loop = ((graphs.edge_index[0] == 6) & (graphs.edge_index[1] == 6)).nonzero().flatten()
+    assert loop.numel() == 1 and float(graphs.edge_attr[loop, 9]) == 1
+    without = ld.GraphBatch(graphs.x, graphs.edge_index, graphs.edge_attr.clone(), graphs.batch, 1)
+    without.edge_attr[loop, 9] = 0
+    torch.manual_seed(0)
+    enc = lje.LabyrinthEncoder(small_config("squares")).eval()
+    node = lde.NodeEncoder(lde.DGIConfig(enc_hidden_dim=32, node_dim=32, enc_heads=2)).eval()
+    with torch.no_grad():
+        a, b = enc(graphs).squares[0, 6], enc(without).squares[0, 6]
+        assert not torch.allclose(a, b), "the JEPA encoder ignored the castling self-loop"
+        a = node.forward_merged(graphs.x, graphs.edge_index, graphs.edge_attr)[6]
+        b = node.forward_merged(without.x, without.edge_index, without.edge_attr)[6]
+        assert not torch.allclose(a, b), "the DGI encoder ignored the castling self-loop"
+
+
+def test_unbiased_sigreg_has_no_pull_at_small_batches():
+    """At batch 48, the plain statistic expects about +1 on a standard normal and pushes the spread down; unbiased does neither."""
+    def averages(unbiased):
+        values, pulls = [], []
+        for seed in range(150):
+            scale = torch.tensor(1.0, requires_grad=True)
+            z = torch.randn(48, 32, generator=torch.Generator().manual_seed(seed)) * scale
+            v = lje.sigreg(z, torch.Generator().manual_seed(seed), unbiased=unbiased)
+            v.backward()
+            values.append(float(v.detach()))
+            pulls.append(float(scale.grad))
+        return sum(values) / len(values), sum(pulls) / len(pulls)
+    biased_value, biased_pull = averages(False)
+    value, pull = averages(True)
+    assert biased_value > 0.5 and biased_pull > 0.4, (biased_value, biased_pull)
+    assert abs(value) < 0.2 and abs(pull) < 0.25, (value, pull)
+
+
+def test_search_space_leaves_out_fixed_values():
+    names = lambda cs: set(cs.keys())
+    full = names(lje.build_jepa_configspace())
+    squares = lje.build_jepa_configspace(fixed={"token_variant": "squares"})
+    assert not names(squares) & {"token_variant", "num_registers", "unpool_layers", "unpool_hidden", "rl_coef"}
+    unpool = lje.build_jepa_configspace(fixed={"token_variant": "unpool", "lr": 1e-4})
+    assert {"unpool_layers", "unpool_hidden", "rl_coef"} <= names(unpool) and "lr" not in names(unpool)
+    for sample in unpool.sample_configuration(5):       # the unpool settings are now always sampled
+        assert "unpool_layers" in dict(sample)
+    assert not names(lje.build_jepa_configspace(fixed={"anticollapse": "none"})) & {"sigreg_weight", "vicreg_weight"}
+    assert names(squares) < full
+
+
 def test_dehb_search_space_samples_build():
     cs = lje.build_jepa_configspace(seed=1)
     seen = set()

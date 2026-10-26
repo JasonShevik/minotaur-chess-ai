@@ -1121,6 +1121,7 @@ def to_single_graph(
     edges: Sequence[torch.Tensor],
     x: torch.Tensor,
     merge: bool = True,
+    self_loops: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Turn the per-type edge lists of create_filled_chess_graphs into the single graph a model reads.
@@ -1132,24 +1133,38 @@ def to_single_graph(
         bishop or rook edge, every king edge also a queen edge).
     merge=False: one edge per relation, with a one-hot feature.
 
+    self_loops=True (what the models expect): every square also gets an edge to itself. Its feature is
+        all zeros, except when a castling edge is itself a self-loop: a Chess960 king already on its
+        castling destination (g1 / c1) or a rook already on its own (f1 / d1), which happens in about a
+        quarter of positions. That square's self-loop then carries the castling flag. The GAT layers
+        reading this graph must use add_self_loops=False: PyG's default deletes existing self-loops and
+        adds fresh ones, which would throw that castling flag away.
+
     Returns (x, edge_index [2, E], edge_attr [E, NUM_EDGE_TYPES]), all on x's device. Merged edges are
     sorted by (from, to).
     """
     device, dtype = x.device, x.dtype
     num_types = len(edges)
+    n = x.size(0)
     parts = [e.to(device) for e in edges if e.numel()]
+    types = [torch.full((e.size(1),), t, dtype=torch.long, device=device) for t, e in enumerate(edges) if e.numel()]
+    if self_loops:
+        squares = torch.arange(n, device=device)
+        parts.append(torch.stack([squares, squares]))
+        types.append(torch.full((n,), -1, dtype=torch.long, device=device))   # -1: no relation type, just itself
     if not parts:
         return x, torch.empty(2, 0, dtype=torch.long, device=device), torch.empty(0, num_types, dtype=dtype, device=device)
     edge_index = torch.cat(parts, dim=1)
-    edge_type = torch.cat([torch.full((e.size(1),), t, dtype=torch.long, device=device)
-                           for t, e in enumerate(edges) if e.numel()])
-    if not merge:
-        return x, edge_index, torch.nn.functional.one_hot(edge_type, num_types).to(dtype)
-    n = x.size(0)
-    keys, pair = torch.unique(edge_index[0] * n + edge_index[1], sorted=True, return_inverse=True)
-    edge_attr = torch.zeros(keys.numel(), num_types, dtype=dtype, device=device)
-    edge_attr[pair, edge_type] = 1
-    return x, torch.stack([keys // n, keys % n]), edge_attr
+    edge_type = torch.cat(types)
+    typed = edge_type >= 0
+    if merge:
+        keys, pair = torch.unique(edge_index[0] * n + edge_index[1], sorted=True, return_inverse=True)
+        edge_attr = torch.zeros(keys.numel(), num_types, dtype=dtype, device=device)
+        edge_attr[pair[typed], edge_type[typed]] = 1
+        return x, torch.stack([keys // n, keys % n]), edge_attr
+    edge_attr = torch.zeros(edge_index.size(1), num_types, dtype=dtype, device=device)
+    edge_attr[typed.nonzero().flatten(), edge_type[typed]] = 1
+    return x, edge_index, edge_attr
 
 
 def batch_graphs(
