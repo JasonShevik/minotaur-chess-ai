@@ -717,9 +717,14 @@ class _EpochShuffle(Sampler):
 
     def __iter__(self) -> Iterator[int]:
         if not self.shuffle:
-            return iter(range(len(self.dataset)))
+            yield from range(len(self.dataset))
+            return
         g = torch.Generator().manual_seed(self.dataset.seed * 7919 + self.dataset.epoch)
-        return iter(torch.randperm(len(self.dataset), generator=g).tolist())
+        # The permutation stays a tensor (8 bytes per position) and is handed out a million at a time:
+        # as one Python list it would cost several GB for a dataset of a hundred million positions.
+        order = torch.randperm(len(self.dataset), generator=g)
+        for start in range(0, order.numel(), 1_000_000):
+            yield from order[start:start + 1_000_000].tolist()
 
 
 class JEPALoader:

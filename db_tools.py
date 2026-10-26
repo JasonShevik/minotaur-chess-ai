@@ -81,7 +81,9 @@ def _check_table_name(table: str) -> None:
 def create_ssl_table(db_name: str, table: str = SSL_TABLE) -> None:
     """
     Create the table of self-supervised training positions if it does not exist: one row per FEN,
-    with the file it was loaded from.
+    with the file it was loaded from. WITHOUT ROWID makes the FEN itself the table's key, instead of a
+    table plus a separate index holding a second copy of every FEN: about 40% smaller and several times
+    faster to load at a hundred million rows.
     """
     _check_table_name(table)
     with sqlite3.connect(f"{db_name}.db") as conn:
@@ -89,7 +91,7 @@ def create_ssl_table(db_name: str, table: str = SSL_TABLE) -> None:
             CREATE TABLE IF NOT EXISTS "{table}" (
             fen TEXT PRIMARY KEY,
             source TEXT
-            )
+            ) WITHOUT ROWID
         ''')
         conn.commit()
 
@@ -104,6 +106,8 @@ def add_ssl_positions(db_name: str, filepaths: List[str], table: str = SSL_TABLE
     create_ssl_table(db_name, table)
     added = 0
     with sqlite3.connect(f"{db_name}.db") as conn:
+        conn.execute("PRAGMA cache_size = -1048576")   # 1 GB page cache for this connection: inserts into a
+                                                       # large table stay fast while its key tree fits
         for filepath in filepaths:
             source = os.path.basename(filepath)
             print(f"Adding from {filepath}")
