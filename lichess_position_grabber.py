@@ -6,11 +6,13 @@ Samples positions from Lichess game archives into a text file with one FEN per l
 Reads .pgn files and the .pgn.zst archives that https://database.lichess.org/ distributes (those need
 the zstandard package: pip install zstandard), in parallel, one worker per file. From every game it
 picks up to max_positions_per_game random positions, at least min_ply_gap plies apart (as many as the
-game allows: a short game gives fewer), by default excluding:
-  * the starting position (there are only 960 of them, so they would repeat endlessly);
-  * the final position (often mate or the moment of resignation);
+game allows: a short game gives fewer). Every position of a game can be picked except, by default,
+the final one (often mate or the moment of resignation; skip_final_position). Optionally skipped too:
+  * the starting position (skip_start_position): there are only 960 of them, so they repeat often;
   * positions with endgame_max_pieces pieces or fewer (skip_endgames): chess is solved there, and
-    endgame tablebases are better training data for them. Set skip_endgames=False to keep them.
+    endgame tablebases may be better training data for them.
+The command line takes every default from GrabOptions, and each switch works both ways
+(--skip-endgames / --no-skip-endgames, --skip-start, --skip-final).
 
 The output file is what the rest of the pipeline reads: load it into the database with
 db_tools.add_ssl_positions (the table for self-supervised positions), or build the training cache
@@ -40,9 +42,9 @@ import chess.pgn
 class GrabOptions:
     max_positions_per_game: int = 10
     min_ply_gap: int = 5              # two positions from the same game are at least this many plies apart
-    skip_endgames: bool = True        # skip positions with endgame_max_pieces pieces or fewer
+    skip_endgames: bool = False       # skip positions with endgame_max_pieces pieces or fewer
     endgame_max_pieces: int = 7       # 7-piece endgames are solved (Syzygy tablebases)
-    skip_start_position: bool = True
+    skip_start_position: bool = False
     skip_final_position: bool = True
     skip_games_with_errors: bool = True   # games python-chess could not read cleanly
     max_games_per_file: Optional[int] = None   # stop each archive early (for quick runs)
