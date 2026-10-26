@@ -24,6 +24,7 @@ dehb_unpool_out*/
 labyrinth_data_cache/
 dehb_jepa_out*/
 runs/
+ssl_positions*.txt
 
 # ----- Python -----
 __pycache__/

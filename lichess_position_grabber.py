@@ -230,8 +230,14 @@ def split_file(path: str, num_files: int = 5) -> List[str]:
     return parts
 
 
-def main() -> None:
-    defaults = GrabOptions()
+def parse_args(argv: Optional[Sequence[str]] = None, defaults: Optional[GrabOptions] = None):
+    """
+    The command line. Every option defaults to the GrabOptions defaults (edit the class to change them),
+    and every switch can be set either way: --skip-endgames / --no-skip-endgames, and so on.
+    Returns (options, args).
+    """
+    defaults = defaults or GrabOptions()
+    on_off = argparse.BooleanOptionalAction
     parser = argparse.ArgumentParser(description="Sample positions from Lichess game archives into a FEN text file.")
     parser.add_argument("--games", nargs="+", default=["lichess-games"], help="folders or .pgn / .pgn.zst files")
     parser.add_argument("--out", default="ssl_positions.txt")
@@ -239,20 +245,29 @@ def main() -> None:
                         help="most positions taken from one game")
     parser.add_argument("--min-ply-gap", type=int, default=defaults.min_ply_gap,
                         help="fewest plies between two positions taken from the same game")
-    parser.add_argument("--keep-endgames", action="store_true", help="keep positions with few pieces")
+    parser.add_argument("--skip-endgames", action=on_off, default=defaults.skip_endgames,
+                        help="skip positions with --endgame-max-pieces pieces or fewer")
     parser.add_argument("--endgame-max-pieces", type=int, default=defaults.endgame_max_pieces)
-    parser.add_argument("--keep-start", action="store_true", help="keep starting positions")
-    parser.add_argument("--keep-final", action="store_true", help="keep final positions")
-    parser.add_argument("--max-games-per-file", type=int, default=None)
+    parser.add_argument("--skip-start", action=on_off, default=defaults.skip_start_position,
+                        help="skip starting positions")
+    parser.add_argument("--skip-final", action=on_off, default=defaults.skip_final_position,
+                        help="skip final positions")
+    parser.add_argument("--skip-games-with-errors", action=on_off, default=defaults.skip_games_with_errors)
+    parser.add_argument("--max-games-per-file", type=int, default=defaults.max_games_per_file)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--split", type=int, default=1, help="also split the output into this many files")
     parser.add_argument("--seed", type=int, default=defaults.seed)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     options = GrabOptions(max_positions_per_game=args.max_per_game, min_ply_gap=args.min_ply_gap,
-                          skip_endgames=not args.keep_endgames,
-                          endgame_max_pieces=args.endgame_max_pieces, skip_start_position=not args.keep_start,
-                          skip_final_position=not args.keep_final, max_games_per_file=args.max_games_per_file,
-                          seed=args.seed)
+                          skip_endgames=args.skip_endgames, endgame_max_pieces=args.endgame_max_pieces,
+                          skip_start_position=args.skip_start, skip_final_position=args.skip_final,
+                          skip_games_with_errors=args.skip_games_with_errors,
+                          max_games_per_file=args.max_games_per_file, seed=args.seed)
+    return options, args
+
+
+def main() -> None:
+    options, args = parse_args()
     print("Options:", asdict(options))
     grab_positions(args.games, args.out, options, workers=args.workers, split_into=args.split)
 

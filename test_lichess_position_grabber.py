@@ -182,6 +182,21 @@ def test_compressed_archives_read_like_plain_ones():
         assert a == b and counts_a == counts_b and len(a) > 0
 
 
+def test_command_line_respects_the_class_defaults():
+    """Running the file without arguments uses GrabOptions' defaults, whatever they are set to."""
+    options, _ = lpg.parse_args([])
+    assert options == lpg.GrabOptions()
+    edited = lpg.GrabOptions(skip_endgames=False, skip_start_position=False, max_positions_per_game=3,
+                             max_games_per_file=100)
+    options, _ = lpg.parse_args([], defaults=edited)
+    assert options == edited, "edited defaults must not be overridden by the command line"
+    # and every switch works in both directions
+    options, _ = lpg.parse_args(["--no-skip-endgames", "--no-skip-start", "--skip-final", "--min-ply-gap", "8"])
+    assert (options.skip_endgames, options.skip_start_position, options.skip_final_position, options.min_ply_gap) == (False, False, True, 8)
+    options, _ = lpg.parse_args(["--skip-endgames", "--skip-start"], defaults=edited)
+    assert options.skip_endgames and options.skip_start_position
+
+
 def test_database_table_and_training_cache():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         folder = os.path.join(tmp, "games")
