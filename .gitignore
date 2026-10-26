@@ -25,6 +25,7 @@ labyrinth_*cache*/
 dehb_jepa_out*/
 runs/
 ssl_positions*.txt
+probe_results*/
 
 # ----- Python -----
 __pycache__/
