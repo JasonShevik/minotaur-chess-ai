@@ -327,6 +327,25 @@ def test_latent_rollout_trains_every_step_without_peeking():
     assert torch.allclose(a, b, atol=1e-6)
 
 
+def test_decorrelation_term_adds_to_sigreg():
+    """decorrelation_weight adds VICReg's covariance term on top of SIGReg, and trains the encoder through it."""
+    # it separates a few factors spread across all dimensions from isotropic embeddings
+    torch.manual_seed(0)
+    assert float(lje.vicreg_terms(torch.randn(256, 20) @ torch.randn(20, 512) / 20 ** 0.5)[1]) >         5 * float(lje.vicreg_terms(torch.randn(256, 512))[1])
+    batch = make_batch(small_config("registers"))
+    plain = lje.LabyrinthJEPA(small_config("registers"))
+    assert "decorrelation" not in plain.losses(batch, rng=torch.Generator().manual_seed(0)).stats
+    cfg = small_config("registers", decorrelation_weight=10.0)
+    model = lje.LabyrinthJEPA(cfg)
+    model.load_state_dict(plain.state_dict())
+    with_term = model.losses(batch, rng=torch.Generator().manual_seed(0))
+    without = plain.losses(batch, rng=torch.Generator().manual_seed(0))
+    assert with_term.stats["decorrelation"] > 0
+    assert abs(float(with_term.total - without.total) - 10.0 * with_term.stats["decorrelation"]) < 1e-3
+    with_term.total.backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder.readout_proj.parameters())
+
+
 def test_dehb_search_space_samples_build():
     cs = lje.build_jepa_configspace(seed=1)
     seen = set()

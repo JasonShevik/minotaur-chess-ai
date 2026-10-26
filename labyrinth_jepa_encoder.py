@@ -139,6 +139,9 @@ class JEPAConfig:
     sigreg_t_max: float = 3.0
     sigreg_unbiased: bool = True     # finite-sample-unbiased Epps-Pulley statistic (see sigreg)
     vicreg_cov_ratio: float = 0.04   # covariance weight relative to the variance term (VICReg's 1 : 25)
+    decorrelation_weight: float = 0.0  # adds VICReg's covariance (decorrelation) term on top of SIGReg: SIGReg's
+                                       # random 1-D projections barely see a few strong factors spread across all
+                                       # dimensions, which correlated dimensions are; 0 turns it off
 
     # ----- Rollout curriculum (predicting several moves ahead) -----
     rollout_max_steps: int = 4       # the longest rollout
@@ -624,6 +627,10 @@ class LabyrinthJEPA(nn.Module):
                     terms.append(variance + c.vicreg_cov_ratio * covariance)
             anticollapse = torch.stack(terms).mean()
             total = total + (c.sigreg_weight if c.anticollapse == "sigreg" else c.vicreg_weight) * anticollapse
+            if c.decorrelation_weight > 0 and c.anticollapse == "sigreg":
+                decorrelation = torch.stack([vicreg_terms(e)[1] for _, e in embeddings]).mean()
+                total = total + c.decorrelation_weight * decorrelation
+                stats["decorrelation"] = float(decorrelation.detach())
 
         # ---- unpooling decisions: REINFORCE with learned baselines ----
         # A position involves thousands of decisions, so its log-probability and entropy are averaged per
