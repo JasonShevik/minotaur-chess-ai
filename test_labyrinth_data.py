@@ -322,6 +322,78 @@ def test_database_source_streams_with_several_workers():
             assert one[key] == two[key], key
 
 
+def test_rollouts_play_legal_moves_described_in_the_starting_frame():
+    rng = random.Random(21)
+    for board in random_positions(25, seed=21):
+        fen = ld.fen_of(board)
+        seed = rng.randrange(10 ** 9)
+        one = ld.build_sample(fen, random.Random(seed), rollout_steps=1)
+        three = ld.build_sample(fen, random.Random(seed), rollout_steps=3)
+        # the mask and the first move do not depend on the rollout length
+        assert torch.equal(one.mask, three.mask)
+        assert (one.next is None) == (three.next is None)
+        if one.next is not None:
+            assert one.next.move == three.next.move
+        orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+        current = board.copy(stack=False)
+        for step in three.rollout:
+            move = chess.Move.from_uci(step.move)
+            assert move in current.legal_moves
+            # squares are node indices of the STARTING position's graph, whoever moves
+            assert (step.from_square, step.to_square) == (orient(move.from_square), orient(move.to_square))
+            current.push(move)
+            assert step.next_fen == ld.fen_of(current)
+            edges, x = cg.create_filled_chess_graphs(step.next_fen, cg.castling_rook_squares_from_board(current))
+            assert torch.equal(step.view.x, x) and edge_set(step.view) == typed_edge_set(edges)
+        assert len(three.rollout) == 3 or current.is_game_over()
+
+
+def test_batches_of_uneven_rollouts_line_up():
+    rng = random.Random(22)
+    samples = [ld.build_sample(ld.fen_of(b), rng, rollout_steps=3) for b in random_positions(4, seed=22, per_start=2)]
+    samples[1].rollout = samples[1].rollout[:1]      # as if its game had ended after one move
+    samples[4].rollout = []                          # ... or had no legal move at all
+    samples[6].rollout = samples[6].rollout[:2]
+    batch = ld.collate_jepa(samples)
+    lengths = [len(s.rollout) for s in samples]
+    assert len(batch.rollout) == max(lengths)
+    previous = None
+    for k, step in enumerate(batch.rollout):
+        assert step.index.tolist() == [i for i, n in enumerate(lengths) if n > k]
+        assert step.graphs.num_graphs == step.index.numel()
+        if previous is None:
+            assert torch.equal(step.parent, step.index)
+        else:
+            assert torch.equal(previous.index[step.parent], step.index), "each row continues its own position"
+        for row, i in enumerate(step.index.tolist()):
+            assert int(step.move_from[row]) == i * 64 + samples[i].rollout[k].from_square
+        previous = step
+    assert batch.moves[1] == [samples[1].rollout[0].move] and batch.moves[4] == []
+
+
+def test_loader_rollout_length_and_mid_epoch_resume():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "fens.txt")
+        with open(path, "w") as f:
+            f.write("\n".join(ld.fen_of(b) for b in random_positions(30, seed=23)))
+        cache = os.path.join(tmp, "cache")
+        ld.build_position_cache_from_file(path, cache, 0.0, 0.0, verbose=False)
+        loader = ld.JEPALoader(cache, "train", batch_size=10, num_workers=0, seed=4)
+        loader.set_epoch(2)
+        full = [f for b in loader for f in b.fens]
+        loader.set_epoch(2)
+        loader.set_rollout_steps(2)
+        first = []
+        for b in loader:
+            first += b.fens
+            assert len(b.rollout) <= 2 and len(b.rollout) >= 1
+            if len(first) >= 40:
+                break
+        loader.resume_at(40)
+        rest = [f for b in loader for f in b.fens]
+        assert first[:40] + rest == full, "resuming continues the epoch without repeats or gaps"
+
+
 # ##### ##### ##### ##### #####
 #   Runner
 

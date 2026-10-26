@@ -10,6 +10,9 @@ train(model_config, run_config) is one training run:
   * AdamW (no weight decay on biases, norms and learned tokens), linear warm-up then cosine decay;
   * the target encoder follows the online encoder by a moving average whose momentum rises from
     ema_start to ema_end over the run;
+  * the rollout curriculum (labyrinth_jepa_encoder.rollout_schedule): how many moves ahead the model
+    predicts grows with the number of training positions seen; when it grows, the loader continues the
+    current epoch with longer rollouts, without repeating positions;
   * non-finite losses or gradients skip the step (too many in a row stop the run);
   * a memory guard: on Windows a GPU that runs out of memory does not fail, it silently spills into
     system memory and slows down a hundredfold, so a run whose peak memory exceeds memory_budget of the
@@ -47,7 +50,7 @@ import labyrinth_jepa_encoder as lje
 
 # Batch sizes that fit a 16 GB card with the default sizes; the unpool variant stores far more
 # activations per position. The memory guard catches configurations these do not fit.
-DEFAULT_BATCH_SIZE = {"squares": 128, "registers": 128, "unpool": 48}
+DEFAULT_BATCH_SIZE = {"squares": 256, "registers": 256, "unpool": 48}
 
 
 class MemoryBudgetExceeded(RuntimeError):
@@ -129,7 +132,7 @@ def check_memory_budget(peak_bytes: int, total_bytes: int, budget: float) -> Non
 
 @torch.no_grad()
 def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optional[ld.JEPALoader],
-             run: RunConfig, device: torch.device) -> Dict[str, float]:
+             run: RunConfig, device: torch.device, rollout_weights: Optional[List[float]] = None) -> Dict[str, float]:
     """
     Label-free metrics on fixed validation positions, of the target encoder (the plain keys: the encoder
     that is kept) and of the online encoder ("online_" keys: over short runs the moving-average target
@@ -145,11 +148,12 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
     metrics.update({f"online_{k}": v for k, v in online.items()})
     if val_loader is not None:
         val_loader.set_epoch(0)
+        val_loader.set_rollout_steps(len(rollout_weights) if rollout_weights else 1)
         gen = torch.Generator(device=device).manual_seed(run.seed + 12345)
         sums: Dict[str, float] = {"val_loss_mask": 0.0, "val_loss_next": 0.0}
         n = 0
         for batch in val_loader:
-            out = model.losses(batch.to(device), rng=gen)
+            out = model.losses(batch.to(device), rng=gen, rollout_weights=rollout_weights)
             sums["val_loss_mask"] += float(out.mask)
             sums["val_loss_next"] += float(out.next)
             n += 1
@@ -231,8 +235,13 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
                                seed=run.seed + 1, shuffle=False, indices=list(range(n_val))) if n_val else None
 
+    # Where in the data and the curriculum this run starts (step 0, or a resumed step)
     epoch = step // len(loader)
     loader.set_epoch(epoch)
+    loader.resume_at((step - epoch * len(loader)) * batch_size)
+    epoch_start_step = epoch * len(loader)
+    rollout_weights = lje.rollout_schedule(config, step * batch_size)
+    loader.set_rollout_steps(len(rollout_weights))
     batches = iter(loader)
     skips = 0
     t_last, positions_since = time.perf_counter(), 0
@@ -241,7 +250,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
 
     def run_eval() -> Dict[str, float]:
         nonlocal best_lidar
-        metrics = evaluate(model, eval_fens, val_loader, run, device)
+        metrics = evaluate(model, eval_fens, val_loader, run, device, rollout_weights)
         record({"step": step, "eval": metrics})
         log(f"[{step:>7}] eval  lidar={metrics['lidar']:.1f}  rankme={metrics['rankme']:.1f}  "
             f"rankme_centered={metrics['rankme_centered']:.1f}  online_lidar={metrics['online_lidar']:.1f}  "
@@ -256,16 +265,25 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
 
     final: Dict[str, float] = {}
     while step < run.total_steps:
+        new_weights = lje.rollout_schedule(config, step * batch_size)
+        if len(new_weights) != len(rollout_weights):
+            # The curriculum adds a move: continue this epoch with longer rollouts, without repeating positions
+            loader.set_rollout_steps(len(new_weights))
+            loader.resume_at((step - epoch_start_step) * batch_size)
+            batches = iter(loader)
+            log(f"[{step:>7}] rollout curriculum: now predicting {len(new_weights)} move(s) ahead")
+        rollout_weights = new_weights
         try:
             batch = next(batches)
         except StopIteration:
             epoch += 1
+            epoch_start_step = step
             loader.set_epoch(epoch)
             batches = iter(loader)
             continue
         batch = batch.to(device, non_blocking=True)
         model.train()
-        out = model.losses(batch, rng=gen)
+        out = model.losses(batch, rng=gen, rollout_weights=rollout_weights)
         opt.zero_grad(set_to_none=True)
         if not torch.isfinite(out.total):
             skips += 1
@@ -294,12 +312,14 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
         if step % run.log_every == 0 or step == run.total_steps:
             now = time.perf_counter()
             entry = {"step": step, "epoch": epoch, "loss": float(out.total.detach()), "lr": sched.get_last_lr()[0],
+                     "rollout_weights": list(rollout_weights),
                      "momentum": model.momentum_at(step, run.total_steps), "grad_norm": float(grad_norm),
                      "positions_per_s": positions_since / max(1e-9, now - t_last), **out.stats}
             if device.type == "cuda":
                 entry["gpu_peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
             record(entry)
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
+                f"K={len(rollout_weights)} "
                 f"reg={entry['anticollapse']:.3f} z_std={entry['z_std']:.3f} z_cos={entry['z_mean_cosine']:.3f} "
                 f"lr={entry['lr']:.2e} {entry['positions_per_s']:.0f} pos/s")
             t_last, positions_since = now, 0

@@ -102,6 +102,22 @@ def test_a_run_trains_evaluates_checkpoints_and_resumes():
         assert [h["step"] for h in lines if "loss" in h] == list(range(1, 10))
 
 
+def test_rollout_curriculum_grows_during_a_run():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        cfg = tiny_config("registers", rollout_max_steps=3, rollout_stage_positions=16, rollout_ramp_fraction=0.5)
+        messages = []
+        out = os.path.join(tmp, "run")
+        result = tj.train(cfg, tiny_run(cache, out, total_steps=7, eval_every=0), log=messages.append)
+        lengths = [len(h["rollout_weights"]) for h in result["history"] if "loss" in h]
+        # 8 positions per step, 16 per stage: one move ahead for steps 1-2, two for 3-4, three from step 5
+        assert lengths == [1, 1, 2, 2, 3, 3, 3], lengths
+        assert sum("now predicting" in m for m in messages) == 2
+        # resuming picks the curriculum up where it was
+        resumed = tj.train(cfg, tiny_run(cache, out, total_steps=9, eval_every=0), log=messages.append)
+        assert [len(h["rollout_weights"]) for h in resumed["history"] if "loss" in h] == [3, 3]
+
+
 def test_every_variant_trains():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cache = make_cache(tmp)

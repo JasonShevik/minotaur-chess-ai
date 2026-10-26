@@ -19,7 +19,10 @@ DataLoader worker processes so the GPU never waits.
         One item per position: a JEPASample with
           * the full board's graph (what the target encoder sees),
           * a masked view of it (what the context encoder sees for masked-square prediction),
-          * one random legal move and the next position's graph (for next-position prediction).
+          * a rollout of up to rollout_steps random legal moves and the graph of every position they lead
+            to (for predicting positions one, two, ... moves ahead). Every move is described by squares of
+            the STARTING position's graph, so a model rolling the moves forward in latent space never sees
+            the intermediate positions.
         Every random choice comes from a generator seeded by (seed, epoch, index), so a run is
         reproducible whatever the number of workers.
 
@@ -501,11 +504,11 @@ class GraphView:
 
 @dataclass
 class NextPosition:
-    """The random legal move and the position it leads to."""
+    """One move of a rollout and the position it leads to."""
     move: str
     next_fen: str
-    from_square: int       # node index in the current position's graph
-    to_square: int         # node index in the current position's graph (the rook's square for castling)
+    from_square: int       # node index in the STARTING position's graph (that board's orientation, whoever moves)
+    to_square: int         # likewise (the rook's square for castling)
     promotion: int         # 0, or the python-chess piece type promoted to
     flags: Tuple[bool, bool, bool]   # (is_castling, is_capture, is_en_passant)
     view: GraphView        # the next position's graph
@@ -517,7 +520,12 @@ class JEPASample:
     full: GraphView        # the whole board: what the target encoder sees
     context: GraphView     # the masked board: what the context encoder sees for masked-square prediction
     mask: torch.Tensor     # [64] bool, True on the masked squares
-    next: Optional[NextPosition]   # None when the position has no legal move (mate or stalemate)
+    rollout: List[NextPosition]   # up to rollout_steps moves; shorter when the game ends (mate or stalemate)
+
+    @property
+    def next(self) -> Optional[NextPosition]:
+        """The first move of the rollout, or None when the position has no legal move."""
+        return self.rollout[0] if self.rollout else None
 
 
 def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, chess.Board, Tuple[int, int, int, int]]:
@@ -539,24 +547,38 @@ def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, che
 
 
 def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskConfig(),
-                 mask: Optional[torch.Tensor] = None) -> JEPASample:
+                 mask: Optional[torch.Tensor] = None, rollout_steps: int = 1) -> JEPASample:
     """
     Everything one position contributes to a training step. fen should be normalized (normalize_fen);
-    the cache already is. mask: use this mask instead of sampling one.
+    the cache already is. mask: use this mask instead of sampling one. rollout_steps: how many random
+    legal moves to play from the position (fewer if the game ends first).
+
+    The random draws come in a fixed order (mask, then move 1, move 2, ...), so for a given rng the
+    mask and the first moves are the same whatever rollout_steps is.
     """
     if mask is None:
         mask = sample_mask(rng, mask_config)
     full, context, board, rook_squares = build_views(fen, mask)
 
-    nxt = None
-    moves = list(board.legal_moves)
-    if moves:
-        t = cg.move_transition(board, rng.choice(moves), rook_squares)
+    # Every move is described in the starting position's frame (side to move at the bottom), so a model
+    # rolling the moves forward never needs the intermediate positions' graphs, only their targets.
+    orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+    rollout: List[NextPosition] = []
+    current, current_rooks = board, rook_squares
+    for _ in range(rollout_steps):
+        moves = list(current.legal_moves)
+        if not moves:
+            break
+        move = rng.choice(moves)
+        t = cg.move_transition(current, move, current_rooks)
         next_edges, next_x = cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares)
-        nxt = NextPosition(t.move, t.next_fen, t.from_square, t.to_square, t.promotion,
-                           (t.is_castling, t.is_capture, t.is_en_passant),
-                           GraphView.from_edge_lists(next_edges, next_x))
-    return JEPASample(fen, full, context, mask, nxt)
+        rollout.append(NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
+                                    t.promotion, (t.is_castling, t.is_capture, t.is_en_passant),
+                                    GraphView.from_edge_lists(next_edges, next_x)))
+        current = current.copy(stack=False)
+        current.push(move)
+        current_rooks = t.next_castling_rook_squares
+    return JEPASample(fen, full, context, mask, rollout)
 
 
 # ##### ##### ##### ##### #####
@@ -590,70 +612,132 @@ def pack_views(views: Sequence[GraphView]) -> GraphBatch:
 
 
 @dataclass
+class RolloutStep:
+    """
+    Move k of the rollouts in a batch, for the B_k positions whose rollout reaches it (B_k shrinks when
+    games end).
+      graphs     GraphBatch of the positions after move k (the targets)
+      index      [B_k] which of the batch's B positions each row belongs to
+      parent     [B_k] the row each one continues from: for move 1 an index into the B positions, for
+                 move k > 1 a row of move k - 1
+      move_from, move_to   [B_k] the move's squares as node indices into full / context (b*64 + square,
+                 in the starting position's frame)
+      promotion  [B_k] 0, or the piece type promoted to
+      flags      [B_k, 3] (is_castling, is_capture, is_en_passant) as floats
+    """
+    graphs: GraphBatch
+    index: torch.Tensor
+    parent: torch.Tensor
+    move_from: torch.Tensor
+    move_to: torch.Tensor
+    promotion: torch.Tensor
+    flags: torch.Tensor
+
+    def _map(self, fn, graph_fn) -> "RolloutStep":
+        return RolloutStep(graph_fn(self.graphs), fn(self.index), fn(self.parent), fn(self.move_from),
+                           fn(self.move_to), fn(self.promotion), fn(self.flags))
+
+    def to(self, device, non_blocking: bool = False) -> "RolloutStep":
+        return self._map(lambda t: t.to(device, non_blocking=non_blocking), lambda g: g.to(device, non_blocking))
+
+    def pin_memory(self) -> "RolloutStep":
+        return self._map(lambda t: t.pin_memory(), _pin_graphs)
+
+
+def _pin_graphs(g: GraphBatch) -> GraphBatch:
+    return GraphBatch(g.x.pin_memory(), g.edge_index.pin_memory(), g.edge_attr.pin_memory(), g.batch.pin_memory(),
+                      g.num_graphs)
+
+
+@dataclass
 class JEPABatch:
     """
     A training batch of B positions.
       full, context     GraphBatch of all B positions (whole board / masked board)
       mask              [B*64] bool, aligned with the nodes of full and context
-      next              GraphBatch of the next positions, for the B_next positions that have a legal move
-      next_index        [B_next] which of the B positions each next position belongs to
-      move_from, move_to  [B_next] the move's squares as node indices into full / context (b*64 + square)
-      promotion         [B_next] 0, or the piece type promoted to
-      move_flags        [B_next, 3] (is_castling, is_capture, is_en_passant) as floats
-      fens, moves       for inspection
+      rollout           one RolloutStep per move ahead (empty when no position has a legal move)
+      fens, moves       for inspection (moves: each position's rollout moves, in UCI)
+    next, next_index, move_from, move_to, promotion and move_flags are the first move's, as before rollouts.
     """
     full: GraphBatch
     context: GraphBatch
     mask: torch.Tensor
-    next: Optional[GraphBatch]
-    next_index: torch.Tensor
-    move_from: torch.Tensor
-    move_to: torch.Tensor
-    promotion: torch.Tensor
-    move_flags: torch.Tensor
+    rollout: List[RolloutStep]
     fens: List[str] = field(default_factory=list)
-    moves: List[str] = field(default_factory=list)
+    moves: List[List[str]] = field(default_factory=list)
 
     @property
     def num_graphs(self) -> int:
         return self.full.num_graphs
 
+    def _first(self, name: str, empty_shape=(0,), dtype=torch.long) -> torch.Tensor:
+        if self.rollout:
+            return getattr(self.rollout[0], name)
+        return torch.zeros(empty_shape, dtype=dtype, device=self.mask.device)
+
+    @property
+    def next(self) -> Optional[GraphBatch]:
+        return self.rollout[0].graphs if self.rollout else None
+
+    @property
+    def next_index(self) -> torch.Tensor:
+        return self._first("index")
+
+    @property
+    def move_from(self) -> torch.Tensor:
+        return self._first("move_from")
+
+    @property
+    def move_to(self) -> torch.Tensor:
+        return self._first("move_to")
+
+    @property
+    def promotion(self) -> torch.Tensor:
+        return self._first("promotion")
+
+    @property
+    def move_flags(self) -> torch.Tensor:
+        return self._first("flags", (0, 3), torch.float32)
+
     def to(self, device, non_blocking: bool = False) -> "JEPABatch":
-        def mv(t: torch.Tensor) -> torch.Tensor:
-            return t.to(device, non_blocking=non_blocking)
-        return JEPABatch(self.full.to(device, non_blocking), self.context.to(device, non_blocking), mv(self.mask),
-                         None if self.next is None else self.next.to(device, non_blocking),
-                         mv(self.next_index), mv(self.move_from), mv(self.move_to), mv(self.promotion),
-                         mv(self.move_flags), self.fens, self.moves)
+        return JEPABatch(self.full.to(device, non_blocking), self.context.to(device, non_blocking),
+                         self.mask.to(device, non_blocking=non_blocking),
+                         [step.to(device, non_blocking) for step in self.rollout], self.fens, self.moves)
 
     def pin_memory(self) -> "JEPABatch":
-        def pin(t: torch.Tensor) -> torch.Tensor:
-            return t.pin_memory()
-
-        def pin_graphs(g: Optional[GraphBatch]) -> Optional[GraphBatch]:
-            return None if g is None else GraphBatch(pin(g.x), pin(g.edge_index), pin(g.edge_attr), pin(g.batch),
-                                                     g.num_graphs)
-        return JEPABatch(pin_graphs(self.full), pin_graphs(self.context), pin(self.mask), pin_graphs(self.next),
-                         pin(self.next_index), pin(self.move_from), pin(self.move_to), pin(self.promotion),
-                         pin(self.move_flags), self.fens, self.moves)
+        return JEPABatch(_pin_graphs(self.full), _pin_graphs(self.context), self.mask.pin_memory(),
+                         [step.pin_memory() for step in self.rollout], self.fens, self.moves)
 
 
 def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
-    with_next = [i for i, s in enumerate(samples) if s.next is not None]
-    nexts = [samples[i].next for i in with_next]
-    index = torch.tensor(with_next, dtype=torch.long)
+    steps: List[RolloutStep] = []
+    previous: List[int] = []
+    for k in range(max((len(s.rollout) for s in samples), default=0)):
+        ids = [i for i, s in enumerate(samples) if len(s.rollout) > k]
+        moves = [samples[i].rollout[k] for i in ids]
+        index = torch.tensor(ids, dtype=torch.long)
+        if k == 0:
+            parent = index.clone()
+        else:
+            row_of = {sample: row for row, sample in enumerate(previous)}
+            parent = torch.tensor([row_of[i] for i in ids], dtype=torch.long)
+        steps.append(RolloutStep(
+            graphs=pack_views([m.view for m in moves]),
+            index=index,
+            parent=parent,
+            move_from=index * 64 + torch.tensor([m.from_square for m in moves], dtype=torch.long),
+            move_to=index * 64 + torch.tensor([m.to_square for m in moves], dtype=torch.long),
+            promotion=torch.tensor([m.promotion for m in moves], dtype=torch.long),
+            flags=torch.tensor([m.flags for m in moves], dtype=torch.float32).reshape(-1, 3),
+        ))
+        previous = ids
     return JEPABatch(
         full=pack_views([s.full for s in samples]),
         context=pack_views([s.context for s in samples]),
         mask=torch.cat([s.mask for s in samples]),
-        next=pack_views([n.view for n in nexts]) if nexts else None,
-        next_index=index,
-        move_from=index * 64 + torch.tensor([n.from_square for n in nexts], dtype=torch.long),
-        move_to=index * 64 + torch.tensor([n.to_square for n in nexts], dtype=torch.long),
-        promotion=torch.tensor([n.promotion for n in nexts], dtype=torch.long),
-        move_flags=torch.tensor([n.flags for n in nexts], dtype=torch.float32).reshape(-1, 3),
+        rollout=steps,
         fens=[s.fen for s in samples],
-        moves=[n.move for n in nexts],
+        moves=[[m.move for m in s.rollout] for s in samples],
     )
 
 
@@ -676,6 +760,7 @@ class PositionDataset(Dataset):
         self.mask_config = mask_config
         self.seed = int(seed)
         self.epoch = 0
+        self.rollout_steps = 1
         self._positions: Optional[np.ndarray] = None
         total = len(np.load(self.path, mmap_mode="r"))
         self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
@@ -703,27 +788,28 @@ class PositionDataset(Dataset):
         return random.Random((self.seed * 1_000_003 + self.epoch) * 10_000_019 + i)
 
     def __getitem__(self, i: int) -> JEPASample:
-        return build_sample(self.fen(i), self.rng_for(i), self.mask_config)
+        return build_sample(self.fen(i), self.rng_for(i), self.mask_config, rollout_steps=self.rollout_steps)
 
 
 class _EpochShuffle(Sampler):
-    """A shuffled order that depends only on (seed, epoch)."""
+    """A shuffled order that depends only on (seed, epoch), starting `start` positions into it."""
 
     def __init__(self, dataset: PositionDataset, shuffle: bool):
         self.dataset, self.shuffle = dataset, shuffle
+        self.start = 0
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return max(0, len(self.dataset) - self.start)
 
     def __iter__(self) -> Iterator[int]:
         if not self.shuffle:
-            yield from range(len(self.dataset))
+            yield from range(self.start, len(self.dataset))
             return
         g = torch.Generator().manual_seed(self.dataset.seed * 7919 + self.dataset.epoch)
         # The permutation stays a tensor (8 bytes per position) and is handed out a million at a time:
         # as one Python list it would cost several GB for a dataset of a hundred million positions.
         order = torch.randperm(len(self.dataset), generator=g)
-        for start in range(0, order.numel(), 1_000_000):
+        for start in range(self.start, order.numel(), 1_000_000):
             yield from order[start:start + 1_000_000].tolist()
 
 
@@ -745,7 +831,17 @@ class JEPALoader:
             self.loader_kwargs["prefetch_factor"] = prefetch_factor
 
     def set_epoch(self, epoch: int) -> None:
+        """Start epoch `epoch` from its beginning: a new order, new masks and new moves."""
         self.dataset.epoch = int(epoch)
+        self.sampler.start = 0
+
+    def set_rollout_steps(self, steps: int) -> None:
+        """How many moves ahead each sample's rollout goes (takes effect for the next iterator)."""
+        self.dataset.rollout_steps = int(steps)
+
+    def resume_at(self, positions_into_epoch: int) -> None:
+        """Make the next iterator continue the current epoch after this many positions, without repeats."""
+        self.sampler.start = int(positions_into_epoch)
 
     def __len__(self) -> int:
         bs = self.loader_kwargs["batch_size"]
@@ -753,7 +849,7 @@ class JEPALoader:
         return n // bs if self.loader_kwargs["drop_last"] else -(-n // bs)
 
     def __iter__(self) -> Iterator[JEPABatch]:
-        # A fresh DataLoader per epoch, so the workers see the current epoch
+        # A fresh DataLoader each time, so the workers see the current epoch, rollout length and start
         return iter(DataLoader(self.dataset, **self.loader_kwargs))
 
 

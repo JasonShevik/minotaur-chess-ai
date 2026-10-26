@@ -8,9 +8,14 @@ answers the predictors are graded against. Two predictors give the training sign
     masked squares   The encoder sees the board with some squares hidden (labyrinth_data builds
                      that masked view leak-free). A small GAT on the chess graph predicts what the
                      target encoder, seeing the whole board, makes of each hidden square.
-    next position    From z of a position and a move (the from/to square tokens, the promotion
+    next positions   From z of a position and a move (the from/to square tokens, the promotion
                      piece and the move flags), predict the target encoder's z of the position the
-                     move leads to.
+                     move leads to; then, from that prediction and the next move, the position after
+                     that, and so on: a rollout in latent space, with a loss at every step. Moves are
+                     always described with the STARTING position's square tokens, so the rollout never
+                     sees an intermediate position, only predicts it. A curriculum lengthens it: one
+                     move ahead at first, one more every rollout_stage_positions training positions, up
+                     to rollout_max_steps (see rollout_schedule).
 
 The encoder:
 
@@ -135,6 +140,12 @@ class JEPAConfig:
     sigreg_unbiased: bool = True     # finite-sample-unbiased Epps-Pulley statistic (see sigreg)
     vicreg_cov_ratio: float = 0.04   # covariance weight relative to the variance term (VICReg's 1 : 25)
 
+    # ----- Rollout curriculum (predicting several moves ahead) -----
+    rollout_max_steps: int = 4       # the longest rollout
+    rollout_stage_positions: int = 250_000   # training positions per curriculum stage (0: full length from the start)
+    rollout_ramp_fraction: float = 0.25      # a newly added step's weight ramps from 0 to 1 over this part of its stage
+    rollout_step_decay: float = 1.0  # step k's loss weight is decay ** (k - 1)
+
     # ----- Unpooling decisions (REINFORCE) -----
     unpool_rl: bool = True           # False freezes the decision policy; everything else still trains
     rl_coef: float = 0.01
@@ -195,6 +206,10 @@ class JEPAConfig:
             raise ValueError("loss_type must be smooth_l1 or mse")
         if self.anticollapse not in ANTICOLLAPSE:
             raise ValueError(f"anticollapse must be one of {ANTICOLLAPSE}")
+        if self.rollout_max_steps < 1 or self.rollout_stage_positions < 0:
+            raise ValueError("need rollout_max_steps >= 1 and rollout_stage_positions >= 0")
+        if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
+            raise ValueError("need 0 < rollout_ramp_fraction <= 1 and rollout_step_decay > 0")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
             raise ValueError("need 0 <= mask_min_ratio <= mask_max_ratio <= 1")
 
@@ -388,18 +403,25 @@ class MaskPredictor(nn.Module):
 
 
 class NextPredictor(nn.Module):
-    """Predicts the target encoder's z of the next position from z and the move played."""
+    """
+    Predicts the target encoder's z of the position a move leads to, from z (encoded, or predicted by
+    the previous rollout step) and the move. The move's squares are tokens of the starting position, and
+    a learned embedding of the step number tells the predictor which side is moving and how far the
+    board has drifted from those tokens.
+    """
 
     def __init__(self, config: JEPAConfig):
         super().__init__()
         c = config
         self.promotion = nn.Embedding(7, c.move_dim)          # 0 = none, else the python-chess piece type
+        self.step = nn.Embedding(c.rollout_max_steps + 1, c.move_dim)
         self.move = _mlp([2 * c.d_model + 3, c.move_dim, c.move_dim])
         self.body = _mlp([c.z_dim + c.move_dim] + [c.next_hidden] * c.next_layers + [c.z_dim])
 
     def forward(self, z: torch.Tensor, from_token: torch.Tensor, to_token: torch.Tensor,
-                promotion: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+                promotion: torch.Tensor, flags: torch.Tensor, step: int = 1) -> torch.Tensor:
         move = self.move(torch.cat([from_token, to_token, flags], dim=-1)) + self.promotion(promotion)
+        move = move + self.step.weight[step]
         return z + self.body(torch.cat([z, move], dim=-1))     # residual: predict the change
 
 
@@ -507,6 +529,22 @@ class LabyrinthJEPA(nn.Module):
         for b_t, b_c in zip(self.target.buffers(), self.encoder.buffers()):
             b_t.copy_(b_c)
 
+    def predict_rollout(self, z: torch.Tensor, squares: torch.Tensor, steps: Sequence[ld.RolloutStep]) -> List[torch.Tensor]:
+        """
+        Latent rollout: z [B, z_dim] and squares [B, 64, d_model] of the starting positions (online
+        encoder) -> one prediction per step, [B_k, z_dim], each from the previous step's prediction.
+        Uses only the starting positions and the moves; the steps' graphs (the intermediate positions)
+        are never read here, only encoded as targets elsewhere.
+        """
+        flat = squares.reshape(-1, squares.size(-1))
+        source, predictions = z, []
+        for k, step in enumerate(steps, start=1):
+            pred = self.next_predictor(source[step.parent], flat[step.move_from], flat[step.move_to],
+                                       step.promotion, step.flags, k)
+            predictions.append(pred)
+            source = pred
+        return predictions
+
     def _distance(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Per-row loss against a layer-normalized target."""
         target = F.layer_norm(target, target.shape[-1:])
@@ -514,16 +552,23 @@ class LabyrinthJEPA(nn.Module):
             return F.mse_loss(pred, target, reduction="none").mean(-1)
         return F.smooth_l1_loss(pred, target, reduction="none").mean(-1)
 
-    def losses(self, batch: ld.JEPABatch, rng: Optional[torch.Generator] = None) -> JEPALosses:
-        """All training losses for one batch (already on the model's device)."""
+    def losses(self, batch: ld.JEPABatch, rng: Optional[torch.Generator] = None,
+               rollout_weights: Optional[Sequence[float]] = None) -> JEPALosses:
+        """
+        All training losses for one batch (already on the model's device). rollout_weights: the loss
+        weight of each rollout step (rollout_schedule gives them); its length is how many moves ahead to
+        predict, and the batch must reach at least that far where games allow. Default: one move.
+        """
         c = self.config
         B = batch.num_graphs
         stats: Dict[str, float] = {}
+        weights = list(rollout_weights) if rollout_weights is not None else [1.0]
+        steps = batch.rollout[:len(weights)]
 
         with torch.no_grad():
             self.target.eval()
             target_full = self.target(batch.full, rng=rng)
-            target_next = self.target(batch.next, rng=rng) if batch.next is not None else None
+            target_steps = [self.target(step.graphs, rng=rng).z for step in steps]
 
         # ---- masked squares ----
         ctx_masked = self.encoder(batch.context, mask=batch.mask, rng=rng)
@@ -534,31 +579,44 @@ class LabyrinthJEPA(nn.Module):
         mask_per_pos = torch.zeros(B, device=per_square.device).index_add(0, owner, per_square) / n_masked
         mask_loss = mask_per_pos.mean()
 
-        # ---- next position ----
-        if batch.next is not None and batch.next_index.numel():
+        # ---- next positions: a latent rollout, a loss at every step ----
+        if steps:
             ctx_full = self.encoder(batch.full, rng=rng)
-            flat = ctx_full.squares.reshape(B * 64, -1)
-            pred_next = self.next_predictor(ctx_full.z[batch.next_index], flat[batch.move_from], flat[batch.move_to],
-                                            batch.promotion, batch.move_flags)
-            next_per_pos = self._distance(pred_next, target_next.z)
-            next_loss = next_per_pos.mean()
+            predictions = self.predict_rollout(ctx_full.z, ctx_full.squares, steps)
+            loss_sum = mask_loss.new_zeros(B)
+            weight_sum = mask_loss.new_zeros(B)
+            weighted, total_weight = mask_loss.new_zeros(()), 0.0
+            for k, (step, pred, target_z, w) in enumerate(zip(steps, predictions, target_steps, weights), start=1):
+                per = self._distance(pred, target_z)
+                loss_sum = loss_sum.index_add(0, step.index, w * per)
+                weight_sum = weight_sum.index_add(0, step.index, torch.full_like(per, w))
+                weighted = weighted + w * per.mean()
+                total_weight += w
+                stats[f"loss_next_{k}"] = float(per.detach().mean())
+            next_loss = weighted / max(total_weight, 1e-12)
+            first = steps[0].index
+            next_per_pos = loss_sum[first] / weight_sum[first].clamp_min(1e-12)   # each position's weighted rollout loss
         else:
             ctx_full, next_per_pos, next_loss = None, None, mask_loss.new_zeros(())
+        stats["rollout_steps"] = float(len(steps))
 
         total = c.mask_weight * mask_loss + c.next_weight * next_loss
 
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
         if c.anticollapse != "none":
-            embeddings = [ctx_masked.z] + ([ctx_full.z] if ctx_full is not None else [])
+            embeddings = [("masked", ctx_masked.z)] + ([("full", ctx_full.z)] if ctx_full is not None else [])
             if c.anticollapse_squares:
                 squares = ctx_masked.squares.reshape(-1, c.d_model)
                 if squares.size(0) > 4096:     # a random subset keeps the cost bounded
                     keep = torch.randperm(squares.size(0), device=squares.device, generator=rng)[:4096]
                     squares = squares[keep]
-                embeddings.append(squares)
+                embeddings.append(("squares", squares))
             terms = []
-            for e in embeddings:
+            # Measured on the current batch only. (A queue of recent embeddings was tried, to give the
+            # statistic more samples: the queue's centre lags the encoder, so the cheapest way to lower
+            # the statistic became moving the whole batch away from it, and training collapsed.)
+            for name, e in embeddings:
                 if c.anticollapse == "sigreg":
                     terms.append(sigreg(e, rng, c.sigreg_slices, c.sigreg_points, c.sigreg_t_max, c.sigreg_unbiased))
                 else:
@@ -574,7 +632,7 @@ class LabyrinthJEPA(nn.Module):
         if c.uses_unpool and c.unpool_rl:
             terms = [("mask", ctx_masked, mask_per_pos, slice(None))]
             if ctx_full is not None:
-                terms.append(("next", ctx_full, next_per_pos, batch.next_index))
+                terms.append(("next", ctx_full, next_per_pos, steps[0].index))
             for name, out, loss_per_pos, rows in terms:
                 reward = -loss_per_pos.detach()
                 baseline = self.baselines[name](out.z[rows].detach()).squeeze(-1)
@@ -619,6 +677,26 @@ def describe(config: JEPAConfig) -> Dict[str, Any]:
         "max_tokens": config.max_tokens,
         "z_dim": config.z_dim,
     }
+
+
+def rollout_schedule(config: JEPAConfig, positions_seen: int) -> List[float]:
+    """
+    The loss weight of each rollout step after positions_seen training positions; the list's length is
+    how many moves ahead to predict. One move at first, one more every rollout_stage_positions positions,
+    up to rollout_max_steps. A newly added step's weight rises linearly from 0 to its full value over the
+    first rollout_ramp_fraction of its stage. Step k's full weight is rollout_step_decay ** (k - 1).
+    """
+    c = config
+    if c.rollout_stage_positions <= 0 or c.rollout_max_steps == 1:
+        steps, ramp = c.rollout_max_steps, 1.0
+    else:
+        steps = min(c.rollout_max_steps, 1 + positions_seen // c.rollout_stage_positions)
+        added_at = (steps - 1) * c.rollout_stage_positions
+        progress = (positions_seen - added_at) / c.rollout_stage_positions
+        ramp = 1.0 if steps == 1 else min(1.0, progress / c.rollout_ramp_fraction)
+    weights = [c.rollout_step_decay ** k for k in range(steps)]
+    weights[-1] *= ramp
+    return weights
 
 
 # ##### ##### ##### ##### #####
@@ -738,7 +816,7 @@ def build_jepa_configspace(seed: int = 0, include_training: bool = True, fixed: 
     I = CS.UniformIntegerHyperparameter
     U = CS.UniformFloatHyperparameter
 
-    # (hyperparameter, None or (the hyperparameter it depends on, the value it needs))
+    # (hyperparameter, None or (the hyperparameter it depends on, the value it needs, or a list of values))
     specs = [
         # square stage
         (I("gat_layers", lower=2, upper=4), None),
@@ -764,6 +842,9 @@ def build_jepa_configspace(seed: int = 0, include_training: bool = True, fixed: 
         (U("mask_min_ratio", lower=0.05, upper=0.25), None),
         (U("mask_max_ratio", lower=0.30, upper=0.60), None),
         (I("mask_max_block_radius", lower=0, upper=2), None),
+        # rollout curriculum
+        (H("rollout_max_steps", choices=[1, 2, 3, 4, 6]), None),
+        (H("rollout_stage_positions", choices=[100_000, 250_000, 500_000]), ("rollout_max_steps", [2, 3, 4, 6])),
     ]
     if include_training:
         specs += [
@@ -778,18 +859,25 @@ def build_jepa_configspace(seed: int = 0, include_training: bool = True, fixed: 
             (U("rl_entropy_coef", lower=1e-5, upper=1e-2, log=True), ("token_variant", "unpool")),
         ]
 
+    def allows(condition: Tuple[str, Any], value: Any) -> bool:
+        return value in condition[1] if isinstance(condition[1], (list, tuple)) else value == condition[1]
+
     cs = CS.ConfigurationSpace(seed=seed)
     kept: Dict[str, Tuple[Any, Optional[Tuple[str, Any]]]] = {}
     for hp, condition in specs:
         if hp.name in fixed:
             continue
-        if condition is not None and condition[0] in fixed and fixed[condition[0]] != condition[1]:
+        if condition is not None and condition[0] in fixed and not allows(condition, fixed[condition[0]]):
             continue                       # it only applies under a value the fixed setting rules out
         cs.add_hyperparameter(hp)
         kept[hp.name] = (hp, condition)
     for hp, condition in kept.values():
         if condition is not None and condition[0] in kept:
-            cs.add_condition(CS.EqualsCondition(hp, kept[condition[0]][0], condition[1]))
+            parent = kept[condition[0]][0]
+            if isinstance(condition[1], (list, tuple)):
+                cs.add_condition(CS.InCondition(hp, parent, list(condition[1])))
+            else:
+                cs.add_condition(CS.EqualsCondition(hp, parent, condition[1]))
     return cs
 
 

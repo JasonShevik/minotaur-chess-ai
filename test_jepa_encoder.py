@@ -282,7 +282,49 @@ def test_search_space_leaves_out_fixed_values():
     for sample in unpool.sample_configuration(5):       # the unpool settings are now always sampled
         assert "unpool_layers" in dict(sample)
     assert not names(lje.build_jepa_configspace(fixed={"anticollapse": "none"})) & {"sigreg_weight", "vicreg_weight"}
+    assert "rollout_stage_positions" not in names(lje.build_jepa_configspace(fixed={"rollout_max_steps": 1}))
+    assert "rollout_stage_positions" in names(lje.build_jepa_configspace(fixed={"rollout_max_steps": 4}))
+    for sample in lje.build_jepa_configspace(seed=3).sample_configuration(30):
+        values = dict(sample)
+        assert ("rollout_stage_positions" in values) == (values["rollout_max_steps"] > 1)
     assert names(squares) < full
+
+
+def test_rollout_schedule():
+    cfg = small_config(rollout_max_steps=3, rollout_stage_positions=1000, rollout_ramp_fraction=0.25,
+                       rollout_step_decay=0.5)
+    assert lje.rollout_schedule(cfg, 0) == [1.0]
+    assert lje.rollout_schedule(cfg, 999) == [1.0]
+    assert lje.rollout_schedule(cfg, 1000) == [1.0, 0.0]                # a new step starts at weight 0 ...
+    assert abs(lje.rollout_schedule(cfg, 1125)[1] - 0.25) < 1e-9        # ... ramps over a quarter of its stage ...
+    assert lje.rollout_schedule(cfg, 1250) == [1.0, 0.5]                # ... to decay ** 1
+    assert len(lje.rollout_schedule(cfg, 10 ** 9)) == 3                 # never past rollout_max_steps
+    assert lje.rollout_schedule(small_config(rollout_max_steps=3, rollout_stage_positions=0), 0) == [1.0, 1.0, 1.0]
+
+
+def test_latent_rollout_trains_every_step_without_peeking():
+    cfg = small_config("registers", rollout_max_steps=3)
+    model = lje.LabyrinthJEPA(cfg)
+    rnd = random.Random(31)
+    batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=3) for f in FENS[:4]])
+    assert len(batch.rollout) == 3
+    losses = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0, 1.0, 1.0])
+    assert torch.isfinite(losses.total) and {"loss_next_1", "loss_next_2", "loss_next_3"} <= set(losses.stats)
+    losses.total.backward()
+    assert float(model.next_predictor.step.weight.grad[3].abs().sum()) > 0, "step 3 must train"
+    # the rollout reads only the starting positions and the moves: garbage intermediate graphs change nothing
+    with torch.no_grad():
+        enc = model.encoder(batch.full)
+        clean = model.predict_rollout(enc.z, enc.squares, batch.rollout)
+        for step in batch.rollout:
+            step.graphs.x.fill_(7.0)
+            step.graphs.edge_attr.fill_(3.0)
+        dirty = model.predict_rollout(enc.z, enc.squares, batch.rollout)
+    assert all(torch.equal(a, b) for a, b in zip(clean, dirty))
+    # a step with weight 0 contributes nothing to the loss
+    a = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0, 0.0]).next
+    b = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0]).next
+    assert torch.allclose(a, b, atol=1e-6)
 
 
 def test_dehb_search_space_samples_build():
