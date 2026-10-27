@@ -300,6 +300,38 @@ def test_rollout_schedule():
     assert lje.rollout_schedule(cfg, 1250) == [1.0, 0.5]                # ... to decay ** 1
     assert len(lje.rollout_schedule(cfg, 10 ** 9)) == 3                 # never past rollout_max_steps
     assert lje.rollout_schedule(small_config(rollout_max_steps=3, rollout_stage_positions=0), 0) == [1.0, 1.0, 1.0]
+    # starting longer: rollout_start_steps at once, then one more per stage
+    start = small_config(rollout_start_steps=3, rollout_max_steps=20, rollout_stage_positions=1000)
+    assert lje.rollout_schedule(start, 0) == [1.0, 1.0, 1.0]
+    assert lje.rollout_schedule(start, 1000) == [1.0, 1.0, 1.0, 0.0]
+    assert len(lje.rollout_schedule(start, 17_000)) == 20 and lje.rollout_schedule(start, 17_250)[-1] == 1.0
+    # which steps are graded
+    assert lje.rollout_target_steps(start, 20) is None
+    log = small_config(rollout_targets="log", rollout_max_steps=20)
+    assert lje.rollout_target_steps(log, 20) == [1, 2, 4, 8, 16, 20]
+    assert lje.rollout_target_steps(log, 1) == [1] and lje.rollout_target_steps(log, 3) == [1, 2, 3]
+    for bad in (dict(rollout_start_steps=5, rollout_max_steps=4), dict(rollout_targets="some")):
+        try:
+            small_config(**bad).validate()
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} must be refused")
+
+
+def test_long_rollouts_grade_only_the_target_steps():
+    cfg = small_config("registers", rollout_max_steps=6, rollout_targets="log")
+    model = lje.LabyrinthJEPA(cfg)
+    targets = lje.rollout_target_steps(cfg, 6)
+    rnd = random.Random(32)
+    batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=6, target_steps=targets)
+                             for f in FENS[:4]])
+    losses = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0] * 6)
+    graded = {k for k in range(1, 7) if f"loss_next_{k}" in losses.stats}
+    assert graded == {1, 2, 4, 6}, graded
+    losses.total.backward()
+    # the ungraded steps are still on the way to the graded ones, so their step embeddings train too
+    assert float(model.next_predictor.step.weight.grad[3].abs().sum()) > 0
+    assert float(model.next_predictor.step.weight.grad[6].abs().sum()) > 0
 
 
 def test_latent_rollout_trains_every_step_without_peeking():
@@ -349,7 +381,8 @@ def test_decorrelation_term_adds_to_sigreg():
 def test_loss_terms_add_up_to_the_total():
     """JEPALosses.terms splits total into each term's weighted share, one per regularized embedding."""
     cases = [("unpool", dict()), ("registers", dict(decorrelation_weight=0.5, anticollapse_squares=True)),
-             ("squares", dict(anticollapse="vicreg")), ("squares", dict(anticollapse="none"))]
+             ("squares", dict(anticollapse="vicreg")), ("squares", dict(anticollapse="none")),
+             ("squares", dict(zpred_weight=0.5, projector_layers=2, projector_hidden=32, projector_dim=16))]
     for variant, kw in cases:
         cfg = small_config(variant, **kw)
         torch.manual_seed(0)
@@ -362,7 +395,41 @@ def test_loss_terms_add_up_to_the_total():
             expected |= {"decorrelation"} if cfg.decorrelation_weight > 0 else set()
             assert all(f"anticollapse_{n}" in out.stats for n in ("masked", "full"))
         expected |= {"rl"} if cfg.uses_unpool and cfg.unpool_rl else set()
+        expected |= {"zpred"} if cfg.zpred_weight > 0 else set()
         assert set(out.terms) == expected, (variant, kw, sorted(out.terms))
+
+
+def test_whole_board_predictor_projector_and_regularized_views():
+    batch = make_batch(small_config("squares"))
+    rng = lambda: torch.Generator().manual_seed(0)
+    # the whole-board term grades z of the masked board, through the readout
+    cfg = small_config("squares", zpred_weight=1.0, anticollapse="none")
+    model = lje.LabyrinthJEPA(cfg)
+    out = model.losses(batch, rng=rng())
+    assert out.stats["loss_zpred"] > 0
+    out.terms["zpred"].backward()
+    assert float(model.full_predictor.body[0].weight.grad.abs().sum()) > 0
+    assert float(model.encoder.readout_proj.weight.grad.abs().sum()) > 0
+    assert lje.LabyrinthJEPA(small_config("squares")).full_predictor is None
+    # which views are regularized
+    for views, names in (("both", {"masked", "full"}), ("full", {"full"}), ("masked", {"masked"})):
+        out = lje.LabyrinthJEPA(small_config("squares", anticollapse_views=views)).losses(batch, rng=rng())
+        assert {k[len("anticollapse_"):] for k in out.terms if k.startswith("anticollapse_")} == names, views
+    # with a projector, the regularizer sees the head's output, and its gradient reaches z through the head
+    cfg = small_config("squares", projector_layers=2, projector_hidden=48, projector_dim=24)
+    model = lje.LabyrinthJEPA(cfg)
+    seen = []
+    original = lje.sigreg
+    try:
+        lje.sigreg = lambda e, *a, **k: (seen.append(e.shape[-1]), original(e, *a, **k))[1]
+        out = model.losses(batch, rng=rng())
+    finally:
+        lje.sigreg = original
+    assert seen == [24, 24]
+    out.terms["anticollapse_full"].backward()
+    assert float(model.projector[0].weight.grad.abs().sum()) > 0
+    assert float(model.encoder.readout_proj.weight.grad.abs().sum()) > 0
+    assert not any(n.startswith("projector") for n, _ in model.encoder.named_parameters())
 
 
 def test_dehb_search_space_samples_build():

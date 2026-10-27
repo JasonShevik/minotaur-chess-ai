@@ -13,7 +13,8 @@ train(model_config, run_config) is one training run:
     ema_start to ema_end over the run;
   * the rollout curriculum (labyrinth_jepa_encoder.rollout_schedule): how many moves ahead the model
     predicts grows with the number of training positions seen; when it grows, the loader continues the
-    current epoch with longer rollouts, without repeating positions;
+    current epoch with longer rollouts, without repeating positions, building graphs only for the steps
+    that are graded (rollout_target_steps);
   * non-finite losses or gradients skip the step (too many in a row stop the run);
   * a memory guard: on Windows a GPU that runs out of memory does not fail, it silently spills into
     system memory and slows down a hundredfold, so a run whose peak memory exceeds memory_budget of the
@@ -167,7 +168,8 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
     metrics.update({f"online_{k}": v for k, v in online.items()})
     if val_loader is not None:
         val_loader.set_epoch(0)
-        val_loader.set_rollout_steps(len(rollout_weights) if rollout_weights else 1)
+        steps = len(rollout_weights) if rollout_weights else 1
+        val_loader.set_rollout_steps(steps, lje.rollout_target_steps(model.config, steps))
         gen = torch.Generator(device=device).manual_seed(run.seed + 12345)
         sums: Dict[str, float] = {"val_loss_mask": 0.0, "val_loss_next": 0.0}
         n = 0
@@ -175,6 +177,8 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
             out = model.losses(batch.to(device), rng=gen, rollout_weights=rollout_weights)
             sums["val_loss_mask"] += float(out.mask)
             sums["val_loss_next"] += float(out.next)
+            if "loss_zpred" in out.stats:
+                sums["val_loss_zpred"] = sums.get("val_loss_zpred", 0.0) + out.stats["loss_zpred"]
             n += 1
         metrics.update({k: v / max(1, n) for k, v in sums.items()})
     model.train(was_training)
@@ -420,7 +424,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     loader.resume_at((step - epoch * len(loader)) * batch_size)
     epoch_start_step = epoch * len(loader)
     rollout_weights = lje.rollout_schedule(config, step * batch_size)
-    loader.set_rollout_steps(len(rollout_weights))
+    loader.set_rollout_steps(len(rollout_weights), lje.rollout_target_steps(config, len(rollout_weights)))
     batches = iter(loader)
     skips = 0
     t_last, positions_since = time.perf_counter(), 0
@@ -459,7 +463,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
         new_weights = lje.rollout_schedule(config, step * batch_size)
         if len(new_weights) != len(rollout_weights):
             # The curriculum adds a move: continue this epoch with longer rollouts, without repeating positions
-            loader.set_rollout_steps(len(new_weights))
+            loader.set_rollout_steps(len(new_weights), lje.rollout_target_steps(config, len(new_weights)))
             loader.resume_at((step - epoch_start_step) * batch_size)
             batches = iter(loader)
             log(f"[{step:>7}] rollout curriculum: now predicting {len(new_weights)} move(s) ahead")
@@ -517,8 +521,9 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             if device.type == "cuda":
                 entry["gpu_peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
             record(entry)
+            zpred = f"zpred={entry['loss_zpred']:.4f} " if "loss_zpred" in entry else ""
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
-                f"K={len(rollout_weights)} "
+                f"{zpred}K={len(rollout_weights)} "
                 f"reg={entry['anticollapse']:.3f} z_std={entry['z_std']:.3f} z_cos={entry['z_mean_cosine']:.3f} "
                 f"lr={entry['lr']:.2e} {entry['positions_per_s']:.0f} pos/s")
             t_last, positions_since = now, 0
@@ -634,6 +639,8 @@ def _plot(history: List[Dict[str, Any]], out_dir: str) -> None:
     fig, ((a0, a1, a2), (b0, b1, b2)) = plt.subplots(2, 3, figsize=(15, 8))
     a0.plot([h["step"] for h in steps], [h["loss_mask"] for h in steps], label="masked squares")
     a0.plot([h["step"] for h in steps], [h["loss_next"] for h in steps], label="next position")
+    if any("loss_zpred" in h for h in steps):
+        a0.plot([h["step"] for h in steps], [h.get("loss_zpred", math.nan) for h in steps], label="whole board z")
     a0.set_title("Training losses"); a0.set_xlabel("step"); a0.legend()
     a1.plot([h["step"] for h in evals], [h["eval"]["lidar"] for h in evals], marker="o", label="LiDAR")
     a1.plot([h["step"] for h in evals], [h["eval"]["rankme_centered"] for h in evals], marker="o",

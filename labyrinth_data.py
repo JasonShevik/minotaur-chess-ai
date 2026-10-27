@@ -19,10 +19,11 @@ DataLoader worker processes so the GPU never waits.
         One item per position: a JEPASample with
           * the full board's graph (what the target encoder sees),
           * a masked view of it (what the context encoder sees for masked-square prediction),
-          * a rollout of up to rollout_steps random legal moves and the graph of every position they lead
-            to (for predicting positions one, two, ... moves ahead). Every move is described by squares of
-            the STARTING position's graph, so a model rolling the moves forward in latent space never sees
-            the intermediate positions.
+          * a rollout of up to rollout_steps random legal moves and the graphs of the positions they lead
+            to (for predicting positions one, two, ... moves ahead): of every one, or only of the target
+            steps set with set_rollout_steps (long rollouts need far fewer graphs than moves). Every move is
+            described by squares of the STARTING position's graph, so a model rolling the moves forward in
+            latent space never sees the intermediate positions.
         Every random choice comes from a generator seeded by (seed, epoch, index), so a run is
         reproducible whatever the number of workers.
 
@@ -511,7 +512,7 @@ class NextPosition:
     to_square: int         # likewise (the rook's square for castling)
     promotion: int         # 0, or the python-chess piece type promoted to
     flags: Tuple[bool, bool, bool]   # (is_castling, is_capture, is_en_passant)
-    view: GraphView        # the next position's graph
+    view: Optional[GraphView]        # the next position's graph; None when this step is not a target
 
 
 @dataclass
@@ -547,11 +548,13 @@ def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, che
 
 
 def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskConfig(),
-                 mask: Optional[torch.Tensor] = None, rollout_steps: int = 1) -> JEPASample:
+                 mask: Optional[torch.Tensor] = None, rollout_steps: int = 1,
+                 target_steps: Optional[Sequence[int]] = None) -> JEPASample:
     """
     Everything one position contributes to a training step. fen should be normalized (normalize_fen);
     the cache already is. mask: use this mask instead of sampling one. rollout_steps: how many random
-    legal moves to play from the position (fewer if the game ends first).
+    legal moves to play from the position (fewer if the game ends first). target_steps: the steps
+    (1 = the first move) whose positions get a graph, as prediction targets; None: every step.
 
     The random draws come in a fixed order (mask, then move 1, move 2, ...), so for a given rng the
     mask and the first moves are the same whatever rollout_steps is.
@@ -564,17 +567,19 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     # rolling the moves forward never needs the intermediate positions' graphs, only their targets.
     orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
     rollout: List[NextPosition] = []
+    targets = None if target_steps is None else set(target_steps)
     current, current_rooks = board, rook_squares
-    for _ in range(rollout_steps):
+    for k in range(1, rollout_steps + 1):
         moves = list(current.legal_moves)
         if not moves:
             break
         move = rng.choice(moves)
         t = cg.move_transition(current, move, current_rooks)
-        next_edges, next_x = cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares)
+        view = None
+        if targets is None or k in targets:
+            view = GraphView.from_edge_lists(*cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares))
         rollout.append(NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
-                                    t.promotion, (t.is_castling, t.is_capture, t.is_en_passant),
-                                    GraphView.from_edge_lists(next_edges, next_x)))
+                                    t.promotion, (t.is_castling, t.is_capture, t.is_en_passant), view))
         current = current.copy(stack=False)
         current.push(move)
         current_rooks = t.next_castling_rook_squares
@@ -616,7 +621,7 @@ class RolloutStep:
     """
     Move k of the rollouts in a batch, for the B_k positions whose rollout reaches it (B_k shrinks when
     games end).
-      graphs     GraphBatch of the positions after move k (the targets)
+      graphs     GraphBatch of the positions after move k (the targets); None when move k is not a target step
       index      [B_k] which of the batch's B positions each row belongs to
       parent     [B_k] the row each one continues from: for move 1 an index into the B positions, for
                  move k > 1 a row of move k - 1
@@ -625,7 +630,7 @@ class RolloutStep:
       promotion  [B_k] 0, or the piece type promoted to
       flags      [B_k, 3] (is_castling, is_capture, is_en_passant) as floats
     """
-    graphs: GraphBatch
+    graphs: Optional[GraphBatch]
     index: torch.Tensor
     parent: torch.Tensor
     move_from: torch.Tensor
@@ -634,7 +639,8 @@ class RolloutStep:
     flags: torch.Tensor
 
     def _map(self, fn, graph_fn) -> "RolloutStep":
-        return RolloutStep(graph_fn(self.graphs), fn(self.index), fn(self.parent), fn(self.move_from),
+        graphs = graph_fn(self.graphs) if self.graphs is not None else None
+        return RolloutStep(graphs, fn(self.index), fn(self.parent), fn(self.move_from),
                            fn(self.move_to), fn(self.promotion), fn(self.flags))
 
     def to(self, device, non_blocking: bool = False) -> "RolloutStep":
@@ -722,7 +728,7 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
             row_of = {sample: row for row, sample in enumerate(previous)}
             parent = torch.tensor([row_of[i] for i in ids], dtype=torch.long)
         steps.append(RolloutStep(
-            graphs=pack_views([m.view for m in moves]),
+            graphs=pack_views([m.view for m in moves]) if moves[0].view is not None else None,
             index=index,
             parent=parent,
             move_from=index * 64 + torch.tensor([m.from_square for m in moves], dtype=torch.long),
@@ -761,6 +767,7 @@ class PositionDataset(Dataset):
         self.seed = int(seed)
         self.epoch = 0
         self.rollout_steps = 1
+        self.rollout_targets: Optional[List[int]] = None     # None: every step is a target
         self._positions: Optional[np.ndarray] = None
         total = len(np.load(self.path, mmap_mode="r"))
         self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
@@ -788,7 +795,8 @@ class PositionDataset(Dataset):
         return random.Random((self.seed * 1_000_003 + self.epoch) * 10_000_019 + i)
 
     def __getitem__(self, i: int) -> JEPASample:
-        return build_sample(self.fen(i), self.rng_for(i), self.mask_config, rollout_steps=self.rollout_steps)
+        return build_sample(self.fen(i), self.rng_for(i), self.mask_config, rollout_steps=self.rollout_steps,
+                            target_steps=self.rollout_targets)
 
 
 class _EpochShuffle(Sampler):
@@ -835,9 +843,13 @@ class JEPALoader:
         self.dataset.epoch = int(epoch)
         self.sampler.start = 0
 
-    def set_rollout_steps(self, steps: int) -> None:
-        """How many moves ahead each sample's rollout goes (takes effect for the next iterator)."""
+    def set_rollout_steps(self, steps: int, targets: Optional[Sequence[int]] = None) -> None:
+        """
+        How many moves ahead each sample's rollout goes, and which of its steps get a graph as a target
+        (None: every step). Takes effect for the next iterator.
+        """
         self.dataset.rollout_steps = int(steps)
+        self.dataset.rollout_targets = None if targets is None else sorted(int(k) for k in targets)
 
     def resume_at(self, positions_into_epoch: int) -> None:
         """Make the next iterator continue the current epoch after this many positions, without repeats."""

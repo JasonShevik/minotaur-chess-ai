@@ -13,9 +13,13 @@ answers the predictors are graded against. Two predictors give the training sign
                      move leads to; then, from that prediction and the next move, the position after
                      that, and so on: a rollout in latent space, with a loss at every step. Moves are
                      always described with the STARTING position's square tokens, so the rollout never
-                     sees an intermediate position, only predicts it. A curriculum lengthens it: one
-                     move ahead at first, one more every rollout_stage_positions training positions, up
-                     to rollout_max_steps (see rollout_schedule).
+                     sees an intermediate position, only predicts it. A curriculum lengthens it:
+                     rollout_start_steps moves (plies) ahead at first, one more every
+                     rollout_stage_positions training positions, up to rollout_max_steps (see
+                     rollout_schedule). With rollout_targets = "log" only steps 1, 2, 4, 8, ... and the
+                     last are graded, so a long rollout needs few target encodings.
+    whole board      (zpred_weight > 0) From z of the masked board, predict the target encoder's z of
+                     the whole board: the masked-square task at the level of the position vector.
 
 The encoder:
 
@@ -40,6 +44,10 @@ z, and the predictors then win by learning that shared vector. An anti-collapse 
             direction used;
   "vicreg"  VICReg's variance and covariance terms: every dimension keeps a spread of at least 1 across
             the batch, and dimensions are decorrelated.
+It acts on z of the masked and / or the whole board (anticollapse_views), or, with projector_layers > 0,
+on an MLP head's output: pushing a vector towards a fixed distribution costs the layers nearest to it
+information (guillotine regularization), so the head takes that cost and z, before it, is the
+representation.
 
 The three variants share everything else, so comparing them answers whether the unpooling layers
 earn their place. The unpooling decisions are sampled everywhere, in the target encoder too; their
@@ -74,6 +82,8 @@ import labyrinth_data as ld
 
 TOKEN_VARIANTS = ("squares", "registers", "unpool")
 ANTICOLLAPSE = ("sigreg", "vicreg", "none")
+ANTICOLLAPSE_VIEWS = ("both", "full", "masked")
+ROLLOUT_TARGETS = ("all", "log")
 
 
 # ##### ##### ##### ##### #####
@@ -124,6 +134,11 @@ class JEPAConfig:
     next_hidden: int = 1024
     next_layers: int = 2
 
+    # ----- Whole-board predictor: the target's z of the whole board from z of the masked board -----
+    zpred_weight: float = 0.0        # its loss weight; 0 leaves the predictor out
+    zpred_hidden: int = 1024
+    zpred_layers: int = 2
+
     # ----- Objectives -----
     mask_weight: float = 1.0
     next_weight: float = 1.0
@@ -142,12 +157,19 @@ class JEPAConfig:
     decorrelation_weight: float = 0.0  # adds VICReg's covariance (decorrelation) term on top of SIGReg: SIGReg's
                                        # random 1-D projections barely see a few strong factors spread across all
                                        # dimensions, which correlated dimensions are; 0 turns it off
+    anticollapse_views: str = "both" # which views' z are regularized: "both", "full" or "masked"
+    projector_layers: int = 0        # > 0: the regularizers act on an MLP head's output instead of on z itself, so
+    projector_hidden: int = 2048     # the head, not z, bends to fit the target distribution (z is the
+    projector_dim: int = 256         # representation; the head is only used in training)
 
-    # ----- Rollout curriculum (predicting several moves ahead) -----
+    # ----- Rollout curriculum (predicting several moves ahead; a "move" is one ply) -----
+    rollout_start_steps: int = 1     # the rollout's length at the start of training
     rollout_max_steps: int = 4       # the longest rollout
     rollout_stage_positions: int = 250_000   # training positions per curriculum stage (0: full length from the start)
     rollout_ramp_fraction: float = 0.25      # a newly added step's weight ramps from 0 to 1 over this part of its stage
     rollout_step_decay: float = 1.0  # step k's loss weight is decay ** (k - 1)
+    rollout_targets: str = "all"     # which steps get a loss (and a target graph): "all", or "log" (steps 1, 2, 4,
+                                     # 8, ... and the last), so long rollouts need few target encodings
 
     # ----- Unpooling decisions (REINFORCE) -----
     unpool_rl: bool = True           # False freezes the decision policy; everything else still trains
@@ -211,6 +233,14 @@ class JEPAConfig:
             raise ValueError(f"anticollapse must be one of {ANTICOLLAPSE}")
         if self.rollout_max_steps < 1 or self.rollout_stage_positions < 0:
             raise ValueError("need rollout_max_steps >= 1 and rollout_stage_positions >= 0")
+        if not 1 <= self.rollout_start_steps <= self.rollout_max_steps:
+            raise ValueError("need 1 <= rollout_start_steps <= rollout_max_steps")
+        if self.rollout_targets not in ROLLOUT_TARGETS:
+            raise ValueError(f"rollout_targets must be one of {ROLLOUT_TARGETS}")
+        if self.anticollapse_views not in ANTICOLLAPSE_VIEWS:
+            raise ValueError(f"anticollapse_views must be one of {ANTICOLLAPSE_VIEWS}")
+        if self.zpred_weight < 0 or self.zpred_layers < 1 or self.projector_layers < 0:
+            raise ValueError("need zpred_weight >= 0, zpred_layers >= 1 and projector_layers >= 0")
         if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
             raise ValueError("need 0 < rollout_ramp_fraction <= 1 and rollout_step_decay > 0")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
@@ -428,6 +458,23 @@ class NextPredictor(nn.Module):
         return z + self.body(torch.cat([z, move], dim=-1))     # residual: predict the change
 
 
+class FullPredictor(nn.Module):
+    """
+    Predicts the target encoder's z of the whole board from the online encoder's z of the masked board:
+    the position-level counterpart of the masked-square predictor. Without it, z of a masked board is
+    graded by nothing but the anti-collapse term, so the readout is free to make it depend on which
+    squares happen to be hidden.
+    """
+
+    def __init__(self, config: JEPAConfig):
+        super().__init__()
+        c = config
+        self.body = _mlp([c.z_dim] + [c.zpred_hidden] * (c.zpred_layers - 1) + [c.z_dim])
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return z + self.body(z)                                # residual: predict what the mask hid
+
+
 # ##### ##### ##### ##### #####
 #       Anti-collapse regularizers
 
@@ -515,6 +562,10 @@ class LabyrinthJEPA(nn.Module):
             p.requires_grad_(False)
         self.mask_predictor = MaskPredictor(config)
         self.next_predictor = NextPredictor(config)
+        self.full_predictor = FullPredictor(config) if config.zpred_weight > 0 else None
+        # The head the anti-collapse terms act on (none: they act on z itself); never part of the encoder
+        self.projector = _mlp([config.z_dim] + [config.projector_hidden] * (config.projector_layers - 1)
+                              + [config.projector_dim]) if config.projector_layers > 0 else None
         # Learned baselines for the unpooling rewards: each position's expected loss, from its z
         self.baselines = nn.ModuleDict({k: _mlp([config.z_dim, 256, 1]) for k in ("mask", "next")}) \
             if config.uses_unpool else None
@@ -563,7 +614,8 @@ class LabyrinthJEPA(nn.Module):
         """
         All training losses for one batch (already on the model's device). rollout_weights: the loss
         weight of each rollout step (rollout_schedule gives them); its length is how many moves ahead to
-        predict, and the batch must reach at least that far where games allow. Default: one move.
+        predict, and the batch must reach at least that far where games allow. Default: one move. Steps
+        the batch has no target graphs for (rollout_targets = "log") are predicted but not graded.
         """
         c = self.config
         B = batch.num_graphs
@@ -574,7 +626,8 @@ class LabyrinthJEPA(nn.Module):
         with torch.no_grad():
             self.target.eval()
             target_full = self.target(batch.full, rng=rng)
-            target_steps = [self.target(step.graphs, rng=rng).z for step in steps]
+            target_steps = [self.target(step.graphs, rng=rng).z if step.graphs is not None else None
+                            for step in steps]
 
         # ---- masked squares ----
         ctx_masked = self.encoder(batch.context, mask=batch.mask, rng=rng)
@@ -593,6 +646,8 @@ class LabyrinthJEPA(nn.Module):
             weight_sum = mask_loss.new_zeros(B)
             weighted, total_weight = mask_loss.new_zeros(()), 0.0
             for k, (step, pred, target_z, w) in enumerate(zip(steps, predictions, target_steps, weights), start=1):
+                if target_z is None:
+                    continue
                 per = self._distance(pred, target_z)
                 loss_sum = loss_sum.index_add(0, step.index, w * per)
                 weight_sum = weight_sum.index_add(0, step.index, torch.full_like(per, w))
@@ -609,10 +664,23 @@ class LabyrinthJEPA(nn.Module):
         contributions = {"mask": c.mask_weight * mask_loss, "next": c.next_weight * next_loss}
         total = contributions["mask"] + contributions["next"]
 
+        # ---- the whole board's z from the masked board's z ----
+        if self.full_predictor is not None:
+            zpred_loss = self._distance(self.full_predictor(ctx_masked.z), target_full.z).mean()
+            contributions["zpred"] = c.zpred_weight * zpred_loss
+            total = total + contributions["zpred"]
+            stats["loss_zpred"] = float(zpred_loss.detach())
+
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
         if c.anticollapse != "none":
-            embeddings = [("masked", ctx_masked.z)] + ([("full", ctx_full.z)] if ctx_full is not None else [])
+            embeddings = []
+            if c.anticollapse_views in ("both", "masked"):
+                embeddings.append(("masked", ctx_masked.z))
+            if c.anticollapse_views in ("both", "full") and ctx_full is not None:
+                embeddings.append(("full", ctx_full.z))
+            if self.projector is not None:
+                embeddings = [(name, self.projector(e)) for name, e in embeddings]
             if c.anticollapse_squares:
                 squares = ctx_masked.squares.reshape(-1, c.d_model)
                 if squares.size(0) > 4096:     # a random subset keeps the cost bounded
@@ -629,17 +697,18 @@ class LabyrinthJEPA(nn.Module):
                 else:
                     variance, covariance = vicreg_terms(e)
                     terms.append(variance + c.vicreg_cov_ratio * covariance)
-            anticollapse = torch.stack(terms).mean()
-            reg_weight = c.sigreg_weight if c.anticollapse == "sigreg" else c.vicreg_weight
-            total = total + reg_weight * anticollapse
-            for (name, _), term in zip(embeddings, terms):
-                contributions[f"anticollapse_{name}"] = reg_weight * term / len(terms)
-                stats[f"anticollapse_{name}"] = float(term.detach())
-            if c.decorrelation_weight > 0 and c.anticollapse == "sigreg":
-                decorrelation = torch.stack([vicreg_terms(e)[1] for _, e in embeddings]).mean()
-                contributions["decorrelation"] = c.decorrelation_weight * decorrelation
-                total = total + contributions["decorrelation"]
-                stats["decorrelation"] = float(decorrelation.detach())
+            if terms:                          # (none when the regularized view is absent from this batch)
+                anticollapse = torch.stack(terms).mean()
+                reg_weight = c.sigreg_weight if c.anticollapse == "sigreg" else c.vicreg_weight
+                total = total + reg_weight * anticollapse
+                for (name, _), term in zip(embeddings, terms):
+                    contributions[f"anticollapse_{name}"] = reg_weight * term / len(terms)
+                    stats[f"anticollapse_{name}"] = float(term.detach())
+                if c.decorrelation_weight > 0 and c.anticollapse == "sigreg":
+                    decorrelation = torch.stack([vicreg_terms(e)[1] for _, e in embeddings]).mean()
+                    contributions["decorrelation"] = c.decorrelation_weight * decorrelation
+                    total = total + contributions["decorrelation"]
+                    stats["decorrelation"] = float(decorrelation.detach())
 
         # ---- unpooling decisions: REINFORCE with learned baselines ----
         # A position involves thousands of decisions, so its log-probability and entropy are averaged per
@@ -691,6 +760,8 @@ def describe(config: JEPAConfig) -> Dict[str, Any]:
         "encoder_params": count_parameters(model.encoder),
         "mask_predictor_params": count_parameters(model.mask_predictor),
         "next_predictor_params": count_parameters(model.next_predictor),
+        "full_predictor_params": count_parameters(model.full_predictor) if model.full_predictor is not None else 0,
+        "projector_params": count_parameters(model.projector) if model.projector is not None else 0,
         "max_tokens": config.max_tokens,
         "z_dim": config.z_dim,
     }
@@ -699,21 +770,39 @@ def describe(config: JEPAConfig) -> Dict[str, Any]:
 def rollout_schedule(config: JEPAConfig, positions_seen: int) -> List[float]:
     """
     The loss weight of each rollout step after positions_seen training positions; the list's length is
-    how many moves ahead to predict. One move at first, one more every rollout_stage_positions positions,
-    up to rollout_max_steps. A newly added step's weight rises linearly from 0 to its full value over the
-    first rollout_ramp_fraction of its stage. Step k's full weight is rollout_step_decay ** (k - 1).
+    how many moves ahead to predict. rollout_start_steps moves at first, one more every
+    rollout_stage_positions positions, up to rollout_max_steps. A newly added step's weight rises
+    linearly from 0 to its full value over the first rollout_ramp_fraction of its stage. Step k's full
+    weight is rollout_step_decay ** (k - 1). Which steps are graded at all: rollout_target_steps.
     """
     c = config
-    if c.rollout_stage_positions <= 0 or c.rollout_max_steps == 1:
+    if c.rollout_stage_positions <= 0 or c.rollout_max_steps == c.rollout_start_steps:
         steps, ramp = c.rollout_max_steps, 1.0
     else:
-        steps = min(c.rollout_max_steps, 1 + positions_seen // c.rollout_stage_positions)
-        added_at = (steps - 1) * c.rollout_stage_positions
+        grown = positions_seen // c.rollout_stage_positions
+        steps = min(c.rollout_max_steps, c.rollout_start_steps + grown)
+        added_at = (steps - c.rollout_start_steps) * c.rollout_stage_positions
         progress = (positions_seen - added_at) / c.rollout_stage_positions
-        ramp = 1.0 if steps == 1 else min(1.0, progress / c.rollout_ramp_fraction)
+        ramp = 1.0 if steps == c.rollout_start_steps else min(1.0, progress / c.rollout_ramp_fraction)
     weights = [c.rollout_step_decay ** k for k in range(steps)]
     weights[-1] *= ramp
     return weights
+
+
+def rollout_target_steps(config: JEPAConfig, steps: int) -> Optional[List[int]]:
+    """
+    The steps of a rollout of this length that get a target graph and a loss: None for every step
+    (rollout_targets = "all"), or steps 1, 2, 4, 8, ... and the last ("log"). The rest are still
+    predicted (the rollout passes through them), just not graded.
+    """
+    if config.rollout_targets == "all":
+        return None
+    targets = {1, steps}
+    k = 2
+    while k < steps:
+        targets.add(k)
+        k *= 2
+    return sorted(targets)
 
 
 # ##### ##### ##### ##### #####

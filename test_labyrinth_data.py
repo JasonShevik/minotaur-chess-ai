@@ -371,6 +371,26 @@ def test_batches_of_uneven_rollouts_line_up():
     assert batch.moves[1] == [samples[1].rollout[0].move] and batch.moves[4] == []
 
 
+def test_rollouts_build_graphs_only_for_target_steps():
+    rng = random.Random(24)
+    boards = random_positions(6, seed=24, per_start=2)
+    seeds = [rng.randrange(10 ** 9) for _ in boards]
+    every = [ld.build_sample(ld.fen_of(b), random.Random(s), rollout_steps=6) for b, s in zip(boards, seeds)]
+    sparse = [ld.build_sample(ld.fen_of(b), random.Random(s), rollout_steps=6, target_steps=[1, 2, 4, 6])
+              for b, s in zip(boards, seeds)]
+    for a, b in zip(every, sparse):
+        # the same moves; graphs only where asked, and those the same graphs
+        assert [m.move for m in a.rollout] == [m.move for m in b.rollout]
+        for k, (ma, mb) in enumerate(zip(a.rollout, b.rollout), start=1):
+            assert (mb.view is not None) == (k in (1, 2, 4, 6))
+            if mb.view is not None:
+                assert torch.equal(ma.view.x, mb.view.x) and torch.equal(ma.view.edge_index, mb.view.edge_index)
+    batch = ld.collate_jepa(sparse)
+    assert [step.graphs is not None for step in batch.rollout] == [True, True, False, True, False, True]
+    moved = batch.to("cpu")
+    assert moved.rollout[2].graphs is None and torch.equal(moved.rollout[2].move_from, batch.rollout[2].move_from)
+
+
 def test_loader_rollout_length_and_mid_epoch_resume():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         path = os.path.join(tmp, "fens.txt")
