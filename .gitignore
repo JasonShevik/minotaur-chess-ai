@@ -26,6 +26,7 @@ dehb_jepa_out*/
 runs/
 ssl_positions*.txt
 probe_results*/
+move_distribution*.csv
 
 # ----- Python -----
 __pycache__/
