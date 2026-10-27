@@ -92,6 +92,40 @@ def test_puzzles_play_the_setting_move_first():
     assert out.numeric["puzzle_rating"].tolist() == [1811, 1529]
 
 
+TINY = dict(token_variant="squares", gat_dim=16, gat_heads=2, gat_layers=2, d_model=16, transformer_layers=1,
+            transformer_heads=2, readout_queries=2, z_dim=16, pred_dim=16, pred_gat_layers=1, pred_heads=2,
+            move_dim=16, next_hidden=16, next_layers=1)
+
+
+def test_encoder_views_are_the_encoders_own_vectors():
+    torch.manual_seed(0)
+    encoder = lje.LabyrinthEncoder(lje.JEPAConfig(**TINY)).eval()
+    viewer = pl.EncoderViews(encoder, list(pl.VIEWS))
+    rnd = random.Random(1)
+    board = chess.Board.from_chess960_pos(7)
+    fens = []
+    for _ in range(6):
+        board.push(rnd.choice(list(board.legal_moves)))
+        fens.append(ld.fen_of(board))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in fens])
+    views = viewer(graphs)
+    with torch.no_grad():
+        out = encoder(graphs)
+        assert torch.allclose(views["z"], out.z) and torch.allclose(views["token_mean"], out.squares.mean(1))
+        # the readout's input gives z through its last layer, and the captured transformer input gives the
+        # final square tokens through the transformer and its norm
+        assert torch.allclose(encoder.readout_proj(views["readout_in"]), out.z, atol=1e-5)
+        tokens = viewer._captured["pre_transformer"]
+        assert torch.allclose(encoder.final_norm(encoder.transformer(tokens)), out.squares, atol=1e-5)
+        assert torch.allclose(views["pre_transformer_mean"], tokens.mean(1))
+    assert views["readout_in"].shape == (6, 2 * 16)
+    try:
+        pl.EncoderViews(encoder, ["nope"])
+        assert False, "unknown views are refused"
+    except ValueError:
+        pass
+
+
 def test_end_to_end_writes_the_csvs():
     rnd = random.Random(0)
     boards = []
@@ -109,20 +143,35 @@ def test_end_to_end_writes_the_csvs():
     themes.binary["fork"] = np.array([i % 2 for i in range(60)], dtype=np.float32)
     themes.kinds["fork"] = "theme"
     pl._add_board_labels(themes, [pl.board_labels(b) for b in boards[:60]])
-    cfg = lje.JEPAConfig(token_variant="squares", gat_dim=16, gat_heads=2, gat_layers=2, d_model=16,
-                         transformer_layers=1, transformer_heads=2, readout_queries=2, z_dim=16, pred_dim=16,
-                         pred_gat_layers=1, pred_heads=2, move_dim=16, next_hidden=16, next_layers=1)
+    cfg = lje.JEPAConfig(**TINY)
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         ckpt = os.path.join(tmp, "best.pt")
-        torch.save({"model": lje.LabyrinthJEPA(cfg).state_dict(), "jepa_config": cfg.to_dict()}, ckpt)
+        model = lje.LabyrinthJEPA(cfg)
+        with torch.no_grad():
+            model.target.readout_proj.bias.add_(1.0)       # so the online and target encoders differ
+        torch.save({"model": model.state_dict(), "jepa_config": cfg.to_dict()}, ckpt)
         out = os.path.join(tmp, "results.csv")
         pl.run_probes({"tiny": ckpt}, [themes, labels], out, baselines=True, device="cpu", k=5, workers=0,
+                      views=["z", "token_mean"], online=True, report_fens=labels.fens[:24], report_samples=2,
                       log=lambda m: None)
         with open(out) as f:
             rows = list(csv.DictReader(f))
         with open(os.path.splitext(out)[0] + "_summary.csv") as f:
             summary = list(csv.DictReader(f))
+        with open(os.path.splitext(out)[0] + "_representation.csv") as f:
+            report = list(csv.DictReader(f))
+        for which, part in (("online", model.encoder), ("target", model.target)):
+            assert torch.equal(pl.load_encoder(ckpt, "cpu", which).readout_proj.bias, part.readout_proj.bias)
     assert {r["model"] for r in rows} == {"tiny", "untrained", "board_onehot"}
+    assert {(r["model"], r["encoder"], r["view"]) for r in rows} == {
+        ("tiny", "target", "z"), ("tiny", "target", "token_mean"), ("tiny", "online", "z"),
+        ("tiny", "online", "token_mean"), ("untrained", "random init", "z"), ("untrained", "random init", "token_mean"),
+        ("board_onehot", "", "onehot")}
+    assert {(r["model"], r["encoder"], r["view"]) for r in report} == {(r["model"], r["encoder"], r["view"])
+                                                                        for r in rows}
+    board = next(r for r in report if r["model"] == "board_onehot")
+    assert board["dims"] == "512" and 0 < float(board["self_consistency"]) < 1 and board["lidar"] == ""
+    assert {s["view"] for s in summary} == {"z", "token_mean", "onehot"}
     theme_rows = [r for r in rows if r["is_theme"] == "True"]
     assert {r["label"] for r in theme_rows} == {"fork"} and all(r["kind"] == "theme" for r in theme_rows)
     assert {"white_to_move", "material_balance", "eval_win_prob", "best_move:x"} <= {r["label"] for r in rows}

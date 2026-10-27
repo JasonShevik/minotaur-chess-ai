@@ -2,7 +2,8 @@
 Probes for trained Labyrinth encoders: what do the position vectors know about chess?
 
     python probe_labyrinth.py --model mine=runs/squares_sigreg/best.pt [--model other=...] \\
-        --puzzles lichess_db_puzzle.csv.zst --db minotaur_data.db --out probe_results.csv
+        --puzzles lichess_db_puzzle.csv.zst --db minotaur_data.db --out probe_results.csv \\
+        [--views z,token_mean,readout_in,pre_transformer_mean --online --report-cache labyrinth_ssl_cache]
 
 Every position is encoded by each model's target encoder (the one that is kept), and every label is
 measured three ways, on held-out positions:
@@ -36,6 +37,16 @@ Labels:
 
 Baselines, probed the same way (--baselines): an untrained encoder of the same architecture
 ("untrained") and the raw board encoding, the 64 squares' 8 features flattened ("board_onehot").
+
+Where to probe (--views, --online): z by default, or also vectors inside the encoder, to find where
+information is lost: token_mean (the final square tokens averaged, before the readout), readout_in (the
+readout's attention outputs before its last linear layer) and pre_transformer_mean (the square tokens
+averaged as they enter the transformer). --online also probes each checkpoint's online encoder, next to
+the target encoder. The encoder and view columns say which vector a row measured.
+
+Representation report (--report-cache): LiDAR, centred RankMe and the self-consistency ratio of every
+probed vector, baselines included, on the cache's val split under the light masks training evaluates
+with, so z's numbers can be read against what the untrained encoder and the raw board score.
 
 Probe train / test split: a hash of the position (80 / 20), so it is the same for every model.
 A notes column carries caveats: the labeled positions' castling bias (only ~5% have castling rights,
@@ -257,34 +268,119 @@ class _FenGraphs(Dataset):
         return ld.build_views(self.fens[i], torch.zeros(64, dtype=torch.bool))[0]
 
 
-def load_target_encoder(path: str, device) -> lje.LabyrinthEncoder:
-    """The target encoder of a training checkpoint (last.pt / best.pt)."""
+def load_encoder(path: str, device, which: str = "target") -> lje.LabyrinthEncoder:
+    """
+    One encoder of a training checkpoint (last.pt / best.pt): "target" (the moving average, the one that
+    is kept) or "online" (the one the optimizer trains).
+    """
+    prefix = {"target": "target.", "online": "encoder."}[which]
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     encoder = lje.LabyrinthEncoder(lje.JEPAConfig.from_dict(ckpt["jepa_config"]))
-    state = {k[len("target."):]: v for k, v in ckpt["model"].items() if k.startswith("target.")}
+    state = {k[len(prefix):]: v for k, v in ckpt["model"].items() if k.startswith(prefix)}
     encoder.load_state_dict(state)
     return encoder.to(device).eval()
 
 
+# The vectors an encoder can be probed at, from the readout's output back to the square stage
+VIEWS = {
+    "z": "the position vector (the readout's output)",
+    "token_mean": "the mean of the 64 final square tokens (after the transformer, before the readout)",
+    "readout_in": "the readout's attention outputs, normalized and concatenated, before its last linear layer",
+    "pre_transformer_mean": "the mean of the 64 square tokens entering the transformer (after the square GATs)",
+}
+
+
+class EncoderViews:
+    """
+    Runs an encoder and returns the requested views of each position (see VIEWS). The intermediate ones
+    are taken with forward hooks, so the encoder itself is unchanged.
+    """
+
+    def __init__(self, encoder: lje.LabyrinthEncoder, views: Sequence[str]):
+        unknown = set(views) - set(VIEWS)
+        if unknown:
+            raise ValueError(f"unknown views {sorted(unknown)}; choose from {sorted(VIEWS)}")
+        self.encoder, self.views = encoder, list(views)
+        self._captured: Dict[str, torch.Tensor] = {}
+        if "readout_in" in self.views:
+            encoder.readout_proj.register_forward_hook(
+                lambda module, args, output: self._captured.__setitem__("readout_in", args[0]))
+        if "pre_transformer_mean" in self.views:
+            encoder.transformer.register_forward_pre_hook(
+                lambda module, args: self._captured.__setitem__("pre_transformer", args[0]))
+
+    @torch.no_grad()
+    def __call__(self, graphs: ld.GraphBatch, mask: Optional[torch.Tensor] = None,
+                 rng: Optional[torch.Generator] = None) -> Dict[str, torch.Tensor]:
+        """{view: [B, dim] on the CPU}."""
+        out = self.encoder(graphs, mask=mask, rng=rng)
+        found = {"z": lambda: out.z,
+                 "token_mean": lambda: out.squares.mean(1),
+                 "readout_in": lambda: self._captured["readout_in"],
+                 "pre_transformer_mean": lambda: self._captured["pre_transformer"][:, :64].mean(1)}
+        return {view: found[view]().float().cpu() for view in self.views}
+
+
 @torch.no_grad()
-def encode_all(fens: Sequence[str], encoders: Dict[str, lje.LabyrinthEncoder], board_baseline: bool,
-               device, batch_size: int = 512, workers: int = 8, seed: int = 0, log=print) -> Dict[str, torch.Tensor]:
-    """{model name: [N, z_dim] on the CPU}, every model reading the same graph batches."""
+def encode_views(fens: Sequence[str], viewer: Optional[EncoderViews], device, batch_size: int = 512,
+                 workers: int = 8, seed: int = 0) -> Dict[str, torch.Tensor]:
+    """
+    {view: [N, dim] on the CPU} for one encoder; with viewer None, {"onehot": the raw board}, the 64
+    squares' features flattened.
+    """
     loader = DataLoader(_FenGraphs(fens), batch_size=batch_size, num_workers=workers, collate_fn=ld.pack_views,
                         persistent_workers=False)
-    out: Dict[str, List[torch.Tensor]] = {name: [] for name in encoders}
-    if board_baseline:
-        out["board_onehot"] = []
-    gens = {name: torch.Generator(device=device).manual_seed(seed) for name in encoders}
-    t0 = time.time()
+    gen = torch.Generator(device=device).manual_seed(seed)
+    parts: Dict[str, List[torch.Tensor]] = collections.defaultdict(list)
     for graphs in loader:
-        if board_baseline:
-            out["board_onehot"].append(graphs.x.view(graphs.num_graphs, -1).clone())
-        graphs = graphs.to(device)
-        for name, encoder in encoders.items():
-            out[name].append(encoder(graphs, rng=gens[name]).z.float().cpu())
-    log(f"  encoded {len(fens):,} positions with {len(out)} models in {time.time() - t0:.0f}s")
-    return {name: torch.cat(parts) for name, parts in out.items()}
+        if viewer is None:
+            parts["onehot"].append(graphs.x.view(graphs.num_graphs, -1).clone())
+            continue
+        for view, vectors in viewer(graphs.to(device), rng=gen).items():
+            parts[view].append(vectors)
+    return {view: torch.cat(p) for view, p in parts.items()}
+
+
+# Light masks for the representation report: the ones train_labyrinth_jepa's evaluation uses
+# (RunConfig.eval_mask_min_ratio / eval_mask_max_ratio, one-square blocks)
+REPORT_MASKS = ld.MaskConfig(0.05, 0.15, 1)
+
+
+@torch.no_grad()
+def representation_rows(sources: Sequence[Tuple[Tuple[str, str], Optional[EncoderViews]]], fens: Sequence[str],
+                        device, samples: int = 4, batch_size: int = 256, seed: int = 0) -> List[Dict[str, object]]:
+    """
+    LiDAR, centred RankMe and the self-consistency ratio of every probed vector, measured as training
+    measures z: each position encoded `samples` times, each time under a fresh light mask. Every model sees
+    the same masks; the raw board gets them as the encoders do, with the hidden squares' features cleared.
+    LiDAR is left out when a view has more than half as many dimensions as there are positions.
+    """
+    rnd = random.Random(seed)
+    masks = [[ld.sample_mask(rnd, REPORT_MASKS) for _ in fens] for _ in range(samples)]
+    collected: Dict[Tuple[str, str, str], List[List[torch.Tensor]]] = \
+        collections.defaultdict(lambda: [[] for _ in range(samples)])
+    gen = torch.Generator(device=device).manual_seed(seed)
+    for s in range(samples):
+        for lo in range(0, len(fens), batch_size):
+            chunk = range(lo, min(lo + batch_size, len(fens)))
+            graphs = ld.pack_views([ld.build_views(fens[i], masks[s][i])[1] for i in chunk])
+            mask = torch.cat([masks[s][i] for i in chunk])
+            for (model, which), viewer in sources:
+                if viewer is None:
+                    collected[(model, which, "onehot")][s].append(graphs.x.view(graphs.num_graphs, -1).clone())
+                    continue
+                for view, vectors in viewer(graphs.to(device), mask=mask.to(device), rng=gen).items():
+                    collected[(model, which, view)][s].append(vectors)
+    rows = []
+    for (model, which, view), per_sample in collected.items():
+        z = torch.stack([torch.cat(parts) for parts in per_sample], dim=1).to(device)    # [N, samples, D]
+        means = z.mean(1)
+        rows.append({"model": model, "encoder": which, "view": view, "dims": z.size(2), "positions": z.size(0),
+                     "samples": samples, "self_consistency": lje.self_consistency(z),
+                     "rankme_centered": lje.rankme(means - means.mean(0)),
+                     "lidar": lje.lidar(z) if 2 * z.size(2) <= z.size(0) else None,
+                     "notes": VIEWS.get(view, "the raw board: the 64 squares' features flattened")})
+    return rows
 
 
 # ##### ##### ##### ##### #####
@@ -456,7 +552,7 @@ def _max_abs_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 #       Running everything
 
 
-COLUMNS = ["model", "dataset", "kind", "is_theme", "label", "n_train", "n_test", "n_test_positive", "base_rate",
+COLUMNS = ["model", "encoder", "view", "dataset", "kind", "is_theme", "label", "n_train", "n_test", "n_test_positive", "base_rate",
            "linear_auc", "knn_auc", "knn_lift", "linear_r2", "linear_pearson", "linear_spearman", "knn_r2",
            "knn_spearman", "max_abs_dim_corr", "notes"]
 
@@ -478,36 +574,67 @@ def note_for(row: Dict[str, object]) -> str:
     return "; ".join(p for p in parts if p)
 
 
+REPRESENTATION_COLUMNS = ["model", "encoder", "view", "dims", "positions", "samples", "self_consistency",
+                          "rankme_centered", "lidar", "notes"]
+
+
 def run_probes(models: Dict[str, str], label_sets: Sequence[LabelSet], out_path: str, baselines: bool = True,
-               device: Optional[str] = None, k: int = 20, workers: int = 8, seed: int = 0, log=print) -> List[Dict]:
+               device: Optional[str] = None, k: int = 20, workers: int = 8, seed: int = 0,
+               views: Sequence[str] = ("z",), online: bool = False, report_fens: Optional[Sequence[str]] = None,
+               report_samples: int = 4, log=print) -> List[Dict]:
+    """
+    Probes every model's target encoder (and its online encoder, with online) at each of `views`, plus
+    the baselines, and writes the CSVs. With report_fens, also writes the representation report
+    (LiDAR, RankMe, self-consistency of every probed vector) to <out>_representation.csv.
+    """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    encoders = {name: load_target_encoder(path, device) for name, path in models.items()}
+    encoders: Dict[Tuple[str, str], lje.LabyrinthEncoder] = {}
+    for name, path in models.items():
+        for which in ("target", "online") if online else ("target",):
+            encoders[(name, which)] = load_encoder(path, device, which)
     if baselines:
         torch.manual_seed(seed)
         reference = next(iter(encoders.values())).config if encoders else lje.JEPAConfig(token_variant="squares")
-        encoders["untrained"] = lje.LabyrinthEncoder(reference).to(device).eval()
+        encoders[("untrained", "random init")] = lje.LabyrinthEncoder(reference).to(device).eval()
+    sources: List[Tuple[Tuple[str, str], Optional[EncoderViews]]] = \
+        [(key, EncoderViews(encoder, views)) for key, encoder in encoders.items()]
+    if baselines:
+        sources.append((("board_onehot", ""), None))
     results: List[Dict[str, object]] = []
     for labels in label_sets:
         log(f"{labels.name}: {len(labels.fens):,} positions, {len(labels.binary)} yes/no and "
             f"{len(labels.numeric)} numeric labels")
         train = np.array([_hash_unit(ld.position_key(f), "probe") < 0.8 for f in labels.fens])
-        vectors = encode_all(labels.fens, encoders, baselines, device, workers=workers, seed=seed, log=log)
-        for model_name, z in vectors.items():
+        for (model, which), viewer in sources:
+            # one encoder at a time: every view of every model at once would not fit in memory
             t0 = time.time()
-            for row in probe_one_model(z, labels, train, device, k=k, seed=seed):
-                kind = labels.kinds[row["label"]]
-                results.append({"model": model_name, "dataset": labels.name, "kind": kind,
-                                "is_theme": kind == "theme", **row})
-                results[-1]["notes"] = note_for(results[-1])
-            log(f"  probed {model_name} in {time.time() - t0:.0f}s")
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for row in results:
-            writer.writerow({c: _fmt(row.get(c, "")) for c in COLUMNS})
-    summary_path = os.path.splitext(out_path)[0] + "_summary.csv"
-    write_summary(results, summary_path)
-    log(f"wrote {len(results):,} rows to {out_path} and averages to {summary_path}")
+            vectors = encode_views(labels.fens, viewer, device, workers=workers, seed=seed)
+            for view, z in vectors.items():
+                for row in probe_one_model(z, labels, train, device, k=k, seed=seed):
+                    kind = labels.kinds[row["label"]]
+                    results.append({"model": model, "encoder": which, "view": view, "dataset": labels.name,
+                                    "kind": kind, "is_theme": kind == "theme", **row})
+                    results[-1]["notes"] = note_for(results[-1])
+            log(f"  encoded and probed {model} {which} ({', '.join(vectors)}) in {time.time() - t0:.0f}s")
+    if results:
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for row in results:
+                writer.writerow({c: _fmt(row.get(c, "")) for c in COLUMNS})
+        summary_path = os.path.splitext(out_path)[0] + "_summary.csv"
+        write_summary(results, summary_path)
+        log(f"wrote {len(results):,} rows to {out_path} and averages to {summary_path}")
+    if report_fens:
+        t0 = time.time()
+        rows = representation_rows(sources, report_fens, device, samples=report_samples, seed=seed)
+        report_path = os.path.splitext(out_path)[0] + "_representation.csv"
+        with open(report_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=REPRESENTATION_COLUMNS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({c: _fmt(row[c]) if row[c] is not None else "" for c in REPRESENTATION_COLUMNS})
+        log(f"wrote the representation report ({len(rows)} rows, {time.time() - t0:.0f}s) to {report_path}")
     return results
 
 
@@ -516,20 +643,21 @@ def _fmt(v):
 
 
 def write_summary(results: Sequence[Dict], path: str) -> None:
-    """Per model and kind: how many labels, and the mean of each metric over them."""
+    """Per model, encoder, view and kind: how many labels, and the mean of each metric over them."""
     metrics = ["linear_auc", "knn_auc", "knn_lift", "linear_r2", "knn_r2", "max_abs_dim_corr"]
-    groups: Dict[Tuple[str, str, str], List[Dict]] = collections.defaultdict(list)
+    groups: Dict[Tuple[str, str, str, str, str], List[Dict]] = collections.defaultdict(list)
     for row in results:
-        groups[(row["model"], row["dataset"], row["kind"])].append(row)
+        groups[(row["model"], row["encoder"], row["view"], row["dataset"], row["kind"])].append(row)
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["model", "dataset", "kind", "labels"] + [f"mean_{m}" for m in metrics] + ["notes"])
-        for (model, dataset, kind), rows in sorted(groups.items()):
+        writer.writerow(["model", "encoder", "view", "dataset", "kind", "labels"] + [f"mean_{m}" for m in metrics]
+                        + ["notes"])
+        for (model, which, view, dataset, kind), rows in sorted(groups.items()):
             means = []
             for m in metrics:
                 vals = [r[m] for r in rows if isinstance(r.get(m), float) and not math.isnan(r[m])]
                 means.append(f"{sum(vals) / len(vals):.4f}" if vals else "")
-            writer.writerow([model, dataset, kind, len(rows)] + means + [DATASET_NOTES.get(dataset, "")])
+            writer.writerow([model, which, view, dataset, kind, len(rows)] + means + [DATASET_NOTES.get(dataset, "")])
 
 
 def main() -> None:
@@ -545,6 +673,13 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=20)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--views", default="z", help=f"comma-separated, from: {', '.join(VIEWS)}")
+    parser.add_argument("--online", action="store_true", help="also probe each checkpoint's online encoder")
+    parser.add_argument("--report-cache", default=None,
+                        help="a position cache: its val split feeds the representation report (LiDAR, RankMe, "
+                             "self-consistency of every probed vector)")
+    parser.add_argument("--report-positions", type=int, default=2048, help="as train_labyrinth_jepa's evaluation")
+    parser.add_argument("--report-samples", type=int, default=4)
     args = parser.parse_args()
     models = dict(m.split("=", 1) for m in args.model)
     sets = []
@@ -552,10 +687,15 @@ def main() -> None:
         sets.append(load_puzzles(args.puzzles, args.puzzle_rate, args.per_theme, args.min_count, args.seed))
     if args.db:
         sets.append(load_labeled(args.db, args.min_count))
-    if not sets:
-        raise SystemExit("give --puzzles and/or --db")
+    report_fens = None
+    if args.report_cache:
+        val = ld.PositionDataset(args.report_cache, "val")
+        report_fens = [val.fen(i) for i in range(min(args.report_positions, len(val)))]
+    if not sets and not report_fens:
+        raise SystemExit("give --puzzles and/or --db, or --report-cache")
     run_probes(models, sets, args.out, baselines=not args.no_baselines, k=args.k, workers=args.workers,
-               seed=args.seed)
+               seed=args.seed, views=[v.strip() for v in args.views.split(",") if v.strip()], online=args.online,
+               report_fens=report_fens, report_samples=args.report_samples)
 
 
 if __name__ == "__main__":
