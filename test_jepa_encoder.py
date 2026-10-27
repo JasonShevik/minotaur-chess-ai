@@ -346,6 +346,25 @@ def test_decorrelation_term_adds_to_sigreg():
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder.readout_proj.parameters())
 
 
+def test_loss_terms_add_up_to_the_total():
+    """JEPALosses.terms splits total into each term's weighted share, one per regularized embedding."""
+    cases = [("unpool", dict()), ("registers", dict(decorrelation_weight=0.5, anticollapse_squares=True)),
+             ("squares", dict(anticollapse="vicreg")), ("squares", dict(anticollapse="none"))]
+    for variant, kw in cases:
+        cfg = small_config(variant, **kw)
+        torch.manual_seed(0)
+        out = lje.LabyrinthJEPA(cfg).losses(make_batch(cfg), rng=torch.Generator().manual_seed(0))
+        assert abs(float(sum(out.terms.values()) - out.total)) < 1e-5, (variant, kw)
+        expected = {"mask", "next"}
+        if cfg.anticollapse != "none":
+            expected |= {"anticollapse_masked", "anticollapse_full"}
+            expected |= {"anticollapse_squares"} if cfg.anticollapse_squares else set()
+            expected |= {"decorrelation"} if cfg.decorrelation_weight > 0 else set()
+            assert all(f"anticollapse_{n}" in out.stats for n in ("masked", "full"))
+        expected |= {"rl"} if cfg.uses_unpool and cfg.unpool_rl else set()
+        assert set(out.terms) == expected, (variant, kw, sorted(out.terms))
+
+
 def test_dehb_search_space_samples_build():
     cs = lje.build_jepa_configspace(seed=1)
     seen = set()

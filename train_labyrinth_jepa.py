@@ -1,7 +1,8 @@
 """
 Training and hyperparameter search for the Labyrinth JEPA encoder (labyrinth_jepa_encoder.py).
 
-    python train_labyrinth_jepa.py train [--config best_config.json] [--steps 20000] [--out runs/jepa]
+    python train_labyrinth_jepa.py train [--config best_config.json] [--steps 20000] [--out runs/jepa] \\
+        [--probe-db minotaur_data.db --probe-puzzles lichess_db_puzzle.csv.zst]
     python train_labyrinth_jepa.py tune  [--out dehb_jepa_out] [--fevals 40]
 
 Build the position cache first (python labyrinth_data.py build ...).
@@ -20,6 +21,16 @@ train(model_config, run_config) is one training run:
     since the unpool variant's graphs grow as it learns to split more nodes;
   * every eval_every steps: LiDAR, RankMe and the self-consistency ratio of the target encoder on a fixed
     set of validation positions, plus the losses on validation batches;
+  * probes at every evaluation (probe_positions > 0): linear and nearest-neighbour probes of the target
+    encoder at several views (probe_views: z and vectors inside the encoder), on fixed positions with
+    fixed labels: board facts of validation positions, plus engine evaluations and best moves (probe_db)
+    and puzzle themes (probe_puzzles) when given. The untrained encoder (the run's own starting weights)
+    and the raw board are probed once, as baselines. Rows go to probes.csv, averages to the history;
+  * every grad_terms_every steps, the gradient each loss term alone gives each part of the model (the
+    square stage, the transformer, the readout, the predictors), and the cosine between terms' gradients on
+    the encoder's parts: which signal shapes which layers, and whether signals pull against each other;
+  * weights-only snapshots at step 0 and at snapshot_first, 2x, 4x, ... steps, and at the end, in
+    snapshots/ (probe_labyrinth.py --snapshots probes them all);
   * logs (history.jsonl), last.pt every checkpoint_every steps and at the end, best.pt by LiDAR, and
     resuming from last.pt.
 
@@ -34,6 +45,7 @@ still does not fit, or diverges, scores 0.
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import json
 import math
@@ -41,12 +53,13 @@ import os
 import random
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 import labyrinth_data as ld
 import labyrinth_jepa_encoder as lje
+import probe_labyrinth as pl
 
 # Batch sizes that fit a 16 GB card with the default sizes; the unpool variant stores far more
 # activations per position. The memory guard catches configurations these do not fit.
@@ -88,6 +101,12 @@ class RunConfig:
     memory_check_every: int = 100                    # also check the budget every this many steps (0: only at step 3)
     objective_metric: str = "online_lidar"           # what the DEHB objective reports from the final evaluation
     max_consecutive_skips: int = 50
+    probe_positions: int = 8_000                     # positions per probe set, probed at every evaluation (0: no probes)
+    probe_views: Tuple[str, ...] = ("z", "token_mean", "pre_transformer_mean")   # see probe_labyrinth.VIEWS
+    probe_db: Optional[str] = None                   # minotaur_data.db: engine evaluations and best moves
+    probe_puzzles: Optional[str] = None              # lichess_db_puzzle.csv.zst: puzzle themes (loading takes ~1 min)
+    grad_terms_every: int = 200                      # per-term gradient norms every this many steps (0: never)
+    snapshot_first: int = 250                        # snapshots at step 0, this, twice this, ... (0: none)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -162,6 +181,127 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
     return metrics
 
 
+def build_probes(run: RunConfig, val_dataset: ld.PositionDataset, log: Callable[[str], None] = print
+                 ) -> Optional[pl.TrainingProbes]:
+    """
+    The run's fixed probe set (None with probe_positions 0): board facts of random validation positions,
+    plus the engine-analyzed positions (probe_db) and puzzles (probe_puzzles) when given, each cut to
+    probe_positions positions.
+    """
+    if run.probe_positions <= 0:
+        return None
+    t0 = time.perf_counter()
+    picks = sorted(random.Random(run.seed + 7).sample(range(len(val_dataset)), min(run.probe_positions, len(val_dataset))))
+    sets = [pl.board_label_set("val", [val_dataset.fen(i) for i in picks])]
+    if run.probe_db:
+        sets.append(pl.subsample(pl.load_labeled(run.probe_db, log=log), run.probe_positions, seed=run.seed))
+    if run.probe_puzzles:
+        sets.append(pl.subsample(pl.load_puzzles(run.probe_puzzles, seed=run.seed, log=log), run.probe_positions,
+                                 seed=run.seed))
+    log(f"probe sets ({time.perf_counter() - t0:.0f}s): " + ", ".join(
+        f"{s.name} {len(s.fens):,} positions, {len(s.binary) + len(s.numeric)} labels" for s in sets))
+    return pl.TrainingProbes(sets, views=run.probe_views, seed=run.seed)
+
+
+# What the log shows of each probed view: (summary key, name), as linear / nearest-neighbour pairs
+PROBE_HEADLINES = (("val/material_balance", "material r2"), ("labeled/eval_win_prob", "eval r2"),
+                   ("puzzles/theme/auc", "themes auc"), ("labeled/best_move/auc", "best move auc"))
+
+
+def _probe_line(view_summary: Dict[str, Dict[str, float]]) -> str:
+    parts = [f"{name} {view_summary[key].get('linear', math.nan):.2f}/{view_summary[key].get('knn', math.nan):.2f}"
+             for key, name in PROBE_HEADLINES if key in view_summary]
+    return "  ".join(parts) + "  (linear/knn)"
+
+
+def _append_probe_rows(path: str, rows: Sequence[Dict[str, Any]], step: int) -> None:
+    columns = ["step"] + pl.COLUMNS
+    new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        if new:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({"step": step, **{c: f"{v:.4f}" if isinstance(v, float) else v
+                                              for c, v in ((c, row.get(c, "")) for c in pl.COLUMNS)}})
+
+
+# ##### ##### ##### ##### #####
+#       Gradient diagnostics
+
+
+# The encoder's parts, from input to output
+ENCODER_PARTS = ("square_stage", "transformer", "readout")
+
+
+def parameter_part(name: str) -> str:
+    """Which part of the model a parameter belongs to, by its name in LabyrinthJEPA."""
+    if not name.startswith("encoder."):
+        return name.split(".", 1)[0]                   # mask_predictor, next_predictor, baselines
+    name = name[len("encoder."):]
+    if name.startswith(("queries", "readout_")):
+        return "readout"
+    if name.startswith(("token_proj", "token_type", "registers", "transformer.", "final_norm")):
+        return "transformer"
+    return "square_stage"                              # input_proj, mask_token, the square GATs, unpooling
+
+
+def _sums_by_part(parts: Sequence[str], a: Sequence[Optional[torch.Tensor]],
+                  b: Sequence[Optional[torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Per part, and for the encoder's parts together ("encoder"): the sum of a * b over the part's
+    parameters. A missing gradient (a term that does not reach a parameter) leaves the parameter out."""
+    sums: Dict[str, torch.Tensor] = {}
+    for part, x, y in zip(parts, a, b):
+        if x is None or y is None:
+            continue
+        v = (x * y).sum()
+        for key in (part, "encoder") if part in ENCODER_PARTS else (part,):
+            sums[key] = sums[key] + v if key in sums else v
+    return sums
+
+
+def _trainable(model: lje.LabyrinthJEPA) -> Tuple[List[torch.nn.Parameter], List[str]]:
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad and not n.startswith("target.")]
+    return [p for _, p in named], [parameter_part(n) for n, _ in named]
+
+
+def gradient_by_term(model: lje.LabyrinthJEPA, terms: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    What each loss term alone does to the gradient, before clipping: {"norms": {term: {part: norm}},
+    "cosine": {"a|b": {part: cosine}}}, the cosines between two terms' gradients on each part of the
+    encoder and on the whole encoder (negative: they pull against each other). A part a term does not
+    reach is missing from its norms. One extra backward pass per term, so it runs only now and then.
+    """
+    params, parts = _trainable(model)
+    grads = {term: torch.autograd.grad(value, params, retain_graph=True, allow_unused=True)
+             for term, value in terms.items() if value.requires_grad}
+    squares = {term: _sums_by_part(parts, g, g) for term, g in grads.items()}
+    norms = {term: {part: float(v.sqrt()) for part, v in sq.items()} for term, sq in squares.items()}
+    cosine: Dict[str, Dict[str, float]] = {}
+    names = list(grads)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            dots = _sums_by_part(parts, grads[a], grads[b])
+            cos = {part: float(dot / (squares[a][part] * squares[b][part]).sqrt().clamp_min(1e-30))
+                   for part, dot in dots.items() if part in ENCODER_PARTS + ("encoder",)}
+            if cos:
+                cosine[f"{a}|{b}"] = cos
+    return {"norms": norms, "cosine": cosine}
+
+
+def gradient_norms(model: lje.LabyrinthJEPA) -> Dict[str, float]:
+    """The norm of the accumulated gradient (.grad) on each part of the model."""
+    params, parts = _trainable(model)
+    grads = [p.grad for p in params]
+    return {part: float(v.sqrt()) for part, v in _sums_by_part(parts, grads, grads).items()}
+
+
+def _gradient_line(norms: Dict[str, Dict[str, float]]) -> str:
+    def by_part(n: Dict[str, float]) -> str:
+        return "/".join(f"{n[p]:.2g}" if p in n else "0" for p in ENCODER_PARTS)
+    return "  ".join(f"{term} {by_part(n)}" for term, n in norms.items())
+
+
 # ##### ##### ##### ##### #####
 #       Training
 
@@ -176,11 +316,29 @@ def _save(path: str, model, opt, sched, step: int, best: float, gen: torch.Gener
     os.replace(tmp, path)
 
 
+def snapshot_due(step: int, first: int) -> bool:
+    """Snapshots at step 0 and at first, 2 * first, 4 * first, ...: dense early, where most changes, few in all."""
+    if first <= 0 or (step and step % first):
+        return False
+    m = step // first
+    return m & (m - 1) == 0
+
+
+def _snapshot(folder: str, model, step: int, config, run) -> None:
+    """The weights alone (no optimizer), in a file probe_labyrinth.load_encoder reads."""
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"step_{step:07d}.pt")
+    torch.save({"model": model.state_dict(), "step": step, "jepa_config": config.to_dict(),
+                "run_config": run.to_dict()}, path + ".tmp")
+    os.replace(path + ".tmp", path)
+
+
 def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = print) -> Dict[str, Any]:
     """
-    One training run. Returns {"final": metrics at the end, "best_lidar", "steps", "history"}.
-    With run.out_dir set, writes run_config.json, history.jsonl, last.pt and best.pt there, and resumes
-    from last.pt when run.resume is set and it exists.
+    One training run. Returns {"final": metrics at the end, "probe": the last probe averages (or None),
+    "best_lidar", "steps", "history"}. With run.out_dir set, writes run_config.json, history.jsonl,
+    probes.csv, last.pt, best.pt and snapshots/ there, and resumes from last.pt when run.resume is set
+    and it exists.
     """
     config.validate()
     device = torch.device(run.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -202,7 +360,8 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     paths = {}
     if run.out_dir:
         os.makedirs(run.out_dir, exist_ok=True)
-        paths = {name: os.path.join(run.out_dir, name) for name in ("last.pt", "best.pt", "history.jsonl")}
+        paths = {name: os.path.join(run.out_dir, name)
+                 for name in ("last.pt", "best.pt", "history.jsonl", "probes.csv", "snapshots")}
         with open(os.path.join(run.out_dir, "run_config.json"), "w") as f:
             json.dump({"jepa_config": config.to_dict(), "run_config": run.to_dict(), "batch_size": batch_size}, f, indent=2)
         if run.resume and os.path.exists(paths["last.pt"]):
@@ -235,6 +394,26 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
                                seed=run.seed + 1, shuffle=False, indices=list(range(n_val))) if n_val else None
 
+    probes = build_probes(run, val_dataset, log)
+    if probes is not None and (step == 0 or not (paths and os.path.exists(paths["probes.csv"]))):
+        # Baselines, once a run (at the start, or on resuming a run that has none): the untrained encoder
+        # (rebuilt from the seed: the run's own starting weights) and the raw board
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(run.seed)
+            untrained = lje.LabyrinthEncoder(config).to(device)
+        rows = probes.probe(untrained, device, "untrained", "random init") + probes.probe(None, device, "board_onehot", "")
+        del untrained
+        if paths:
+            _append_probe_rows(paths["probes.csv"], rows, step)
+        baselines = {m: pl.TrainingProbes.summarize([r for r in rows if r["model"] == m])
+                     for m in ("untrained", "board_onehot")}
+        record({"step": step, "probe_baselines": baselines})
+        for m, summary in baselines.items():
+            for view, s in summary.items():
+                log(f"[{step:>7}] probe {m} {view}: {_probe_line(s)}")
+    if paths and step == 0 and snapshot_due(0, run.snapshot_first):
+        _snapshot(paths["snapshots"], model, 0, config, run)
+
     # Where in the data and the curriculum this run starts (step 0, or a resumed step)
     epoch = step // len(loader)
     loader.set_epoch(epoch)
@@ -248,8 +427,20 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     log(f"training {config.token_variant} for {run.total_steps} steps of {batch_size} positions on {device} "
         f"({len(loader.dataset):,} training positions, {len(eval_fens)} evaluation positions)")
 
+    last_probe: Optional[Dict[str, Any]] = None
+
     def run_eval() -> Dict[str, float]:
-        nonlocal best_lidar
+        nonlocal best_lidar, last_probe
+        if probes is not None:
+            t0 = time.perf_counter()
+            rows = probes.probe(model.target, device)
+            if paths:
+                _append_probe_rows(paths["probes.csv"], rows, step)
+            last_probe = pl.TrainingProbes.summarize(rows)
+            record({"step": step, "probe": last_probe})
+            for view, s in last_probe.items():
+                log(f"[{step:>7}] probe {view}: {_probe_line(s)}")
+            log(f"[{step:>7}] probes took {time.perf_counter() - t0:.0f}s")
         metrics = evaluate(model, eval_fens, val_loader, run, device, rollout_weights)
         record({"step": step, "eval": metrics})
         log(f"[{step:>7}] eval  lidar={metrics['lidar']:.1f}  rankme={metrics['rankme']:.1f}  "
@@ -288,7 +479,12 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
         if not torch.isfinite(out.total):
             skips += 1
         else:
+            by_term = None
+            if run.grad_terms_every and (step + 1) % run.grad_terms_every == 0:
+                by_term = gradient_by_term(model, out.terms)
             out.total.backward()
+            if by_term is not None:
+                by_term["norms"]["total"] = gradient_norms(model)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), run.grad_clip)
             if not torch.isfinite(grad_norm):
                 opt.zero_grad(set_to_none=True)
@@ -300,6 +496,9 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                 step += 1
                 model.update_target(model.momentum_at(step, run.total_steps))
                 positions_since += batch.num_graphs
+                if by_term is not None:
+                    record({"step": step, "grad_terms": by_term})
+                    log(f"[{step:>7}] gradient norms ({' / '.join(ENCODER_PARTS)}): {_gradient_line(by_term['norms'])}")
         if skips:
             if skips >= run.max_consecutive_skips:
                 raise TrainingDiverged(f"{skips} consecutive steps with a non-finite loss or gradient at step {step}")
@@ -328,11 +527,14 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             run_eval()
         if paths and run.checkpoint_every and step % run.checkpoint_every == 0:
             _save(paths["last.pt"], model, opt, sched, step, best_lidar, gen, config, run)
+        if paths and (snapshot_due(step, run.snapshot_first) or (run.snapshot_first and step == run.total_steps)):
+            _snapshot(paths["snapshots"], model, step, config, run)
 
     final = run_eval()
     if paths:
         _save(paths["last.pt"], model, opt, sched, step, best_lidar, gen, config, run)
-    result = {"final": final, "best_lidar": best_lidar, "steps": step, "batch_size": batch_size, "history": history}
+    result = {"final": final, "probe": last_probe, "best_lidar": best_lidar, "steps": step, "batch_size": batch_size,
+              "history": history}
     del model, opt
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -366,7 +568,8 @@ def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
         positions = int(round(fidelity * 1000))
         for attempt in range(2):
             run = replace(base_run, out_dir=None, resume=False, eval_every=0, checkpoint_every=0,
-                          batch_size=batch_size, total_steps=max(1, positions // batch_size))
+                          batch_size=batch_size, total_steps=max(1, positions // batch_size),
+                          probe_positions=0, grad_terms_every=0, snapshot_first=0)
             failure = None
             try:
                 result = train_fn(config, run, log=log)
@@ -407,6 +610,15 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     return data.get("best_config") or data.get("jepa_config") or data
 
 
+def _read_history(out_dir: str) -> List[Dict[str, Any]]:
+    """The whole history.jsonl, including the entries from before a resume."""
+    path = os.path.join(out_dir, "history.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def _plot(history: List[Dict[str, Any]], out_dir: str) -> None:
     try:
         import matplotlib
@@ -416,16 +628,41 @@ def _plot(history: List[Dict[str, Any]], out_dir: str) -> None:
         return
     steps = [h for h in history if "loss" in h]
     evals = [h for h in history if "eval" in h]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot([h["step"] for h in steps], [h["loss_mask"] for h in steps], label="masked squares")
-    axes[0].plot([h["step"] for h in steps], [h["loss_next"] for h in steps], label="next position")
-    axes[0].set_title("Training losses"); axes[0].set_xlabel("step"); axes[0].legend()
-    axes[1].plot([h["step"] for h in evals], [h["eval"]["lidar"] for h in evals], marker="o", label="LiDAR")
-    axes[1].plot([h["step"] for h in evals], [h["eval"]["rankme_centered"] for h in evals], marker="o",
-                 label="RankMe (centred)")
-    axes[1].set_title("Representation rank (target encoder)"); axes[1].set_xlabel("step"); axes[1].legend()
-    axes[2].plot([h["step"] for h in evals], [h["eval"]["self_consistency"] for h in evals], marker="o")
-    axes[2].set_title("Self-consistency (lower = more consistent)"); axes[2].set_xlabel("step")
+    grads = [h for h in history if "grad_terms" in h]
+    probes = [h for h in history if "probe" in h]
+    baselines = next((h["probe_baselines"] for h in reversed(history) if "probe_baselines" in h), {})
+    fig, ((a0, a1, a2), (b0, b1, b2)) = plt.subplots(2, 3, figsize=(15, 8))
+    a0.plot([h["step"] for h in steps], [h["loss_mask"] for h in steps], label="masked squares")
+    a0.plot([h["step"] for h in steps], [h["loss_next"] for h in steps], label="next position")
+    a0.set_title("Training losses"); a0.set_xlabel("step"); a0.legend()
+    a1.plot([h["step"] for h in evals], [h["eval"]["lidar"] for h in evals], marker="o", label="LiDAR")
+    a1.plot([h["step"] for h in evals], [h["eval"]["rankme_centered"] for h in evals], marker="o",
+            label="RankMe (centred)")
+    a1.set_title("Representation rank (target encoder)"); a1.set_xlabel("step"); a1.legend()
+    a2.plot([h["step"] for h in evals], [h["eval"]["self_consistency"] for h in evals], marker="o")
+    a2.set_title("Self-consistency (lower = more consistent)"); a2.set_xlabel("step")
+
+    for term in sorted({t for h in grads for t in h["grad_terms"]["norms"]}):
+        b0.plot([h["step"] for h in grads],
+                [h["grad_terms"]["norms"].get(term, {}).get("encoder", math.nan) for h in grads], label=term)
+    b0.set_yscale("log"); b0.set_title("Gradient norm on the encoder, by loss term"); b0.set_xlabel("step")
+    if grads:
+        b0.legend(fontsize=7)
+    has_eval = any("labeled/eval_win_prob" in v for h in probes for v in h["probe"].values())
+    panels = [(b1, "val/material_balance", "linear", "Probe: material balance, linear R^2"),
+              (b2, "labeled/eval_win_prob", "knn", "Probe: engine eval, nearest-neighbour R^2") if has_eval else
+              (b2, "val/material_balance", "knn", "Probe: material balance, nearest-neighbour R^2")]
+    views = list(dict.fromkeys(view for h in probes for view in h["probe"]))
+    for ax, key, probe, title in panels:
+        for i, view in enumerate(views):
+            ax.plot([h["step"] for h in probes], [h["probe"].get(view, {}).get(key, {}).get(probe, math.nan)
+                                                  for h in probes], marker="o", color=f"C{i}", label=view)
+            base = baselines.get("untrained", {}).get(view, {}).get(key, {}).get(probe)
+            if base is not None:
+                ax.axhline(base, color=f"C{i}", linestyle="--", linewidth=1)
+        ax.set_title(title + " (dashed: untrained)", fontsize=10); ax.set_xlabel("step")
+        if views:
+            ax.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "training.png"), dpi=120)
     plt.close(fig)
@@ -448,6 +685,14 @@ def main() -> None:
     t.add_argument("--out", default="runs/labyrinth_jepa")
     t.add_argument("--eval-every", type=int, default=2_000)
     t.add_argument("--no-resume", action="store_true")
+    t.add_argument("--probe-db", default=None, help="minotaur_data.db: engine evaluations and best moves to probe")
+    t.add_argument("--probe-puzzles", default=None, help="lichess_db_puzzle.csv.zst: puzzle themes to probe")
+    t.add_argument("--probe-positions", type=int, default=8_000, help="positions per probe set (0: no probes)")
+    t.add_argument("--probe-views", default=",".join(RunConfig.probe_views),
+                   help=f"comma-separated, from: {', '.join(pl.VIEWS)}")
+    t.add_argument("--grad-terms-every", type=int, default=200, help="per-term gradient norms (0: never)")
+    t.add_argument("--snapshot-first", type=int, default=250,
+                   help="snapshots at step 0, this, twice this, ... and at the end (0: none)")
     d = sub.choices["tune"]
     d.add_argument("--out", default="dehb_jepa_out")
     d.add_argument("--fevals", type=int, default=40)
@@ -464,9 +709,12 @@ def main() -> None:
     if args.command == "train":
         config = lje.JEPAConfig.from_dict(values)
         run = replace(run, out_dir=args.out, total_steps=args.steps, eval_every=args.eval_every,
-                      resume=not args.no_resume)
+                      resume=not args.no_resume, probe_db=args.probe_db, probe_puzzles=args.probe_puzzles,
+                      probe_positions=args.probe_positions,
+                      probe_views=tuple(v.strip() for v in args.probe_views.split(",") if v.strip()),
+                      grad_terms_every=args.grad_terms_every, snapshot_first=args.snapshot_first)
         result = train(config, run)
-        _plot(result["history"], args.out)
+        _plot(_read_history(args.out) or result["history"], args.out)
         print(json.dumps({"final": result["final"], "best_lidar": result["best_lidar"]}, indent=2))
     else:
         from dehb_helper import DEHBHelper, DEHBRunConfig

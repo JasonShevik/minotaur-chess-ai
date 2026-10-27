@@ -48,6 +48,11 @@ Representation report (--report-cache): LiDAR, centred RankMe and the self-consi
 probed vector, baselines included, on the cache's val split under the light masks training evaluates
 with, so z's numbers can be read against what the untrained encoder and the raw board score.
 
+A run's snapshots (--snapshots runs/x/snapshots): every step_*.pt that train_labyrinth_jepa saved, each
+probed as a model named after its step, to see when during training the probes change.
+
+TrainingProbes is the small fixed version train_labyrinth_jepa runs at every evaluation.
+
 Probe train / test split: a hash of the position (80 / 20), so it is the same for every model.
 A notes column carries caveats: the labeled positions' castling bias (only ~5% have castling rights,
 since the Chess960 repair re-queued most of those), the puzzles' standard-chess origin and theme
@@ -60,6 +65,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import glob
 import hashlib
 import io
 import json
@@ -302,12 +308,20 @@ class EncoderViews:
             raise ValueError(f"unknown views {sorted(unknown)}; choose from {sorted(VIEWS)}")
         self.encoder, self.views = encoder, list(views)
         self._captured: Dict[str, torch.Tensor] = {}
+        self._hooks = []
         if "readout_in" in self.views:
-            encoder.readout_proj.register_forward_hook(
-                lambda module, args, output: self._captured.__setitem__("readout_in", args[0]))
+            self._hooks.append(encoder.readout_proj.register_forward_hook(
+                lambda module, args, output: self._captured.__setitem__("readout_in", args[0])))
         if "pre_transformer_mean" in self.views:
-            encoder.transformer.register_forward_pre_hook(
-                lambda module, args: self._captured.__setitem__("pre_transformer", args[0]))
+            self._hooks.append(encoder.transformer.register_forward_pre_hook(
+                lambda module, args: self._captured.__setitem__("pre_transformer", args[0])))
+
+    def remove(self) -> None:
+        """Takes the hooks off, for an encoder that goes on being used (or trained) afterwards."""
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        self._captured.clear()
 
     @torch.no_grad()
     def __call__(self, graphs: ld.GraphBatch, mask: Optional[torch.Tensor] = None,
@@ -660,9 +674,110 @@ def write_summary(results: Sequence[Dict], path: str) -> None:
             writer.writerow([model, which, view, dataset, kind, len(rows)] + means + [DATASET_NOTES.get(dataset, "")])
 
 
+# ##### ##### ##### ##### #####
+#       Probes during training
+
+
+def board_label_set(name: str, fens: Sequence[str]) -> LabelSet:
+    """Positions with only the board labels (material, legal moves, check, ...), which need no outside data."""
+    out = LabelSet(name, list(fens))
+    _add_board_labels(out, [board_labels(chess.Board(f, chess960=True)) for f in out.fens])
+    return out
+
+
+def subsample(labels: LabelSet, n: int, seed: int = 0, min_count: int = 30) -> LabelSet:
+    """
+    At most n of the positions (the same ones for the same seed) with their labels. Yes/no labels left
+    with fewer than min_count positives are dropped: their AUCs would be noise.
+    """
+    keep = np.arange(len(labels.fens))
+    if len(keep) > n:
+        keep = np.sort(np.random.default_rng(seed).choice(len(keep), n, replace=False))
+    out = LabelSet(labels.name, [labels.fens[i] for i in keep])
+    for name, values in labels.binary.items():
+        if np.nansum(values[keep]) >= min_count:
+            out.binary[name], out.kinds[name] = values[keep], labels.kinds[name]
+    for name, values in labels.numeric.items():
+        out.numeric[name], out.kinds[name] = values[keep], labels.kinds[name]
+    return out
+
+
+# Labels that TrainingProbes.summarize also reports one by one, besides the averages by kind
+HEADLINE_LABELS = ("material_balance", "eval_win_prob")
+
+
+class TrainingProbes:
+    """
+    A small fixed probe set for train_labyrinth_jepa's evaluations: the same positions, labels and
+    train / test split every time, so a run's curves show when each view gains or loses information.
+    Graphs are built in the calling process (no loader workers to start at every evaluation).
+    """
+
+    def __init__(self, label_sets: Sequence[LabelSet], views: Sequence[str] = ("z",), k: int = 20,
+                 batch_size: int = 512, seed: int = 0):
+        unknown = set(views) - set(VIEWS)
+        if unknown:
+            raise ValueError(f"unknown views {sorted(unknown)}; choose from {sorted(VIEWS)}")
+        self.label_sets, self.views = list(label_sets), list(views)
+        self.k, self.batch_size, self.seed = k, batch_size, seed
+        self.splits = [np.array([_hash_unit(ld.position_key(f), "probe") < 0.8 for f in labels.fens])
+                       for labels in self.label_sets]
+
+    def probe(self, encoder: Optional[lje.LabyrinthEncoder], device, model: str = "trained",
+              which: str = "target") -> List[Dict[str, object]]:
+        """Every label at every view of the encoder (None: the raw board), as rows with run_probes' columns."""
+        viewer = EncoderViews(encoder, self.views) if encoder is not None else None
+        was_training = encoder is not None and encoder.training
+        if encoder is not None:
+            encoder.eval()
+        rows: List[Dict[str, object]] = []
+        try:
+            for labels, train in zip(self.label_sets, self.splits):
+                vectors = encode_views(labels.fens, viewer, device, batch_size=self.batch_size, workers=0,
+                                       seed=self.seed)
+                k = max(1, min(self.k, int(train.sum())))
+                for view, z in vectors.items():
+                    for row in probe_one_model(z, labels, train, device, k=k, seed=self.seed):
+                        kind = labels.kinds[row["label"]]
+                        rows.append({"model": model, "encoder": which, "view": view, "dataset": labels.name,
+                                     "kind": kind, "is_theme": kind == "theme", **row})
+                        rows[-1]["notes"] = note_for(rows[-1])
+        finally:
+            if encoder is not None:
+                viewer.remove()
+                encoder.train(was_training)
+        return rows
+
+    @staticmethod
+    def summarize(rows: Sequence[Dict[str, object]]) -> Dict[str, Dict[str, Dict[str, float]]]:
+        """
+        One model's rows -> {view: {key: {"linear": x, "knn": y}}}. Keys: "<dataset>/<kind>/auc" (the
+        mean AUC of that kind's yes/no labels), "<dataset>/<kind>/r2" (the mean R^2 of its numeric
+        ones), and "<dataset>/<label>" for HEADLINE_LABELS. Metrics that are NaN everywhere are left out.
+        """
+        groups: Dict[Tuple[str, str], Dict[str, List[float]]] = collections.defaultdict(
+            lambda: collections.defaultdict(list))
+        for row in rows:
+            metric = "auc" if row["binary"] else "r2"
+            keys = [f"{row['dataset']}/{row['kind']}/{metric}"]
+            if row["label"] in HEADLINE_LABELS:
+                keys.append(f"{row['dataset']}/{row['label']}")
+            for key in keys:
+                for probe in ("linear", "knn"):
+                    value = row.get(f"{probe}_{metric}")
+                    if isinstance(value, float) and math.isfinite(value):
+                        groups[(str(row["view"]), key)][probe].append(value)
+        out: Dict[str, Dict[str, Dict[str, float]]] = collections.defaultdict(dict)
+        for (view, key), values in sorted(groups.items()):
+            out[view][key] = {probe: sum(v) / len(v) for probe, v in values.items()}
+        return dict(out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probe trained Labyrinth encoders.")
     parser.add_argument("--model", action="append", default=[], help="NAME=path/to/checkpoint.pt (repeatable)")
+    parser.add_argument("--snapshots", default=None,
+                        help="a training run's snapshots folder: probes every step_*.pt in it, named by its step")
     parser.add_argument("--puzzles", default=None, help="lichess_db_puzzle.csv.zst")
     parser.add_argument("--db", default=None, help="minotaur_data.db (engine-analyzed positions)")
     parser.add_argument("--out", default="probe_results.csv")
@@ -682,6 +797,9 @@ def main() -> None:
     parser.add_argument("--report-samples", type=int, default=4)
     args = parser.parse_args()
     models = dict(m.split("=", 1) for m in args.model)
+    if args.snapshots:
+        for path in sorted(glob.glob(os.path.join(args.snapshots, "step_*.pt"))):
+            models[os.path.splitext(os.path.basename(path))[0]] = path
     sets = []
     if args.puzzles:
         sets.append(load_puzzles(args.puzzles, args.puzzle_rate, args.per_theme, args.min_count, args.seed))

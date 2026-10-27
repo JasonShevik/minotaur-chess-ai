@@ -497,6 +497,9 @@ class JEPALosses:
     rl: torch.Tensor            # REINFORCE + baseline + entropy terms (0 without unpooling or with unpool_rl off)
     anticollapse: torch.Tensor  # the SIGReg / VICReg term (0 with anticollapse = "none")
     stats: Dict[str, float]     # diagnostics for logging
+    # Each term's weighted share of total, which they add up to: "mask", "next", "anticollapse_<embedding>"
+    # (masked, full, squares), "decorrelation", "rl". For measuring what each term alone does to the gradient.
+    terms: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
 
 
 class LabyrinthJEPA(nn.Module):
@@ -603,7 +606,8 @@ class LabyrinthJEPA(nn.Module):
             ctx_full, next_per_pos, next_loss = None, None, mask_loss.new_zeros(())
         stats["rollout_steps"] = float(len(steps))
 
-        total = c.mask_weight * mask_loss + c.next_weight * next_loss
+        contributions = {"mask": c.mask_weight * mask_loss, "next": c.next_weight * next_loss}
+        total = contributions["mask"] + contributions["next"]
 
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
@@ -626,10 +630,15 @@ class LabyrinthJEPA(nn.Module):
                     variance, covariance = vicreg_terms(e)
                     terms.append(variance + c.vicreg_cov_ratio * covariance)
             anticollapse = torch.stack(terms).mean()
-            total = total + (c.sigreg_weight if c.anticollapse == "sigreg" else c.vicreg_weight) * anticollapse
+            reg_weight = c.sigreg_weight if c.anticollapse == "sigreg" else c.vicreg_weight
+            total = total + reg_weight * anticollapse
+            for (name, _), term in zip(embeddings, terms):
+                contributions[f"anticollapse_{name}"] = reg_weight * term / len(terms)
+                stats[f"anticollapse_{name}"] = float(term.detach())
             if c.decorrelation_weight > 0 and c.anticollapse == "sigreg":
                 decorrelation = torch.stack([vicreg_terms(e)[1] for _, e in embeddings]).mean()
-                total = total + c.decorrelation_weight * decorrelation
+                contributions["decorrelation"] = c.decorrelation_weight * decorrelation
+                total = total + contributions["decorrelation"]
                 stats["decorrelation"] = float(decorrelation.detach())
 
         # ---- unpooling decisions: REINFORCE with learned baselines ----
@@ -650,7 +659,8 @@ class LabyrinthJEPA(nn.Module):
                 rl = rl - (advantage * out.log_prob[rows] / per_decision).mean() + F.mse_loss(baseline, reward)
                 rl = rl - c.rl_entropy_coef * (out.entropy[rows] / per_decision).mean()
                 stats[f"{name}_reward_std"] = float(reward.std()) if reward.numel() > 1 else 0.0
-            total = total + c.rl_coef * rl
+            contributions["rl"] = c.rl_coef * rl
+            total = total + contributions["rl"]
 
         with torch.no_grad():
             z = ctx_masked.z
@@ -663,7 +673,7 @@ class LabyrinthJEPA(nn.Module):
                 "tokens": float(ctx_masked.num_tokens.float().mean()),
                 "unpool_entropy_per_decision": float((ctx_masked.entropy / ctx_masked.num_decisions.clamp_min(1)).mean()),
             })
-        return JEPALosses(total, mask_loss, next_loss, rl, anticollapse, stats)
+        return JEPALosses(total, mask_loss, next_loss, rl, anticollapse, stats, contributions)
 
 
 def build_jepa(config: JEPAConfig) -> LabyrinthJEPA:

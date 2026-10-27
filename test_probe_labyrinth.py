@@ -126,6 +126,41 @@ def test_encoder_views_are_the_encoders_own_vectors():
         pass
 
 
+def test_training_probes_leave_the_encoder_as_they_found_it():
+    rnd = random.Random(2)
+    fens = []
+    for i in range(80):
+        b = chess.Board.from_chess960_pos(rnd.randrange(960))
+        for _ in range(rnd.randint(1, 20)):
+            moves = list(b.legal_moves)
+            if moves:
+                b.push(rnd.choice(moves))
+        fens.append(ld.fen_of(b))
+    board = pl.board_label_set("val", fens)
+    assert set(board.numeric) == set(pl.BOARD_NUMERIC) and set(board.binary) == set(pl.BOARD_BINARY)
+    # subsampling keeps the same positions for a seed and drops yes/no labels with too few positives
+    small = pl.subsample(board, 50, seed=3, min_count=5)
+    assert len(small.fens) == 50 and small.fens == pl.subsample(board, 50, seed=3, min_count=5).fens
+    assert "in_check" not in pl.subsample(board, 50, seed=3, min_count=1000).binary
+    assert small.numeric["material_balance"].tolist() == [pl.board_labels(chess.Board(f, chess960=True))
+                                                          ["material_balance"] for f in small.fens]
+
+    torch.manual_seed(0)
+    encoder = lje.LabyrinthEncoder(lje.JEPAConfig(**TINY)).train()
+    probes = pl.TrainingProbes([board], views=["z", "readout_in", "pre_transformer_mean"], k=5)
+    rows = probes.probe(encoder, "cpu")
+    assert encoder.training, "the encoder is put back in training mode"
+    assert not encoder.readout_proj._forward_hooks and not encoder.transformer._forward_pre_hooks
+    assert {r["view"] for r in rows} == {"z", "readout_in", "pre_transformer_mean"}
+    assert str(rows) == str(probes.probe(encoder, "cpu")), "the same positions and split every time"   # str: NaN AUCs
+    summary = pl.TrainingProbes.summarize(rows)
+    material = [r for r in rows if r["view"] == "z" and r["label"] == "material_balance"][0]
+    assert summary["z"]["val/material_balance"] == {"linear": material["linear_r2"], "knn": material["knn_r2"]}
+    assert {"val/board/r2", "val/board/auc"} <= set(summary["z"])
+    onehot = pl.TrainingProbes.summarize(probes.probe(None, "cpu", "board_onehot", ""))
+    assert set(onehot) == {"onehot"}
+
+
 def test_end_to_end_writes_the_csvs():
     rnd = random.Random(0)
     boards = []

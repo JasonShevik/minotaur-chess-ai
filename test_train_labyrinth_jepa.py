@@ -9,6 +9,7 @@ Tiny models on a tiny position cache built in a temporary folder, on the CPU. Th
 trains, evaluates, checkpoints and resumes; that the schedules and weight-decay groups are right; that
 the memory guard trips; and that the DEHB objective scores runs and handles runs that do not fit.
 """
+import csv
 import json
 import os
 import random
@@ -23,6 +24,7 @@ import torch
 
 import labyrinth_data as ld
 import labyrinth_jepa_encoder as lje
+import probe_labyrinth as pl
 import train_labyrinth_jepa as tj
 
 
@@ -75,7 +77,7 @@ def test_a_run_trains_evaluates_checkpoints_and_resumes():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cache = make_cache(tmp)
         out = os.path.join(tmp, "run")
-        result = tj.train(tiny_config(), tiny_run(cache, out), log=quiet)
+        result = tj.train(tiny_config(), tiny_run(cache, out, grad_terms_every=2, snapshot_first=2), log=quiet)
         assert result["steps"] == 6
         steps = [h for h in result["history"] if "loss" in h]
         evals = [h for h in result["history"] if "eval" in h]
@@ -93,13 +95,50 @@ def test_a_run_trains_evaluates_checkpoints_and_resumes():
         model.load_state_dict(ckpt["model"])
         assert any(not torch.equal(a, b) for a, b in zip(model.encoder.parameters(), model.target.parameters()))
 
+        # per-term gradients: the masked-square loss never reaches the readout, the regularizers and the
+        # next-position loss do
+        grads = [h for h in result["history"] if "grad_terms" in h]
+        assert [h["step"] for h in grads] == [2, 4, 6]
+        norms = grads[-1]["grad_terms"]["norms"]
+        assert {"mask", "next", "anticollapse_masked", "anticollapse_full", "rl", "total"} <= set(norms)
+        assert "readout" not in norms["mask"] and norms["mask"]["transformer"] > 0
+        assert norms["next"]["readout"] > 0 and norms["anticollapse_masked"]["readout"] > 0
+        assert norms["total"]["mask_predictor"] > 0 and "mask_predictor" not in norms["next"]
+        assert all(-1 - 1e-6 <= c <= 1 + 1e-6 for pair in grads[-1]["grad_terms"]["cosine"].values()
+                   for c in pair.values())
+        assert "readout" not in grads[-1]["grad_terms"]["cosine"]["mask|next"]
+
+        # probes: the baselines once, then the target encoder at every evaluation, every view
+        baselines = [h for h in result["history"] if "probe_baselines" in h]
+        assert len(baselines) == 1 and set(baselines[0]["probe_baselines"]) == {"untrained", "board_onehot"}
+        probes = [h for h in result["history"] if "probe" in h]
+        assert [h["step"] for h in probes] == [3, 6] and result["probe"] == probes[-1]["probe"]
+        assert set(probes[-1]["probe"]) == {"z", "token_mean", "pre_transformer_mean"}
+        assert "val/material_balance" in probes[-1]["probe"]["z"]
+        with open(os.path.join(out, "probes.csv")) as f:
+            rows = list(csv.DictReader(f))
+        assert {(r["step"], r["model"]) for r in rows} == {("0", "untrained"), ("0", "board_onehot"),
+                                                           ("3", "trained"), ("6", "trained")}
+
+        # snapshots at step 0, 2, 4 and the end; step 0 is the starting point the untrained baseline rebuilds
+        snaps = os.path.join(out, "snapshots")
+        assert sorted(os.listdir(snaps)) == [f"step_{s:07d}.pt" for s in (0, 2, 4, 6)]
+        torch.manual_seed(0)
+        start = lje.LabyrinthEncoder(tiny_config())
+        first = pl.load_encoder(os.path.join(snaps, "step_0000000.pt"), "cpu")
+        assert all(torch.equal(a, b) for a, b in zip(start.parameters(), first.parameters()))
+        assert not torch.equal(pl.load_encoder(os.path.join(snaps, "step_0000006.pt"), "cpu").queries, first.queries)
+
         # resuming continues from step 6 to step 9
-        resumed = tj.train(tiny_config(), tiny_run(cache, out, total_steps=9), log=quiet)
+        resumed = tj.train(tiny_config(), tiny_run(cache, out, total_steps=9, grad_terms_every=2, snapshot_first=2),
+                           log=quiet)
         assert resumed["steps"] == 9
         assert [h["step"] for h in resumed["history"] if "loss" in h] == [7, 8, 9]
         with open(os.path.join(out, "history.jsonl")) as f:
             lines = [json.loads(l) for l in f]
         assert [h["step"] for h in lines if "loss" in h] == list(range(1, 10))
+        assert not any("probe_baselines" in h for h in resumed["history"]), "baselines are not probed again"
+        assert sorted(os.listdir(snaps))[-2:] == ["step_0000008.pt", "step_0000009.pt"]
 
 
 def test_rollout_curriculum_grows_during_a_run():
@@ -144,6 +183,20 @@ def test_schedules_and_weight_decay_groups():
     for token in ("encoder.mask_token", "encoder.token_type", "encoder.registers", "encoder.queries"):
         assert token in no_decay_names, token
     assert len(decay_names) + len(no_decay_names) == len(model.trainable_parameters())
+
+
+def test_parameter_parts_and_snapshot_steps():
+    for variant in lje.TOKEN_VARIANTS:
+        parts = {n: tj.parameter_part(n) for n, _ in lje.LabyrinthJEPA(tiny_config(variant)).named_parameters()
+                 if not n.startswith("target.")}
+        assert all(p in tj.ENCODER_PARTS for n, p in parts.items() if n.startswith("encoder.")), variant
+        assert set(tj.ENCODER_PARTS) <= set(parts.values())
+    assert tj.parameter_part("encoder.queries") == "readout" == tj.parameter_part("encoder.readout_proj.weight")
+    assert tj.parameter_part("encoder.registers") == "transformer" == tj.parameter_part("encoder.final_norm.bias")
+    assert tj.parameter_part("encoder.square_gats.0.conv.lin.weight") == "square_stage"
+    assert tj.parameter_part("next_predictor.step.weight") == "next_predictor"
+    assert [s for s in range(5000) if tj.snapshot_due(s, 250)] == [0, 250, 500, 1000, 2000, 4000]
+    assert not any(tj.snapshot_due(s, 0) for s in range(10))
 
 
 def test_memory_guard():
