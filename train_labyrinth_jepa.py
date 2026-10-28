@@ -21,7 +21,8 @@ train(model_config, run_config) is one training run:
     card stops with MemoryBudgetExceeded instead. It checks at step 3 and every memory_check_every steps,
     since the unpool variant's graphs grow as it learns to split more nodes. It measures the memory
     PyTorch has reserved, not just allocated: the unpool variant's graphs change size every batch, which
-    fragments the allocator's cache until the reserved memory is far above the allocated;
+    fragments the allocator's cache until the reserved memory is far above the allocated. So whenever the
+    reserved memory passes cache_release_fraction of the card, the unused cache is handed back first;
   * every eval_every steps: LiDAR, RankMe and the self-consistency ratio of the target encoder on a fixed
     set of validation positions, plus the losses on validation batches;
   * probes at every evaluation (probe_positions > 0): linear and nearest-neighbour probes of the target
@@ -102,6 +103,8 @@ class RunConfig:
     device: Optional[str] = None                     # None: cuda if available
     memory_budget: float = 0.9                       # fraction of the GPU's memory a run may use
     memory_check_every: int = 100                    # also check the budget every this many steps (0: only at step 3)
+    cache_release_fraction: float = 0.7              # hand the allocator's unused cache back to the GPU whenever the
+                                                     # reserved memory passes this fraction of the card (0: never)
     objective_metric: str = "online_lidar"           # what the DEHB objective reports from the final evaluation
     max_consecutive_skips: int = 50
     probe_positions: int = 8_000                     # positions per probe set, probed at every evaluation (0: no probes)
@@ -434,6 +437,8 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     loader.set_rollout_steps(len(rollout_weights), lje.rollout_target_steps(config, len(rollout_weights)))
     batches = iter(loader)
     skips = 0
+    cache_releases = 0
+    total_gpu_memory = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
     t_last, positions_since = time.perf_counter(), 0
     log(f"training {config.token_variant} for {run.total_steps} steps of {batch_size} positions on {device} "
         f"({len(loader.dataset):,} training positions, {len(eval_fens)} evaluation positions)")
@@ -517,6 +522,12 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                 raise TrainingDiverged(f"{skips} consecutive steps with a non-finite loss or gradient at step {step}")
             continue
 
+        if (device.type == "cuda" and run.cache_release_fraction > 0
+                and torch.cuda.memory_reserved(device) > run.cache_release_fraction * total_gpu_memory):
+            # The unpool variant's graphs change size every batch, so the cache fills with blocks that fit no
+            # later request; left alone, reserved memory creeps past the card and spills into system memory
+            torch.cuda.empty_cache()
+            cache_releases += 1
         if device.type == "cuda" and (step == 3 or (run.memory_check_every and step % run.memory_check_every == 0)):
             check_memory_budget(torch.cuda.max_memory_reserved(device),
                                 torch.cuda.get_device_properties(device).total_memory, run.memory_budget)
@@ -530,6 +541,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             if device.type == "cuda":
                 entry["gpu_peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
                 entry["gpu_reserved_gb"] = torch.cuda.max_memory_reserved(device) / 2**30
+                entry["cache_releases"] = cache_releases
             record(entry)
             zpred = f"zpred={entry['loss_zpred']:.4f} " if "loss_zpred" in entry else ""
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
