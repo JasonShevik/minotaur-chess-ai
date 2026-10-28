@@ -49,7 +49,9 @@ z, and the predictors then win by learning that shared vector. An anti-collapse 
 It acts on z of the masked and / or the whole board (anticollapse_views), or, with projector_layers > 0,
 on an MLP head's output: pushing a vector towards a fixed distribution costs the layers nearest to it
 information (guillotine regularization), so the head takes that cost and z, before it, is the
-representation.
+representation. anticollapse_square_mean also regularizes each view's mean square token: in a mean
+readout over the squares and the unpooled nodes, z can otherwise take all its spread from the nodes
+while the square tokens, which the masked-square loss reads, collapse onto one vector.
 
 The three variants share everything else, so comparing them answers whether the unpooling layers
 earn their place. The unpooling decisions are sampled everywhere, in the target encoder too; their
@@ -154,6 +156,9 @@ class JEPAConfig:
     sigreg_weight: float = 0.05      # LeJEPA's default lambda
     vicreg_weight: float = 1.0       # VICReg's variance weight equals its invariance weight; our losses play that role
     anticollapse_squares: bool = False   # also regularize the square tokens (not only z)
+    anticollapse_square_mean: bool = False  # also regularize each regularized view's mean square token, at the same
+                                            # weight as its z: when unpooled nodes join a mean readout, z can take
+                                            # all its spread from them while the square tokens collapse
     sigreg_slices: int = 256         # random 1-D projections per step
     sigreg_points: int = 17          # quadrature points of the Epps-Pulley integral on [0, sigreg_t_max]
     sigreg_t_max: float = 3.0
@@ -704,11 +709,12 @@ class LabyrinthJEPA(nn.Module):
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
         if c.anticollapse != "none":
-            embeddings = []
+            views = []
             if c.anticollapse_views in ("both", "masked"):
-                embeddings.append(("masked", ctx_masked.z))
+                views.append(("masked", ctx_masked))
             if c.anticollapse_views in ("both", "full") and ctx_full is not None:
-                embeddings.append(("full", ctx_full.z))
+                views.append(("full", ctx_full))
+            embeddings = [(name, out.z) for name, out in views]
             if self.projector is not None:
                 embeddings = [(name, self.projector(e)) for name, e in embeddings]
             if c.anticollapse_squares:
@@ -717,6 +723,12 @@ class LabyrinthJEPA(nn.Module):
                     keep = torch.randperm(squares.size(0), device=squares.device, generator=rng)[:4096]
                     squares = squares[keep]
                 embeddings.append(("squares", squares))
+            # each term above counts 1 / their number; a mean square token counts as much as its view's z
+            scales = [1.0 / len(embeddings)] * len(embeddings) if embeddings else []
+            if c.anticollapse_square_mean:
+                for name, out in views:
+                    embeddings.append((f"square_mean_{name}", out.squares.mean(1)))
+                    scales.append(scales[0])
             terms = []
             # Measured on the current batch only. (A queue of recent embeddings was tried, to give the
             # statistic more samples: the queue's centre lags the encoder, so the cheapest way to lower
@@ -728,11 +740,11 @@ class LabyrinthJEPA(nn.Module):
                     variance, covariance = vicreg_terms(e)
                     terms.append(variance + c.vicreg_cov_ratio * covariance)
             if terms:                          # (none when the regularized view is absent from this batch)
-                anticollapse = torch.stack(terms).mean()
+                anticollapse = sum(scale * term for scale, term in zip(scales, terms))
                 reg_weight = c.sigreg_weight if c.anticollapse == "sigreg" else c.vicreg_weight
                 total = total + reg_weight * anticollapse
-                for (name, _), term in zip(embeddings, terms):
-                    contributions[f"anticollapse_{name}"] = reg_weight * term / len(terms)
+                for (name, _), scale, term in zip(embeddings, scales, terms):
+                    contributions[f"anticollapse_{name}"] = reg_weight * scale * term
                     stats[f"anticollapse_{name}"] = float(term.detach())
                 if c.decorrelation_weight > 0 and c.anticollapse == "sigreg":
                     decorrelation = torch.stack([vicreg_terms(e)[1] for _, e in embeddings]).mean()

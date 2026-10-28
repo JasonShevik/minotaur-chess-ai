@@ -413,7 +413,8 @@ def test_loss_terms_add_up_to_the_total():
     """JEPALosses.terms splits total into each term's weighted share, one per regularized embedding."""
     cases = [("unpool", dict()), ("registers", dict(decorrelation_weight=0.5, anticollapse_squares=True)),
              ("squares", dict(anticollapse="vicreg")), ("squares", dict(anticollapse="none")),
-             ("squares", dict(zpred_weight=0.5, projector_layers=2, projector_hidden=32, projector_dim=16))]
+             ("squares", dict(zpred_weight=0.5, projector_layers=2, projector_hidden=32, projector_dim=16)),
+             ("unpool", dict(transformer_layers=0, readout="mean", anticollapse_square_mean=True))]
     for variant, kw in cases:
         cfg = small_config(variant, **kw)
         torch.manual_seed(0)
@@ -423,6 +424,8 @@ def test_loss_terms_add_up_to_the_total():
         if cfg.anticollapse != "none":
             expected |= {"anticollapse_masked", "anticollapse_full"}
             expected |= {"anticollapse_squares"} if cfg.anticollapse_squares else set()
+            expected |= ({"anticollapse_square_mean_masked", "anticollapse_square_mean_full"}
+                         if cfg.anticollapse_square_mean else set())
             expected |= {"decorrelation"} if cfg.decorrelation_weight > 0 else set()
             assert all(f"anticollapse_{n}" in out.stats for n in ("masked", "full"))
         expected |= {"rl"} if cfg.uses_unpool and cfg.unpool_rl else set()
@@ -461,6 +464,25 @@ def test_whole_board_predictor_projector_and_regularized_views():
     assert float(model.projector[0].weight.grad.abs().sum()) > 0
     assert float(model.encoder.readout_proj.weight.grad.abs().sum()) > 0
     assert not any(n.startswith("projector") for n, _ in model.encoder.named_parameters())
+
+
+def test_square_mean_regularizer_weighs_like_z():
+    """anticollapse_square_mean adds each view's mean square token at its z's weight; z's own terms stay as they were."""
+    def run(**kw):
+        cfg = small_config("unpool", transformer_layers=0, readout="mean", **kw)
+        torch.manual_seed(0)
+        model = lje.LabyrinthJEPA(cfg)
+        return model, model.losses(make_batch(cfg), rng=torch.Generator().manual_seed(0))
+    _, plain = run()
+    model, out = run(anticollapse_square_mean=True)
+    for view in ("masked", "full"):
+        assert abs(float(plain.terms[f"anticollapse_{view}"] - out.terms[f"anticollapse_{view}"])) < 1e-6, view
+        share = float(out.terms[f"anticollapse_square_mean_{view}"])
+        assert share > 0 and abs(share - 0.05 / 2 * out.stats[f"anticollapse_square_mean_{view}"]) < 1e-6, view
+    # it trains the square stage directly, not through z's readout
+    out.terms["anticollapse_square_mean_masked"].backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder.square_gats.parameters())
+    assert model.encoder.readout_proj.weight.grad is None
 
 
 def test_dehb_search_space_samples_build():
