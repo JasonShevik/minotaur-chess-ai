@@ -19,7 +19,9 @@ train(model_config, run_config) is one training run:
   * a memory guard: on Windows a GPU that runs out of memory does not fail, it silently spills into
     system memory and slows down a hundredfold, so a run whose peak memory exceeds memory_budget of the
     card stops with MemoryBudgetExceeded instead. It checks at step 3 and every memory_check_every steps,
-    since the unpool variant's graphs grow as it learns to split more nodes;
+    since the unpool variant's graphs grow as it learns to split more nodes. It measures the memory
+    PyTorch has reserved, not just allocated: the unpool variant's graphs change size every batch, which
+    fragments the allocator's cache until the reserved memory is far above the allocated;
   * every eval_every steps: LiDAR, RankMe and the self-consistency ratio of the target encoder on a fixed
     set of validation positions, plus the losses on validation batches;
   * probes at every evaluation (probe_positions > 0): linear and nearest-neighbour probes of the target
@@ -509,7 +511,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             continue
 
         if device.type == "cuda" and (step == 3 or (run.memory_check_every and step % run.memory_check_every == 0)):
-            check_memory_budget(torch.cuda.max_memory_allocated(device),
+            check_memory_budget(torch.cuda.max_memory_reserved(device),
                                 torch.cuda.get_device_properties(device).total_memory, run.memory_budget)
 
         if step % run.log_every == 0 or step == run.total_steps:
@@ -520,6 +522,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                      "positions_per_s": positions_since / max(1e-9, now - t_last), **out.stats}
             if device.type == "cuda":
                 entry["gpu_peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
+                entry["gpu_reserved_gb"] = torch.cuda.max_memory_reserved(device) / 2**30
             record(entry)
             zpred = f"zpred={entry['loss_zpred']:.4f} " if "loss_zpred" in entry else ""
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
