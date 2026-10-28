@@ -156,6 +156,37 @@ def test_losses_reach_every_trainable_part():
         assert reached(model.baselines) == rl_on
 
 
+def test_encoder_layouts_without_transformer_mean_readout_and_predictor_transformer():
+    batch = make_batch(small_config("squares"))
+
+    def reached(module) -> bool:
+        return any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in module.parameters())
+    for variant in lje.TOKEN_VARIANTS:
+        for kw in (dict(transformer_layers=0), dict(readout="mean"), dict(pred_transformer_layers=2),
+                   dict(transformer_layers=0, readout="mean", pred_transformer_layers=2)):
+            cfg = small_config(variant, **kw)
+            model = lje.LabyrinthJEPA(cfg)
+            losses = model.losses(make_batch(cfg), rng=torch.Generator().manual_seed(3))
+            losses.total.backward()
+            unreached = [n for n, p in model.named_parameters()
+                         if not n.startswith("target.") and p.requires_grad and p.grad is None
+                         and not n.startswith(("baselines.", "encoder.unpool_layers"))]
+            assert not unreached, (variant, kw, unreached[:5])
+            if cfg.pred_transformer_layers:
+                assert reached(model.mask_predictor.transformer)
+    # without a transformer the final square tokens are the GAT tokens, normalized; the mean readout projects
+    # the tokens' mean
+    cfg = small_config("squares", transformer_layers=0, readout="mean")
+    encoder = lje.LabyrinthEncoder(cfg).eval()
+    captured = {}
+    encoder.transformer.register_forward_pre_hook(lambda m, args: captured.__setitem__("in", args[0]))
+    with torch.no_grad():
+        out = encoder(batch.full)
+        assert torch.allclose(out.squares, encoder.final_norm(captured["in"]), atol=1e-6)
+        assert torch.allclose(out.z, encoder.readout_proj(out.squares.mean(1)), atol=1e-5)
+    assert not hasattr(encoder, "queries") and sum(p.numel() for p in encoder.transformer.parameters()) == 0
+
+
 def test_representation_metrics():
     torch.manual_seed(0)
     # RankMe: an identity-like matrix uses every dimension, a rank-1 matrix one
@@ -308,7 +339,7 @@ def test_rollout_schedule():
     # which steps are graded
     assert lje.rollout_target_steps(start, 20) is None
     log = small_config(rollout_targets="log", rollout_max_steps=20)
-    assert lje.rollout_target_steps(log, 20) == [1, 2, 4, 8, 16, 20]
+    assert lje.rollout_target_steps(log, 20) == [1, 2, 3, 4, 5, 8, 9, 16, 17, 19, 20]   # odd and even plies
     assert lje.rollout_target_steps(log, 1) == [1] and lje.rollout_target_steps(log, 3) == [1, 2, 3]
     for bad in (dict(rollout_start_steps=5, rollout_max_steps=4), dict(rollout_targets="some")):
         try:
@@ -319,19 +350,19 @@ def test_rollout_schedule():
 
 
 def test_long_rollouts_grade_only_the_target_steps():
-    cfg = small_config("registers", rollout_max_steps=6, rollout_targets="log")
+    cfg = small_config("registers", rollout_max_steps=10, rollout_targets="log")
     model = lje.LabyrinthJEPA(cfg)
-    targets = lje.rollout_target_steps(cfg, 6)
+    targets = lje.rollout_target_steps(cfg, 10)
     rnd = random.Random(32)
-    batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=6, target_steps=targets)
+    batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=10, target_steps=targets)
                              for f in FENS[:4]])
-    losses = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0] * 6)
-    graded = {k for k in range(1, 7) if f"loss_next_{k}" in losses.stats}
-    assert graded == {1, 2, 4, 6}, graded
+    losses = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0] * 10)
+    graded = {k for k in range(1, 11) if f"loss_next_{k}" in losses.stats}
+    assert graded == {1, 2, 3, 4, 5, 8, 9, 10}, graded
     losses.total.backward()
     # the ungraded steps are still on the way to the graded ones, so their step embeddings train too
-    assert float(model.next_predictor.step.weight.grad[3].abs().sum()) > 0
     assert float(model.next_predictor.step.weight.grad[6].abs().sum()) > 0
+    assert float(model.next_predictor.step.weight.grad[10].abs().sum()) > 0
 
 
 def test_latent_rollout_trains_every_step_without_peeking():

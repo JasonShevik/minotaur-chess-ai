@@ -160,14 +160,15 @@ def test_rollout_curriculum_grows_during_a_run():
 def test_long_sparse_rollouts_whole_board_term_and_projector_train():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cache = make_cache(tmp)
-        cfg = tiny_config("squares", rollout_start_steps=2, rollout_max_steps=6, rollout_stage_positions=8,
+        cfg = tiny_config("squares", rollout_start_steps=10, rollout_max_steps=12, rollout_stage_positions=8,
                           rollout_targets="log", zpred_weight=1.0, projector_layers=2, projector_hidden=32,
                           projector_dim=16, anticollapse_views="full")
         result = tj.train(cfg, tiny_run(cache, None, total_steps=6, eval_every=3, grad_terms_every=3), log=quiet)
         steps = [h for h in result["history"] if "loss" in h]
-        assert [len(h["rollout_weights"]) for h in steps] == [2, 3, 4, 5, 6, 6]
-        assert all("loss_zpred" in h for h in steps) and "loss_next_3" not in steps[-1]
-        assert {"loss_next_1", "loss_next_2", "loss_next_4", "loss_next_6"} <= set(steps[-1])
+        assert [len(h["rollout_weights"]) for h in steps] == [10, 11, 12, 12, 12, 12]
+        assert all("loss_zpred" in h for h in steps)
+        assert "loss_next_6" not in steps[-1] and "loss_next_10" not in steps[-1]       # ungraded steps
+        assert {f"loss_next_{k}" for k in (1, 2, 3, 8, 9)} <= set(steps[-1])
         assert "val_loss_zpred" in [h for h in result["history"] if "eval" in h][-1]["eval"]
         norms = [h for h in result["history"] if "grad_terms" in h][-1]["grad_terms"]["norms"]
         assert set(norms) == {"mask", "next", "zpred", "anticollapse_full", "total"}

@@ -16,8 +16,8 @@ answers the predictors are graded against. Two predictors give the training sign
                      sees an intermediate position, only predicts it. A curriculum lengthens it:
                      rollout_start_steps moves (plies) ahead at first, one more every
                      rollout_stage_positions training positions, up to rollout_max_steps (see
-                     rollout_schedule). With rollout_targets = "log" only steps 1, 2, 4, 8, ... and the
-                     last are graded, so a long rollout needs few target encodings.
+                     rollout_schedule). With rollout_targets = "log" only a few steps are graded (see
+                     rollout_target_steps), so a long rollout needs few target encodings.
     whole board      (zpred_weight > 0) From z of the masked board, predict the target encoder's z of
                      the whole board: the masked-square task at the level of the position vector.
 
@@ -33,7 +33,9 @@ The encoder:
     transformer  all tokens of a position attend to each other (no positional encodings: tokens
                are an unordered set, so the unpooled nodes' arbitrary order cannot matter)
     readout    readout_queries learned queries attend over the final tokens; their outputs are
-               concatenated and projected to z (z_dim)
+               concatenated and projected to z (z_dim). readout = "mean": the tokens' mean, projected.
+    transformer_layers = 0 leaves the transformer out (the square tokens are then only as global as the
+    GAT layers make them); pred_transformer_layers puts attention in the masked-square predictor instead.
 
 Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
 positions get different vectors: the untrained encoder already maps every position to nearly the same
@@ -83,6 +85,7 @@ import labyrinth_data as ld
 TOKEN_VARIANTS = ("squares", "registers", "unpool")
 ANTICOLLAPSE = ("sigreg", "vicreg", "none")
 ANTICOLLAPSE_VIEWS = ("both", "full", "masked")
+READOUTS = ("attention", "mean")
 ROLLOUT_TARGETS = ("all", "log")
 
 
@@ -115,12 +118,13 @@ class JEPAConfig:
 
     # ----- Transformer over the tokens -----
     d_model: int = 256
-    transformer_layers: int = 4
+    transformer_layers: int = 4      # 0: no transformer, the square tokens go straight to the readout
     transformer_heads: int = 8
     transformer_ff_mult: int = 4
     transformer_dropout: float = 0.0
 
     # ----- Readout -----
+    readout: str = "attention"       # "attention": learned queries attend over the tokens; "mean": their mean
     readout_queries: int = 8
     z_dim: int = 1024                # keep fixed during a DEHB search, so LiDAR scores are comparable
 
@@ -128,6 +132,7 @@ class JEPAConfig:
     pred_dim: int = 128
     pred_gat_layers: int = 3
     pred_heads: int = 4
+    pred_transformer_layers: int = 0 # transformer layers over the 64 squares after the predictor's GATs
 
     # ----- Next-position predictor -----
     move_dim: int = 128
@@ -168,8 +173,9 @@ class JEPAConfig:
     rollout_stage_positions: int = 250_000   # training positions per curriculum stage (0: full length from the start)
     rollout_ramp_fraction: float = 0.25      # a newly added step's weight ramps from 0 to 1 over this part of its stage
     rollout_step_decay: float = 1.0  # step k's loss weight is decay ** (k - 1)
-    rollout_targets: str = "all"     # which steps get a loss (and a target graph): "all", or "log" (steps 1, 2, 4,
-                                     # 8, ... and the last), so long rollouts need few target encodings
+    rollout_targets: str = "all"     # which steps get a loss (and a target graph): "all", or "log" (1, 2, 3, every
+                                     # power of two and the step after it, and the last two), so long rollouts need
+                                     # few target encodings
 
     # ----- Unpooling decisions (REINFORCE) -----
     unpool_rl: bool = True           # False freezes the decision policy; everything else still trains
@@ -239,6 +245,10 @@ class JEPAConfig:
             raise ValueError(f"rollout_targets must be one of {ROLLOUT_TARGETS}")
         if self.anticollapse_views not in ANTICOLLAPSE_VIEWS:
             raise ValueError(f"anticollapse_views must be one of {ANTICOLLAPSE_VIEWS}")
+        if self.readout not in READOUTS:
+            raise ValueError(f"readout must be one of {READOUTS}")
+        if self.transformer_layers < 0 or self.pred_transformer_layers < 0:
+            raise ValueError("transformer_layers and pred_transformer_layers must be at least 0")
         if self.zpred_weight < 0 or self.zpred_layers < 1 or self.projector_layers < 0:
             raise ValueError("need zpred_weight >= 0, zpred_layers >= 1 and projector_layers >= 0")
         if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
@@ -254,6 +264,13 @@ def _mlp(sizes: Sequence[int]) -> nn.Sequential:
         layers += [nn.Linear(sizes[i], sizes[i + 1]), nn.LayerNorm(sizes[i + 1]), nn.GELU()]
     layers.append(nn.Linear(sizes[-2], sizes[-1]))
     return nn.Sequential(*layers)
+
+
+class _NoTransformer(nn.Module):
+    """Stands in for the transformer when transformer_layers = 0: the tokens pass through unchanged."""
+
+    def forward(self, tokens: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return tokens
 
 
 class _GATBlock(nn.Module):
@@ -331,13 +348,15 @@ class LabyrinthEncoder(nn.Module):
         layer = nn.TransformerEncoderLayer(c.d_model, c.transformer_heads, c.transformer_ff_mult * c.d_model,
                                            dropout=c.transformer_dropout, activation="gelu",
                                            batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(layer, c.transformer_layers, enable_nested_tensor=False)
+        self.transformer = nn.TransformerEncoder(layer, c.transformer_layers, enable_nested_tensor=False) \
+            if c.transformer_layers > 0 else _NoTransformer()
         self.final_norm = nn.LayerNorm(c.d_model)
 
-        self.queries = nn.Parameter(torch.randn(c.readout_queries, c.d_model) * 0.02)
-        self.readout_attn = nn.MultiheadAttention(c.d_model, c.transformer_heads, batch_first=True)
-        self.readout_norm = nn.LayerNorm(c.d_model)
-        self.readout_proj = nn.Linear(c.readout_queries * c.d_model, c.z_dim)
+        if c.readout == "attention":
+            self.queries = nn.Parameter(torch.randn(c.readout_queries, c.d_model) * 0.02)
+            self.readout_attn = nn.MultiheadAttention(c.d_model, c.transformer_heads, batch_first=True)
+            self.readout_norm = nn.LayerNorm(c.d_model)
+        self.readout_proj = nn.Linear((c.readout_queries if c.readout == "attention" else 1) * c.d_model, c.z_dim)
 
     def forward(
         self,
@@ -388,9 +407,13 @@ class LabyrinthEncoder(nn.Module):
         pad = torch.cat([torch.zeros(B, 64, dtype=torch.bool, device=h.device), extra_pad], dim=1)
         tokens = self.final_norm(self.transformer(tokens, src_key_padding_mask=pad))
 
-        queries = self.queries.unsqueeze(0).expand(B, -1, -1)
-        read, _ = self.readout_attn(queries, tokens, tokens, key_padding_mask=pad, need_weights=False)
-        z = self.readout_proj(self.readout_norm(read).reshape(B, -1))
+        if c.readout == "attention":
+            queries = self.queries.unsqueeze(0).expand(B, -1, -1)
+            read, _ = self.readout_attn(queries, tokens, tokens, key_padding_mask=pad, need_weights=False)
+            z = self.readout_proj(self.readout_norm(read).reshape(B, -1))
+        else:
+            keep = (~pad).unsqueeze(-1).to(tokens.dtype)
+            z = self.readout_proj((tokens * keep).sum(1) / keep.sum(1))
         return EncoderOutput(z, tokens[:, :64], log_prob, entropy, (~pad).sum(1), num_decisions, actions)
 
     @staticmethod
@@ -423,6 +446,11 @@ class MaskPredictor(nn.Module):
         self.target_flag = nn.Parameter(torch.randn(c.pred_dim) * 0.02)
         self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.num_edge_types, 0.0, add_self_loops=False)
                                   for _ in range(c.pred_gat_layers))
+        # Optional attention across the whole board, after the local GAT steps (the squares stay an unordered set)
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(c.pred_dim, c.pred_heads, 4 * c.pred_dim, dropout=0.0, activation="gelu",
+                                       batch_first=True, norm_first=True),
+            c.pred_transformer_layers, enable_nested_tensor=False) if c.pred_transformer_layers > 0 else None
         self.out = nn.Sequential(nn.LayerNorm(c.pred_dim), nn.Linear(c.pred_dim, c.d_model))
 
     def forward(self, squares: torch.Tensor, graphs: ld.GraphBatch, mask: torch.Tensor) -> torch.Tensor:
@@ -432,6 +460,8 @@ class MaskPredictor(nn.Module):
         edge_index, edge_attr = graphs.edge_index, graphs.edge_attr
         for block in self.gats:
             h = block(h, edge_index, edge_attr)
+        if self.transformer is not None:
+            h = self.transformer(h.view(squares.size(0), 64, -1)).reshape(-1, h.size(-1))
         return self.out(h)
 
 
@@ -792,17 +822,19 @@ def rollout_schedule(config: JEPAConfig, positions_seen: int) -> List[float]:
 def rollout_target_steps(config: JEPAConfig, steps: int) -> Optional[List[int]]:
     """
     The steps of a rollout of this length that get a target graph and a loss: None for every step
-    (rollout_targets = "all"), or steps 1, 2, 4, 8, ... and the last ("log"). The rest are still
-    predicted (the rollout passes through them), just not graded.
+    (rollout_targets = "all"), or ("log") steps 1, 2 and 3, every power of two from 4 and the step after
+    it, and the last two steps. Every scale gets an odd and an even step: boards are drawn from the side
+    to move, so after an odd number of plies the board is seen from the other side, a different task
+    from an even number. The rest are still predicted (the rollout passes through them), just not graded.
     """
     if config.rollout_targets == "all":
         return None
-    targets = {1, steps}
-    k = 2
-    while k < steps:
-        targets.add(k)
+    targets = {1, 2, 3, steps - 1, steps}
+    k = 4
+    while k <= steps:
+        targets.update((k, k + 1))
         k *= 2
-    return sorted(targets)
+    return sorted(t for t in targets if 1 <= t <= steps)
 
 
 # ##### ##### ##### ##### #####
