@@ -918,13 +918,14 @@ def encode_positions(encoder: LabyrinthEncoder, fens: Sequence[str], *, samples:
 
 
 def representation_report(encoder: LabyrinthEncoder, fens: Sequence[str], *, samples: int = 4,
-                          mask_config: Optional[ld.MaskConfig] = None, seed: int = 0) -> Dict[str, float]:
+                          mask_config: Optional[ld.MaskConfig] = None, seed: int = 0,
+                          batch_size: int = 256) -> Dict[str, float]:
     """
     LiDAR (the DEHB objective), RankMe and the self-consistency ratio of the encoder on these positions.
     Use a fixed set of held-out positions (the val split) so scores are comparable between runs; LiDAR
     needs more positions than z_dim to reach its full range.
     """
-    z = encode_positions(encoder, fens, samples=samples, mask_config=mask_config, seed=seed)
+    z = encode_positions(encoder, fens, samples=samples, mask_config=mask_config, seed=seed, batch_size=batch_size)
     return {
         "lidar": lidar(z),
         "rankme": rankme(z.mean(1)),

@@ -154,19 +154,20 @@ def check_memory_budget(peak_bytes: int, total_bytes: int, budget: float) -> Non
 
 @torch.no_grad()
 def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optional[ld.JEPALoader],
-             run: RunConfig, device: torch.device, rollout_weights: Optional[List[float]] = None) -> Dict[str, float]:
+             run: RunConfig, device: torch.device, rollout_weights: Optional[List[float]] = None,
+             encode_batch: int = 256) -> Dict[str, float]:
     """
     Label-free metrics on fixed validation positions, of the target encoder (the plain keys: the encoder
     that is kept) and of the online encoder ("online_" keys: over short runs the moving-average target
-    still lags far behind it), and validation losses.
+    still lags far behind it), and validation losses. encode_batch: positions encoded at once.
     """
     was_training = model.training
     model.eval()
     mask = ld.MaskConfig(run.eval_mask_min_ratio, run.eval_mask_max_ratio, 1) if run.eval_mask_max_ratio > 0 else None
     metrics = lje.representation_report(model.target, eval_fens, samples=run.eval_samples, mask_config=mask,
-                                        seed=run.seed)
+                                        seed=run.seed, batch_size=encode_batch)
     online = lje.representation_report(model.encoder, eval_fens, samples=run.eval_samples, mask_config=mask,
-                                       seed=run.seed)
+                                       seed=run.seed, batch_size=encode_batch)
     metrics.update({f"online_{k}": v for k, v in online.items()})
     if val_loader is not None:
         val_loader.set_epoch(0)
@@ -187,8 +188,8 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
     return metrics
 
 
-def build_probes(run: RunConfig, val_dataset: ld.PositionDataset, log: Callable[[str], None] = print
-                 ) -> Optional[pl.TrainingProbes]:
+def build_probes(run: RunConfig, val_dataset: ld.PositionDataset, log: Callable[[str], None] = print,
+                 encode_batch: int = 512) -> Optional[pl.TrainingProbes]:
     """
     The run's fixed probe set (None with probe_positions 0): board facts of random validation positions,
     plus the engine-analyzed positions (probe_db) and puzzles (probe_puzzles) when given, each cut to
@@ -206,7 +207,7 @@ def build_probes(run: RunConfig, val_dataset: ld.PositionDataset, log: Callable[
                                  seed=run.seed))
     log(f"probe sets ({time.perf_counter() - t0:.0f}s): " + ", ".join(
         f"{s.name} {len(s.fens):,} positions, {len(s.binary) + len(s.numeric)} labels" for s in sets))
-    return pl.TrainingProbes(sets, views=run.probe_views, seed=run.seed)
+    return pl.TrainingProbes(sets, views=run.probe_views, seed=run.seed, batch_size=encode_batch)
 
 
 # What the log shows of each probed view: (summary key, name), as linear / nearest-neighbour pairs
@@ -400,7 +401,9 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
                                seed=run.seed + 1, shuffle=False, indices=list(range(n_val))) if n_val else None
 
-    probes = build_probes(run, val_dataset, log)
+    # Evaluation and probes encode no more positions at once than a training step does: the unpool
+    # variant's enlarged graphs make a few hundred positions at once far heavier than its training batch
+    probes = build_probes(run, val_dataset, log, encode_batch=batch_size)
     if probes is not None and (step == 0 or not (paths and os.path.exists(paths["probes.csv"]))):
         # Baselines, once a run (at the start, or on resuming a run that has none): the untrained encoder
         # (rebuilt from the seed: the run's own starting weights) and the raw board
@@ -409,6 +412,8 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             untrained = lje.LabyrinthEncoder(config).to(device)
         rows = probes.probe(untrained, device, "untrained", "random init") + probes.probe(None, device, "board_onehot", "")
         del untrained
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         if paths:
             _append_probe_rows(paths["probes.csv"], rows, step)
         baselines = {m: pl.TrainingProbes.summarize([r for r in rows if r["model"] == m])
@@ -447,7 +452,9 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             for view, s in last_probe.items():
                 log(f"[{step:>7}] probe {view}: {_probe_line(s)}")
             log(f"[{step:>7}] probes took {time.perf_counter() - t0:.0f}s")
-        metrics = evaluate(model, eval_fens, val_loader, run, device, rollout_weights)
+        metrics = evaluate(model, eval_fens, val_loader, run, device, rollout_weights, encode_batch=batch_size)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()           # hand evaluation's odd-sized blocks back before training resumes
         record({"step": step, "eval": metrics})
         log(f"[{step:>7}] eval  lidar={metrics['lidar']:.1f}  rankme={metrics['rankme']:.1f}  "
             f"rankme_centered={metrics['rankme_centered']:.1f}  online_lidar={metrics['online_lidar']:.1f}  "
