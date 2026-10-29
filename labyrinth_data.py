@@ -510,6 +510,7 @@ class NextPosition:
     next_fen: str
     from_square: int       # node index in the STARTING position's graph (that board's orientation, whoever moves)
     to_square: int         # likewise (the rook's square for castling)
+    piece: int             # the python-chess type of the moving piece (the king, for castling)
     promotion: int         # 0, or the python-chess piece type promoted to
     flags: Tuple[bool, bool, bool]   # (is_castling, is_capture, is_en_passant)
     view: Optional[GraphView]        # the next position's graph; None when this step is not a target
@@ -579,7 +580,7 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
         if targets is None or k in targets:
             view = GraphView.from_edge_lists(*cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares))
         rollout.append(NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
-                                    t.promotion, (t.is_castling, t.is_capture, t.is_en_passant), view))
+                                    current.piece_type_at(move.from_square), t.promotion, (t.is_castling, t.is_capture, t.is_en_passant), view))
         current = current.copy(stack=False)
         current.push(move)
         current_rooks = t.next_castling_rook_squares
@@ -629,6 +630,7 @@ class RolloutStep:
                  in the starting position's frame)
       promotion  [B_k] 0, or the piece type promoted to
       flags      [B_k, 3] (is_castling, is_capture, is_en_passant) as floats
+      piece      [B_k] the moving piece's type (python-chess: 1 pawn ... 6 king)
     """
     graphs: Optional[GraphBatch]
     index: torch.Tensor
@@ -637,11 +639,12 @@ class RolloutStep:
     move_to: torch.Tensor
     promotion: torch.Tensor
     flags: torch.Tensor
+    piece: torch.Tensor
 
     def _map(self, fn, graph_fn) -> "RolloutStep":
         graphs = graph_fn(self.graphs) if self.graphs is not None else None
         return RolloutStep(graphs, fn(self.index), fn(self.parent), fn(self.move_from),
-                           fn(self.move_to), fn(self.promotion), fn(self.flags))
+                           fn(self.move_to), fn(self.promotion), fn(self.flags), fn(self.piece))
 
     def to(self, device, non_blocking: bool = False) -> "RolloutStep":
         return self._map(lambda t: t.to(device, non_blocking=non_blocking), lambda g: g.to(device, non_blocking))
@@ -735,6 +738,7 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
             move_to=index * 64 + torch.tensor([m.to_square for m in moves], dtype=torch.long),
             promotion=torch.tensor([m.promotion for m in moves], dtype=torch.long),
             flags=torch.tensor([m.flags for m in moves], dtype=torch.float32).reshape(-1, 3),
+            piece=torch.tensor([m.piece for m in moves], dtype=torch.long),
         ))
         previous = ids
     return JEPABatch(

@@ -183,8 +183,9 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
             out = model.losses(batch.to(device), rng=gen, rollout_weights=rollout_weights)
             sums["val_loss_mask"] += float(out.mask)
             sums["val_loss_next"] += float(out.next)
-            if "loss_zpred" in out.stats:
-                sums["val_loss_zpred"] = sums.get("val_loss_zpred", 0.0) + out.stats["loss_zpred"]
+            for key in ("loss_zpred", "loss_inverse", "inverse_accuracy"):
+                if key in out.stats:
+                    sums[f"val_{key}"] = sums.get(f"val_{key}", 0.0) + out.stats[key]
             n += 1
         metrics.update({k: v / max(1, n) for k, v in sums.items()})
     model.train(was_training)
@@ -544,6 +545,8 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                 entry["cache_releases"] = cache_releases
             record(entry)
             zpred = f"zpred={entry['loss_zpred']:.4f} " if "loss_zpred" in entry else ""
+            if "loss_inverse" in entry:
+                zpred += f"inverse={entry['loss_inverse']:.3f} ({entry['inverse_accuracy']:.0%}) "
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
                 f"{zpred}K={len(rollout_weights)} "
                 f"reg={entry['anticollapse']:.3f} z_std={entry['z_std']:.3f} z_cos={entry['z_mean_cosine']:.3f} "

@@ -446,7 +446,8 @@ def test_loss_terms_add_up_to_the_total():
     cases = [("unpool", dict()), ("registers", dict(decorrelation_weight=0.5, anticollapse_squares=True)),
              ("squares", dict(anticollapse="vicreg")), ("squares", dict(anticollapse="none")),
              ("squares", dict(zpred_weight=0.5, projector_layers=2, projector_hidden=32, projector_dim=16)),
-             ("unpool", dict(transformer_layers=0, readout="mean", anticollapse_square_mean=True))]
+             ("unpool", dict(transformer_layers=0, readout="mean", anticollapse_square_mean=True)),
+             ("squares", dict(inverse_weight=0.5, move_encoding="rank_file", move_piece=True))]
     for variant, kw in cases:
         cfg = small_config(variant, **kw)
         torch.manual_seed(0)
@@ -462,6 +463,7 @@ def test_loss_terms_add_up_to_the_total():
             assert all(f"anticollapse_{n}" in out.stats for n in ("masked", "full"))
         expected |= {"rl"} if cfg.uses_unpool and cfg.unpool_rl else set()
         expected |= {"zpred"} if cfg.zpred_weight > 0 else set()
+        expected |= {"inverse"} if cfg.inverse_weight > 0 else set()
         assert set(out.terms) == expected, (variant, kw, sorted(out.terms))
 
 
@@ -540,6 +542,60 @@ def test_orientation_anchor_breaks_the_mirror_symmetry():
     for variant in ("squares", "unpool"):
         cfg = small_config(variant, orientation_anchor=True)
         lje.LabyrinthJEPA(cfg).losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total.backward()
+
+
+def test_move_encodings_and_the_move_predictor():
+    """
+    Moves named by squares (not tokens) make the next-position predictor tell a position from its mirror
+    image, which the tokens never do; the move predictor names the first move's squares from z.
+    """
+    fen = FENS[3]                                                                   # no castling rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    first = ld.collate_jepa([ld.build_sample(fen, random.Random(4))]).rollout[0]
+    flip = lambda nodes: 64 + ((nodes % 64) ^ 7)                                   # a <-> h, into graph 1
+    both = ld.RolloutStep(None, torch.tensor([0, 1]), torch.tensor([0, 1]),
+                          torch.cat([first.move_from, flip(first.move_from)]), torch.cat([first.move_to, flip(first.move_to)]),
+                          first.promotion.repeat(2), first.flags.repeat(2, 1), first.piece.repeat(2))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    for encoding in lje.MOVE_ENCODINGS:
+        for piece in (False, True):
+            cfg = small_config("squares", move_encoding=encoding, move_piece=piece)
+            torch.manual_seed(0)
+            model = lje.LabyrinthJEPA(cfg)
+            losses = model.losses(make_batch(cfg), rng=torch.Generator().manual_seed(0))
+            assert torch.isfinite(losses.total)
+            losses.total.backward()
+            if encoding != "tokens":
+                assert all(e.weight.grad is not None for e in model.next_predictor.names)
+            assert (model.next_predictor.piece is not None) == piece
+            if piece:
+                assert model.next_predictor.piece.weight.grad is not None
+            with torch.no_grad():
+                out = model.encoder.eval()(graphs)
+                pred = model.predict_rollout(out.z, out.squares, [both])[0]
+                gap = float((pred[0] - pred[1]).norm() / pred[0].norm())
+                if encoding == "tokens":                # the same z, mirrored tokens: the same prediction
+                    assert gap < 1e-5, gap
+                    continue
+                assert gap > 1e-3, (encoding, gap)      # "b1 to c3" is not "g1 to f3"
+                # named squares never read the square tokens
+                noisy = model.predict_rollout(out.z, torch.randn_like(out.squares), [both])[0]
+                assert torch.equal(pred, noisy)
+    # the move predictor: a 64-way choice for each square, trained through z
+    cfg = small_config("squares", inverse_weight=1.0)
+    model = lje.LabyrinthJEPA(cfg)
+    losses = model.losses(make_batch(cfg), rng=torch.Generator().manual_seed(0))
+    assert 2.0 < losses.stats["loss_inverse"] < 8.0 and 0.0 <= losses.stats["inverse_accuracy"] <= 1.0
+    losses.terms["inverse"].backward()
+    assert all(p.grad is not None for p in model.move_predictor.parameters())
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder.readout_proj.parameters())
+    assert lje.LabyrinthJEPA(small_config("squares")).move_predictor is None
+    for bad in (dict(move_encoding="names"), dict(inverse_weight=-1.0), dict(move_encoding="rank_file", d_model=33)):
+        try:
+            small_config("squares", **bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
 
 
 def test_dehb_search_space_samples_build():

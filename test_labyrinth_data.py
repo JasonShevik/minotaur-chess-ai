@@ -341,6 +341,7 @@ def test_rollouts_play_legal_moves_described_in_the_starting_frame():
             assert move in current.legal_moves
             # squares are node indices of the STARTING position's graph, whoever moves
             assert (step.from_square, step.to_square) == (orient(move.from_square), orient(move.to_square))
+            assert step.piece == current.piece_type_at(move.from_square)
             current.push(move)
             assert step.next_fen == ld.fen_of(current)
             edges, x = cg.create_filled_chess_graphs(step.next_fen, cg.castling_rook_squares_from_board(current))
@@ -367,6 +368,7 @@ def test_batches_of_uneven_rollouts_line_up():
             assert torch.equal(previous.index[step.parent], step.index), "each row continues its own position"
         for row, i in enumerate(step.index.tolist()):
             assert int(step.move_from[row]) == i * 64 + samples[i].rollout[k].from_square
+            assert int(step.piece[row]) == samples[i].rollout[k].piece
         previous = step
     assert batch.moves[1] == [samples[1].rollout[0].move] and batch.moves[4] == []
 

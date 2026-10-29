@@ -8,18 +8,24 @@ answers the predictors are graded against. Two predictors give the training sign
     masked squares   The encoder sees the board with some squares hidden (labyrinth_data builds
                      that masked view leak-free). A small GAT on the chess graph predicts what the
                      target encoder, seeing the whole board, makes of each hidden square.
-    next positions   From z of a position and a move (the from/to square tokens, the promotion
-                     piece and the move flags), predict the target encoder's z of the position the
+    next positions   From z of a position and a move (its from/to squares, the promotion piece and
+                     the move flags), predict the target encoder's z of the position the
                      move leads to; then, from that prediction and the next move, the position after
                      that, and so on: a rollout in latent space, with a loss at every step. Moves are
-                     always described with the STARTING position's square tokens, so the rollout never
-                     sees an intermediate position, only predicts it. A curriculum lengthens it:
+                     always described in the STARTING position's terms, so the rollout never sees an
+                     intermediate position, only predicts it. move_encoding says how: by that
+                     position's from/to square tokens, or by the squares' names (learned embeddings of
+                     the squares, or of their files and ranks); move_piece adds the moving piece's
+                     type. A curriculum lengthens it:
                      rollout_start_steps moves (plies) ahead at first, one more every
                      rollout_stage_positions training positions, up to rollout_max_steps (see
                      rollout_schedule). With rollout_targets = "log" only a few steps are graded (see
                      rollout_target_steps), so a long rollout needs few target encodings.
     whole board      (zpred_weight > 0) From z of the masked board, predict the target encoder's z of
                      the whole board: the masked-square task at the level of the position vector.
+    the move         (inverse_weight > 0) From z of a position and the target encoder's z of the position
+                     after the rollout's first move, name the move's from and to squares (inverse
+                     dynamics: a classification, nothing is reconstructed).
 
 The encoder:
 
@@ -43,7 +49,10 @@ Left and right. Every relation in the chess graph is symmetric under swapping th
 four pawn edge types fix up and down, nothing fixes the sides), so without castling rights a position
 and its mirror image get the same z, and mirrored square tokens. orientation_anchor = True adds one
 edge feature, set only on a1's self-loop (a1 of the oriented board: the a-file corner of the side to
-move's back rank), which breaks that tie: the GAT layers can then tell every square's side.
+move's back rank), which breaks that tie: the GAT layers can then tell every square's side. Nothing
+makes them use it while moves are described by square tokens, which mirror with the board. Naming the
+squares instead (move_encoding "squares" or "rank_file", or the move predictor) does: on a lopsided
+position, "b1 to c3" and "g1 to f3" lead to different places, so z must know which side is which.
 
 Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
 positions get different vectors: the untrained encoder already maps every position to nearly the same
@@ -97,6 +106,7 @@ ANTICOLLAPSE = ("sigreg", "vicreg", "none")
 ANTICOLLAPSE_VIEWS = ("both", "full", "masked")
 READOUTS = ("attention", "mean")
 TOKEN_MIXERS = ("attention", "mlp", "mixer")
+MOVE_ENCODINGS = ("tokens", "squares", "rank_file")
 ROLLOUT_TARGETS = ("all", "log")
 
 
@@ -156,6 +166,15 @@ class JEPAConfig:
     move_dim: int = 128
     next_hidden: int = 1024
     next_layers: int = 2
+    move_encoding: str = "tokens"    # how it is told the move's from/to squares: "tokens" (the starting position's
+                                     # square tokens, which mirror with the board), "squares" (a learned embedding
+                                     # per from square and per to square) or "rank_file" (learned embeddings of
+                                     # their files and ranks); the last two name squares in the side to move's frame
+    move_piece: bool = False         # also tell it the moving piece's type
+
+    # ----- Move predictor (inverse dynamics): z before and after a move -> the move's from/to squares -----
+    inverse_weight: float = 0.0      # its loss weight; 0 leaves the predictor out
+    inverse_hidden: int = 1024
 
     # ----- Whole-board predictor: the target's z of the whole board from z of the masked board -----
     zpred_weight: float = 0.0        # its loss weight; 0 leaves the predictor out
@@ -281,6 +300,12 @@ class JEPAConfig:
             raise ValueError("transformer_layers and pred_transformer_layers must be at least 0")
         if self.zpred_weight < 0 or self.zpred_layers < 1 or self.projector_layers < 0:
             raise ValueError("need zpred_weight >= 0, zpred_layers >= 1 and projector_layers >= 0")
+        if self.move_encoding not in MOVE_ENCODINGS:
+            raise ValueError(f"move_encoding must be one of {MOVE_ENCODINGS}")
+        if self.move_encoding == "rank_file" and self.d_model % 2:
+            raise ValueError("move_encoding 'rank_file' needs an even d_model")
+        if self.inverse_weight < 0:
+            raise ValueError("inverse_weight must be at least 0")
         if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
             raise ValueError("need 0 < rollout_ramp_fraction <= 1 and rollout_step_decay > 0")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
@@ -545,22 +570,44 @@ class MaskPredictor(nn.Module):
 class NextPredictor(nn.Module):
     """
     Predicts the target encoder's z of the position a move leads to, from z (encoded, or predicted by
-    the previous rollout step) and the move. The move's squares are tokens of the starting position, and
-    a learned embedding of the step number tells the predictor which side is moving and how far the
-    board has drifted from those tokens.
+    the previous rollout step) and the move. The move's squares are described in the starting position's
+    terms (move_encoding: its square tokens, or the squares' names), and a learned embedding of the step
+    number tells the predictor which side is moving and how far the board has drifted from that position.
     """
 
     def __init__(self, config: JEPAConfig):
         super().__init__()
-        c = config
+        self.config = c = config
         self.promotion = nn.Embedding(7, c.move_dim)          # 0 = none, else the python-chess piece type
+        self.piece = nn.Embedding(7, c.move_dim) if c.move_piece else None
         self.step = nn.Embedding(c.rollout_max_steps + 1, c.move_dim)
+        # Square names, each as wide as a square token: from and to squares, or from file, from rank, to file, to rank
+        if c.move_encoding == "squares":
+            self.names = nn.ModuleList(nn.Embedding(64, c.d_model) for _ in range(2))
+        elif c.move_encoding == "rank_file":
+            self.names = nn.ModuleList(nn.Embedding(8, c.d_model // 2) for _ in range(4))
         self.move = _mlp([2 * c.d_model + 3, c.move_dim, c.move_dim])
         self.body = _mlp([c.z_dim + c.move_dim] + [c.next_hidden] * c.next_layers + [c.z_dim])
 
-    def forward(self, z: torch.Tensor, from_token: torch.Tensor, to_token: torch.Tensor,
-                promotion: torch.Tensor, flags: torch.Tensor, step: int = 1) -> torch.Tensor:
-        move = self.move(torch.cat([from_token, to_token, flags], dim=-1)) + self.promotion(promotion)
+    def describe_squares(self, squares: torch.Tensor, move_from: torch.Tensor,
+                         move_to: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """squares [B*64, d_model] (the starting positions' tokens), move_from / move_to [B_k] node indices
+        (b*64 + square) -> the from and to squares as the predictor reads them, [B_k, d_model] each."""
+        encoding = self.config.move_encoding
+        if encoding == "tokens":
+            return squares[move_from], squares[move_to]
+        a, b = move_from % 64, move_to % 64
+        if encoding == "squares":
+            return self.names[0](a), self.names[1](b)
+        return (torch.cat([self.names[0](a % 8), self.names[1](a // 8)], dim=-1),
+                torch.cat([self.names[2](b % 8), self.names[3](b // 8)], dim=-1))
+
+    def forward(self, z: torch.Tensor, from_square: torch.Tensor, to_square: torch.Tensor,
+                promotion: torch.Tensor, flags: torch.Tensor, piece: Optional[torch.Tensor] = None,
+                step: int = 1) -> torch.Tensor:
+        move = self.move(torch.cat([from_square, to_square, flags], dim=-1)) + self.promotion(promotion)
+        if self.piece is not None:
+            move = move + self.piece(piece)
         move = move + self.step.weight[step]
         return z + self.body(torch.cat([z, move], dim=-1))     # residual: predict the change
 
@@ -580,6 +627,25 @@ class FullPredictor(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return z + self.body(z)                                # residual: predict what the mask hid
+
+
+class MovePredictor(nn.Module):
+    """
+    Inverse dynamics: from the online encoder's z of a position and the target encoder's z of the
+    position after a move, which squares the move went from and to (two 64-way classifications, in the
+    starting position's frame; the rook's square for castling). The answer names squares, so a lopsided
+    position and its mirror image need different z.
+    """
+
+    def __init__(self, config: JEPAConfig):
+        super().__init__()
+        c = config
+        self.body = _mlp([2 * c.z_dim, c.inverse_hidden, 128])
+
+    def forward(self, z: torch.Tensor, z_next: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """-> logits over the from square and over the to square, [B, 64] each."""
+        logits = self.body(torch.cat([z, F.layer_norm(z_next, z_next.shape[-1:])], dim=-1))
+        return logits[:, :64], logits[:, 64:]
 
 
 # ##### ##### ##### ##### #####
@@ -651,8 +717,9 @@ class JEPALosses:
     rl: torch.Tensor            # REINFORCE + baseline + entropy terms (0 without unpooling or with unpool_rl off)
     anticollapse: torch.Tensor  # the SIGReg / VICReg term (0 with anticollapse = "none")
     stats: Dict[str, float]     # diagnostics for logging
-    # Each term's weighted share of total, which they add up to: "mask", "next", "anticollapse_<embedding>"
-    # (masked, full, squares), "decorrelation", "rl". For measuring what each term alone does to the gradient.
+    # Each term's weighted share of total, which they add up to: "mask", "next", "zpred", "inverse",
+    # "anticollapse_<embedding>" (masked, full, squares), "decorrelation", "rl". For measuring what each
+    # term alone does to the gradient.
     terms: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
 
 
@@ -670,6 +737,7 @@ class LabyrinthJEPA(nn.Module):
         self.mask_predictor = MaskPredictor(config)
         self.next_predictor = NextPredictor(config)
         self.full_predictor = FullPredictor(config) if config.zpred_weight > 0 else None
+        self.move_predictor = MovePredictor(config) if config.inverse_weight > 0 else None
         # The head the anti-collapse terms act on (none: they act on z itself); never part of the encoder
         self.projector = _mlp([config.z_dim] + [config.projector_hidden] * (config.projector_layers - 1)
                               + [config.projector_dim]) if config.projector_layers > 0 else None
@@ -703,8 +771,9 @@ class LabyrinthJEPA(nn.Module):
         flat = squares.reshape(-1, squares.size(-1))
         source, predictions = z, []
         for k, step in enumerate(steps, start=1):
-            pred = self.next_predictor(source[step.parent], flat[step.move_from], flat[step.move_to],
-                                       step.promotion, step.flags, k)
+            from_square, to_square = self.next_predictor.describe_squares(flat, step.move_from, step.move_to)
+            pred = self.next_predictor(source[step.parent], from_square, to_square, step.promotion, step.flags,
+                                       step.piece, k)
             predictions.append(pred)
             source = pred
         return predictions
@@ -777,6 +846,18 @@ class LabyrinthJEPA(nn.Module):
             contributions["zpred"] = c.zpred_weight * zpred_loss
             total = total + contributions["zpred"]
             stats["loss_zpred"] = float(zpred_loss.detach())
+
+        # ---- the first move, named from z before and after it ----
+        if self.move_predictor is not None and steps and target_steps[0] is not None:
+            first = steps[0]
+            from_logits, to_logits = self.move_predictor(ctx_full.z[first.index], target_steps[0])
+            from_square, to_square = first.move_from % 64, first.move_to % 64
+            inverse_loss = (F.cross_entropy(from_logits, from_square) + F.cross_entropy(to_logits, to_square)) / 2
+            contributions["inverse"] = c.inverse_weight * inverse_loss
+            total = total + contributions["inverse"]
+            stats["loss_inverse"] = float(inverse_loss.detach())
+            stats["inverse_accuracy"] = float(((from_logits.argmax(-1) == from_square)
+                                               & (to_logits.argmax(-1) == to_square)).float().mean())
 
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
@@ -875,6 +956,7 @@ def describe(config: JEPAConfig) -> Dict[str, Any]:
         "mask_predictor_params": count_parameters(model.mask_predictor),
         "next_predictor_params": count_parameters(model.next_predictor),
         "full_predictor_params": count_parameters(model.full_predictor) if model.full_predictor is not None else 0,
+        "move_predictor_params": count_parameters(model.move_predictor) if model.move_predictor is not None else 0,
         "projector_params": count_parameters(model.projector) if model.projector is not None else 0,
         "max_tokens": config.max_tokens,
         "z_dim": config.z_dim,
