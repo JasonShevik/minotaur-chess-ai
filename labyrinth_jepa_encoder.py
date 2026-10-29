@@ -47,12 +47,18 @@ The encoder:
 
 Left and right. Every relation in the chess graph is symmetric under swapping the a and h files (the
 four pawn edge types fix up and down, nothing fixes the sides), so without castling rights a position
-and its mirror image get the same z, and mirrored square tokens. orientation_anchor = True adds one
-edge feature, set only on a1's self-loop (a1 of the oriented board: the a-file corner of the side to
-move's back rank), which breaks that tie: the GAT layers can then tell every square's side. Nothing
-makes them use it while moves are described by square tokens, which mirror with the board. Naming the
-squares instead (move_encoding "squares" or "rank_file", or the move predictor) does: on a lopsided
-position, "b1 to c3" and "g1 to f3" lead to different places, so z must know which side is which.
+and its mirror image get the same z, and mirrored square tokens. Two options break that tie at a1 (a1
+of the oriented board: the a-file corner of the side to move's back rank), after which the GAT layers
+can tell every square's side. orientation_anchor = True adds one edge feature, set only on a1's
+self-loop; it is weak, since an edge feature only shifts attention weights. orientation_flag = True adds
+a learned vector to a1's input, which reaches every square through the GAT layers' messages. The flag
+starts like the input weights of one more node feature, drawn from its own random numbers, so every
+other weight starts as without it and runs with and without it stay paired. (Starting it at zero would
+leave the model at the mirror-symmetric point, where to first order a flag on a1 acts like one on h1 and
+no weight is rewarded for telling them apart.) Nothing makes the model use either while moves are
+described by square tokens, which mirror with the board. Naming the squares instead (move_encoding
+"squares" or "rank_file", or the move predictor) does: on a lopsided position, "b1 to c3" and "g1 to f3"
+lead to different places, so z must know which side is which.
 
 Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
 positions get different vectors: the untrained encoder already maps every position to nearly the same
@@ -124,6 +130,7 @@ class JEPAConfig:
     node_feature_dim: int = cg.NUM_NODE_FEATURES
     num_edge_types: int = cg.NUM_EDGE_TYPES
     orientation_anchor: bool = False # one more edge feature, on a1's self-loop only, so left and right differ
+    orientation_flag: bool = False   # a learned vector added to a1's input (one more node feature), so left and right differ
 
     # ----- Square stage: GAT layers on the chess graph -----
     gat_dim: int = 128
@@ -419,6 +426,12 @@ class LabyrinthEncoder(nn.Module):
 
         self.input_proj = nn.Linear(c.node_feature_dim, c.gat_dim)
         self.mask_token = nn.Parameter(torch.randn(c.gat_dim) * 0.02)
+        self.a1_flag = None
+        if c.orientation_flag:
+            # Like one more node feature, 1 on a1, and initialized as input_proj's columns are, but from its own
+            # generator (seeded from the run's seed): every other weight starts as it would without the flag
+            g = torch.Generator().manual_seed(torch.initial_seed() + 1)
+            self.a1_flag = nn.Parameter((torch.rand(c.gat_dim, generator=g) * 2 - 1) * c.node_feature_dim ** -0.5)
         self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.edge_dim, c.gat_dropout,
                                                    add_self_loops=False)
                                          for _ in range(c.gat_layers))
@@ -476,6 +489,10 @@ class LabyrinthEncoder(nn.Module):
         h = self.input_proj(graphs.x)
         if mask is not None:
             h = torch.where(mask.unsqueeze(-1), self.mask_token.expand_as(h), h)
+        if self.a1_flag is not None:
+            # After the mask: the flag says nothing about the position, so a hidden a1 keeps it
+            a1 = torch.arange(h.size(0), device=h.device) % 64 == 0
+            h = h + a1.unsqueeze(-1).to(h.dtype) * self.a1_flag
         for block in self.square_gats:
             h = block(h, square_edges, square_attr)
         square_tokens = self.token_proj(h).view(B, 64, c.d_model) + self.token_type[0]

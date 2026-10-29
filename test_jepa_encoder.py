@@ -544,6 +544,51 @@ def test_orientation_anchor_breaks_the_mirror_symmetry():
         lje.LabyrinthJEPA(cfg).losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total.backward()
 
 
+def test_orientation_flag_keeps_the_other_weights_and_breaks_the_mirror_symmetry():
+    """
+    orientation_flag draws its start from its own generator: same seed, same other weights and the same
+    random numbers afterwards as without it, so runs with and without it stay paired. A position and its
+    mirror encode apart from the start, even with a1 hidden, and the flag trains.
+    """
+    fen = FENS[3]                                                                   # no castling rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    flip = torch.tensor([s ^ 7 for s in range(64)])                                 # a <-> h, ranks kept
+    models, after = [], []
+    for flag in (False, True):
+        torch.manual_seed(0)
+        models.append(lje.LabyrinthJEPA(small_config("squares", orientation_flag=flag)))
+        after.append(torch.rand(4))
+    plain, flagged = models[0].state_dict(), models[1].state_dict()
+    assert all(torch.equal(value, flagged[name]) for name, value in plain.items())
+    assert sorted(set(flagged) - set(plain)) == ["encoder.a1_flag", "target.a1_flag"]
+    assert torch.equal(after[0], after[1])
+    bound = models[1].config.node_feature_dim ** -0.5                               # input_proj's init range
+    assert 0 < float(flagged["encoder.a1_flag"].abs().max()) <= bound
+    assert torch.equal(flagged["encoder.a1_flag"], flagged["target.a1_flag"])
+    torch.manual_seed(1)
+    assert not torch.equal(lje.LabyrinthEncoder(small_config("squares", orientation_flag=True)).a1_flag,
+                           flagged["encoder.a1_flag"])                              # it follows the seed
+    model = models[1]
+    batch = make_batch(model.config)
+    model.losses(batch, rng=torch.Generator().manual_seed(0)).total.backward()
+    assert float(model.encoder.a1_flag.grad.abs().sum()) > 0
+
+    def gaps(mask=None):
+        out = model.encoder.eval()(graphs, mask)
+        return (float((out.z[0] - out.z[1]).norm() / out.z[0].norm()),
+                float((out.squares[0] - out.squares[1][flip]).norm() / out.squares[0].norm()))
+
+    # (untrained, most of z's norm is the vector every position shares, so its gap looks smaller)
+    with torch.no_grad():
+        z_gap, token_gap = gaps()
+        assert z_gap > 1e-4 and token_gap > 1e-3, (z_gap, token_gap)
+        hidden = torch.zeros(128, dtype=torch.bool)
+        hidden[[0, 64]] = True                                                      # a1 hidden in both
+        z_gap, token_gap = gaps(hidden)
+        assert z_gap > 1e-4 and token_gap > 1e-3, (z_gap, token_gap)
+
+
 def test_move_encodings_and_the_move_predictor():
     """
     Moves named by squares (not tokens) make the next-position predictor tell a position from its mirror
