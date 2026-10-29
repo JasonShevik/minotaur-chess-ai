@@ -187,6 +187,38 @@ def test_encoder_layouts_without_transformer_mean_readout_and_predictor_transfor
     assert not hasattr(encoder, "queries") and sum(p.numel() for p in encoder.transformer.parameters()) == 0
 
 
+def test_mlp_token_mixers():
+    """token_mixer "mlp" mixes nothing across tokens and keeps the mirror symmetry; "mixer" mixes and breaks it."""
+    fen = FENS[3]
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    for mixer in ("mlp", "mixer"):
+        for variant in ("squares", "registers"):
+            cfg = small_config(variant, token_mixer=mixer, readout="mean")
+            torch.manual_seed(0)
+            model = lje.LabyrinthJEPA(cfg)
+            model.losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total.backward()
+            assert all(p.grad is not None for p in model.encoder.transformer.parameters()), (mixer, variant)
+        encoder = lje.LabyrinthEncoder(small_config("squares", token_mixer=mixer, readout="mean")).eval()
+        # with "mlp", the square stage's output token for a square depends on nothing else after it
+        captured = {}
+        encoder.transformer.register_forward_pre_hook(lambda m, args: captured.__setitem__("in", args[0]))
+        with torch.no_grad():
+            out = encoder(graphs)
+        z_gap = float((out.z[0] - out.z[1]).norm() / out.z[0].norm())
+        if mixer == "mlp":
+            with torch.no_grad():
+                alone = encoder.final_norm(encoder.transformer(captured["in"][:, :1]))
+            assert torch.allclose(alone, out.squares[:, :1], atol=1e-5) and z_gap < 1e-5, z_gap
+        else:
+            assert z_gap > 1e-3, z_gap
+    try:
+        small_config("unpool", token_mixer="mixer").validate()
+        assert False, "the mixer needs a fixed number of tokens"
+    except ValueError:
+        pass
+
+
 def test_representation_metrics():
     torch.manual_seed(0)
     # RankMe: an identity-like matrix uses every dimension, a rank-1 matrix one

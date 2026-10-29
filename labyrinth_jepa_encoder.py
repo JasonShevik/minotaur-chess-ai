@@ -36,6 +36,8 @@ The encoder:
                concatenated and projected to z (z_dim). readout = "mean": the tokens' mean, projected.
     transformer_layers = 0 leaves the transformer out (the square tokens are then only as global as the
     GAT layers make them); pred_transformer_layers puts attention in the masked-square predictor instead.
+    token_mixer swaps the transformer's attention for MLPs: "mlp" keeps only the per-token MLPs (depth
+    without mixing), "mixer" mixes across the tokens with an MLP (MLP-Mixer; fixed token slots).
 
 Left and right. Every relation in the chess graph is symmetric under swapping the a and h files (the
 four pawn edge types fix up and down, nothing fixes the sides), so without castling rights a position
@@ -94,6 +96,7 @@ TOKEN_VARIANTS = ("squares", "registers", "unpool")
 ANTICOLLAPSE = ("sigreg", "vicreg", "none")
 ANTICOLLAPSE_VIEWS = ("both", "full", "masked")
 READOUTS = ("attention", "mean")
+TOKEN_MIXERS = ("attention", "mlp", "mixer")
 ROLLOUT_TARGETS = ("all", "log")
 
 
@@ -131,6 +134,12 @@ class JEPAConfig:
     transformer_heads: int = 8
     transformer_ff_mult: int = 4
     transformer_dropout: float = 0.0
+    token_mixer: str = "attention"   # what mixes the tokens in each of those layers: "attention" (a transformer),
+                                     # "mlp" (nothing: each token through the per-token MLP only, the same depth
+                                     # without mixing) or "mixer" (MLP-Mixer: an MLP across the tokens, then the
+                                     # per-token MLP; its weights belong to token slots, so it tells the squares
+                                     # apart, and it cannot take the unpooled nodes)
+    mixer_hidden: int = 256          # hidden width of the MLP-Mixer's across-tokens MLP
 
     # ----- Readout -----
     readout: str = "attention"       # "attention": learned queries attend over the tokens; "mean": their mean
@@ -264,6 +273,10 @@ class JEPAConfig:
             raise ValueError(f"anticollapse_views must be one of {ANTICOLLAPSE_VIEWS}")
         if self.readout not in READOUTS:
             raise ValueError(f"readout must be one of {READOUTS}")
+        if self.token_mixer not in TOKEN_MIXERS:
+            raise ValueError(f"token_mixer must be one of {TOKEN_MIXERS}")
+        if self.token_mixer == "mixer" and self.uses_unpool:
+            raise ValueError("token_mixer 'mixer' needs a fixed number of tokens, so not the unpool variant")
         if self.transformer_layers < 0 or self.pred_transformer_layers < 0:
             raise ValueError("transformer_layers and pred_transformer_layers must be at least 0")
         if self.zpred_weight < 0 or self.zpred_layers < 1 or self.projector_layers < 0:
@@ -287,6 +300,35 @@ class _NoTransformer(nn.Module):
     """Stands in for the transformer when transformer_layers = 0: the tokens pass through unchanged."""
 
     def forward(self, tokens: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return tokens
+
+
+class _MLPBlocks(nn.Module):
+    """
+    Stands in for the transformer when token_mixer is "mlp" or "mixer": transformer_layers pre-norm residual
+    blocks shaped like the transformer's, with the attention replaced. "mlp": by nothing, so each block is
+    only the per-token MLP (the transformer's depth without its mixing). "mixer": by an MLP across the
+    tokens, the same for every channel (MLP-Mixer, Tolstikhin et al. 2021); its weights belong to token
+    slots, so the tokens must come in a fixed number and order.
+    """
+
+    def __init__(self, config: JEPAConfig, num_tokens: int):
+        super().__init__()
+        c = config
+        d, ff = c.d_model, c.transformer_ff_mult * c.d_model
+        self.token_mix = nn.ModuleList(
+            nn.ModuleDict({"norm": nn.LayerNorm(d), "mlp": nn.Sequential(
+                nn.Linear(num_tokens, c.mixer_hidden), nn.GELU(), nn.Linear(c.mixer_hidden, num_tokens))})
+            for _ in range(c.transformer_layers)) if c.token_mixer == "mixer" else None
+        self.channel = nn.ModuleList(nn.Sequential(nn.LayerNorm(d), nn.Linear(d, ff), nn.GELU(), nn.Linear(ff, d))
+                                     for _ in range(c.transformer_layers))
+
+    def forward(self, tokens: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        for k, channel in enumerate(self.channel):
+            if self.token_mix is not None:
+                mix = self.token_mix[k]
+                tokens = tokens + mix["mlp"](mix["norm"](tokens).transpose(1, 2)).transpose(1, 2)
+            tokens = tokens + channel(tokens)
         return tokens
 
 
@@ -375,8 +417,12 @@ class LabyrinthEncoder(nn.Module):
         layer = nn.TransformerEncoderLayer(c.d_model, c.transformer_heads, c.transformer_ff_mult * c.d_model,
                                            dropout=c.transformer_dropout, activation="gelu",
                                            batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(layer, c.transformer_layers, enable_nested_tensor=False) \
-            if c.transformer_layers > 0 else _NoTransformer()
+        if c.transformer_layers == 0:
+            self.transformer = _NoTransformer()
+        elif c.token_mixer == "attention":
+            self.transformer = nn.TransformerEncoder(layer, c.transformer_layers, enable_nested_tensor=False)
+        else:
+            self.transformer = _MLPBlocks(c, 64 + (c.num_registers if c.token_variant == "registers" else 0))
         self.final_norm = nn.LayerNorm(c.d_model)
 
         if c.readout == "attention":
