@@ -37,6 +37,12 @@ The encoder:
     transformer_layers = 0 leaves the transformer out (the square tokens are then only as global as the
     GAT layers make them); pred_transformer_layers puts attention in the masked-square predictor instead.
 
+Left and right. Every relation in the chess graph is symmetric under swapping the a and h files (the
+four pawn edge types fix up and down, nothing fixes the sides), so without castling rights a position
+and its mirror image get the same z, and mirrored square tokens. orientation_anchor = True adds one
+edge feature, set only on a1's self-loop (a1 of the oriented board: the a-file corner of the side to
+move's back rank), which breaks that tie: the GAT layers can then tell every square's side.
+
 Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
 positions get different vectors: the untrained encoder already maps every position to nearly the same
 z, and the predictors then win by learning that shared vector. An anti-collapse term on z fixes this:
@@ -104,6 +110,7 @@ class JEPAConfig:
     # ----- Graph (fixed by chess_graph) -----
     node_feature_dim: int = cg.NUM_NODE_FEATURES
     num_edge_types: int = cg.NUM_EDGE_TYPES
+    orientation_anchor: bool = False # one more edge feature, on a1's self-loop only, so left and right differ
 
     # ----- Square stage: GAT layers on the chess graph -----
     gat_dim: int = 128
@@ -218,6 +225,11 @@ class JEPAConfig:
         return self.token_variant == "unpool"
 
     @property
+    def edge_dim(self) -> int:
+        """Width of the chess graph's edge features as the GAT layers read them."""
+        return self.num_edge_types + int(self.orientation_anchor)
+
+    @property
     def max_tokens(self) -> int:
         if self.token_variant == "registers":
             return 64 + self.num_registers
@@ -278,6 +290,16 @@ class _NoTransformer(nn.Module):
         return tokens
 
 
+def with_orientation_anchor(edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+    """
+    edge_attr with one more column, 1 only on a1's self-loop (node 0 of each 64-node graph; every square
+    has a self-loop, see chess_graph.to_single_graph). It depends on nothing in the position, so a hidden
+    a1 keeps it like it keeps its other static edges.
+    """
+    anchor = (edge_index[0] == edge_index[1]) & (edge_index[0] % 64 == 0)
+    return torch.cat([edge_attr, anchor.unsqueeze(-1).to(edge_attr.dtype)], dim=-1)
+
+
 class _GATBlock(nn.Module):
     """
     A residual GAT layer, h + GELU(LayerNorm(GAT(h))), its width split across the heads.
@@ -330,14 +352,14 @@ class LabyrinthEncoder(nn.Module):
 
         self.input_proj = nn.Linear(c.node_feature_dim, c.gat_dim)
         self.mask_token = nn.Parameter(torch.randn(c.gat_dim) * 0.02)
-        self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.num_edge_types, c.gat_dropout,
+        self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.edge_dim, c.gat_dropout,
                                                    add_self_loops=False)
                                          for _ in range(c.gat_layers))
 
         self.unpool_layers = nn.ModuleList()
         self.unpool_gats = nn.ModuleList()
         if c.uses_unpool:
-            edge_in = c.num_edge_types
+            edge_in = c.edge_dim
             for _ in range(c.unpool_layers):
                 self.unpool_layers.append(unpool.GuoUnpool(
                     dx=c.gat_dim, dw=edge_in, dy=c.gat_dim, du=c.unpool_edge_dim,
@@ -378,6 +400,8 @@ class LabyrinthEncoder(nn.Module):
         c = self.config
         B = graphs.num_graphs
         square_edges, square_attr = graphs.edge_index, graphs.edge_attr     # one multi-hot edge per square pair
+        if c.orientation_anchor:
+            square_attr = with_orientation_anchor(square_edges, square_attr)
         h = self.input_proj(graphs.x)
         if mask is not None:
             h = torch.where(mask.unsqueeze(-1), self.mask_token.expand_as(h), h)
@@ -449,7 +473,7 @@ class MaskPredictor(nn.Module):
         self.config = c = config
         self.inp = nn.Linear(c.d_model, c.pred_dim)
         self.target_flag = nn.Parameter(torch.randn(c.pred_dim) * 0.02)
-        self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.num_edge_types, 0.0, add_self_loops=False)
+        self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.edge_dim, 0.0, add_self_loops=False)
                                   for _ in range(c.pred_gat_layers))
         # Optional attention across the whole board, after the local GAT steps (the squares stay an unordered set)
         self.transformer = nn.TransformerEncoder(
@@ -463,6 +487,8 @@ class MaskPredictor(nn.Module):
         h = self.inp(squares.reshape(-1, squares.size(-1)))
         h = h + mask.unsqueeze(-1).to(h.dtype) * self.target_flag
         edge_index, edge_attr = graphs.edge_index, graphs.edge_attr
+        if self.config.orientation_anchor:
+            edge_attr = with_orientation_anchor(edge_index, edge_attr)
         for block in self.gats:
             h = block(h, edge_index, edge_attr)
         if self.transformer is not None:

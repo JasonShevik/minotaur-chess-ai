@@ -485,6 +485,31 @@ def test_square_mean_regularizer_weighs_like_z():
     assert model.encoder.readout_proj.weight.grad is None
 
 
+def test_orientation_anchor_breaks_the_mirror_symmetry():
+    """A position without castling rights and its a <-> h mirror encode alike, unless orientation_anchor is on."""
+    fen = FENS[3]
+    assert not chess.Board(fen).castling_rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    marked = lje.with_orientation_anchor(graphs.edge_index, graphs.edge_attr)[:, -1].bool()
+    assert graphs.edge_index[:, marked].tolist() == [[0, 64], [0, 64]]               # a1's self-loop, in each graph
+    flip = torch.tensor([s ^ 7 for s in range(64)])                                 # a <-> h, ranks kept
+    for anchor in (False, True):
+        torch.manual_seed(0)
+        out = lje.LabyrinthEncoder(small_config("squares", orientation_anchor=anchor)).eval()(graphs)
+        z_gap = float((out.z[0] - out.z[1]).norm() / out.z[0].norm())
+        token_gap = float((out.squares[0] - out.squares[1][flip]).norm() / out.squares[0].norm())
+        # (untrained, the anchor only nudges attention weights, so the gap is small, but far above rounding)
+        if anchor:
+            assert z_gap > 1e-6 and token_gap > 1e-6, (z_gap, token_gap)
+        else:
+            assert z_gap < 1e-6 and token_gap < 1e-6, (z_gap, token_gap)
+    # every variant trains with it (the predictor's GAT and the unpooling layers read the wider edges too)
+    for variant in ("squares", "unpool"):
+        cfg = small_config(variant, orientation_anchor=True)
+        lje.LabyrinthJEPA(cfg).losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total.backward()
+
+
 def test_dehb_search_space_samples_build():
     cs = lje.build_jepa_configspace(seed=1)
     seen = set()
