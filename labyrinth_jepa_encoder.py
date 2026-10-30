@@ -30,7 +30,13 @@ answers the predictors are graded against. Two predictors give the training sign
 The encoder:
 
     squares    the 64 square features are embedded (hidden squares get a learned mask token) and
-               refined by gat_layers GAT layers on the chess graph: 64 square tokens
+               refined by gat_layers GAT layers on the chess graph: 64 square tokens. gat_style
+               "split" divides each layer's width among its heads and adds the result back to the
+               input; "concat" gives every head the full width, places the heads side by side with
+               the square's own features, and a per-square MLP reduces them to gat_growth times the
+               layer's input width, so the tokens widen layer by layer. Either way each head
+               averages over the squares it attends to; gat_sum adds a branch that sums the
+               neighbours' messages instead, which can count them
     extras     token_variant decides what joins the square tokens:
                  "squares"    nothing
                  "registers"  num_registers learned tokens, the same for every position
@@ -40,6 +46,9 @@ The encoder:
                are an unordered set, so the unpooled nodes' arbitrary order cannot matter)
     readout    readout_queries learned queries attend over the final tokens; their outputs are
                concatenated and projected to z (z_dim). readout = "mean": the tokens' mean, projected.
+               "mean_max": their mean and per-dimension maximum side by side, projected (a mean
+               dilutes what a single square holds, such as a king in check). readout_hidden > 0
+               makes the projection an MLP.
     transformer_layers = 0 leaves the transformer out (the square tokens are then only as global as the
     GAT layers make them); pred_transformer_layers puts attention in the masked-square predictor instead.
     token_mixer swaps the transformer's attention for MLPs: "mlp" keeps only the per-token MLPs (depth
@@ -110,7 +119,8 @@ import labyrinth_data as ld
 TOKEN_VARIANTS = ("squares", "registers", "unpool")
 ANTICOLLAPSE = ("sigreg", "vicreg", "none")
 ANTICOLLAPSE_VIEWS = ("both", "full", "masked")
-READOUTS = ("attention", "mean")
+READOUTS = ("attention", "mean", "mean_max")
+GAT_STYLES = ("split", "concat")
 TOKEN_MIXERS = ("attention", "mlp", "mixer")
 MOVE_ENCODINGS = ("tokens", "squares", "rank_file")
 ROLLOUT_TARGETS = ("all", "log")
@@ -137,6 +147,13 @@ class JEPAConfig:
     gat_heads: int = 4
     gat_layers: int = 3              # at least 2, so every square can tell which way the board faces
     gat_dropout: float = 0.0
+    gat_style: str = "split"         # "split": the heads share the layer's width, added back to the input (residual);
+                                     # "concat": every head sees and returns the full width, the heads sit side by
+                                     # side with the square's own features, and a per-square MLP reduces them to a
+                                     # width gat_growth times the layer's input
+    gat_growth: float = 1.5          # (concat) each layer's output width over its input width
+    gat_sum: bool = False            # (concat) also sum the neighbours' edge-aware messages: the heads average over
+                                     # the squares they attend to, a sum can count them
 
     # ----- Extra tokens -----
     token_variant: str = "unpool"    # "squares" | "registers" | "unpool"
@@ -159,8 +176,10 @@ class JEPAConfig:
     mixer_hidden: int = 256          # hidden width of the MLP-Mixer's across-tokens MLP
 
     # ----- Readout -----
-    readout: str = "attention"       # "attention": learned queries attend over the tokens; "mean": their mean
+    readout: str = "attention"       # "attention": learned queries attend over the tokens; "mean": their mean;
+                                     # "mean_max": their mean and per-dimension maximum side by side
     readout_queries: int = 8
+    readout_hidden: int = 0          # > 0: an MLP with this hidden width turns the pooled tokens into z (0: one linear layer)
     z_dim: int = 1024                # keep fixed during a DEHB search, so LiDAR scores are comparable
 
     # ----- Masked-square predictor (a GAT on the chess graph) -----
@@ -265,6 +284,14 @@ class JEPAConfig:
         return self.num_edge_types + int(self.orientation_anchor)
 
     @property
+    def gat_widths(self) -> List[int]:
+        """Width of the square tokens entering each square GAT layer, then leaving the last one."""
+        widths = [self.gat_dim]
+        for _ in range(self.gat_layers):
+            widths.append(widths[-1] if self.gat_style == "split" else int(round(widths[-1] * self.gat_growth)))
+        return widths
+
+    @property
     def max_tokens(self) -> int:
         if self.token_variant == "registers":
             return 64 + self.num_registers
@@ -297,8 +324,18 @@ class JEPAConfig:
             raise ValueError(f"rollout_targets must be one of {ROLLOUT_TARGETS}")
         if self.anticollapse_views not in ANTICOLLAPSE_VIEWS:
             raise ValueError(f"anticollapse_views must be one of {ANTICOLLAPSE_VIEWS}")
+        if self.gat_style not in GAT_STYLES:
+            raise ValueError(f"gat_style must be one of {GAT_STYLES}")
+        if self.gat_style == "concat" and self.uses_unpool:
+            raise ValueError("gat_style 'concat' widens the square tokens, which the unpooling layers do not take")
+        if self.gat_growth < 1:
+            raise ValueError("gat_growth must be at least 1")
+        if self.gat_sum and self.gat_style != "concat":
+            raise ValueError("gat_sum needs gat_style 'concat'")
         if self.readout not in READOUTS:
             raise ValueError(f"readout must be one of {READOUTS}")
+        if self.readout_hidden < 0:
+            raise ValueError("readout_hidden must be at least 0")
         if self.token_mixer not in TOKEN_MIXERS:
             raise ValueError(f"token_mixer must be one of {TOKEN_MIXERS}")
         if self.token_mixer == "mixer" and self.uses_unpool:
@@ -391,6 +428,33 @@ class _GATBlock(nn.Module):
         return h + F.gelu(self.norm(self.gat(h, edge_index, edge_attr)))
 
 
+class _ConcatGATBlock(nn.Module):
+    """
+    A GAT layer whose heads each see and return the full width, placed side by side with the square's own
+    features (and, with summed = True, the sum of the neighbours' edge-aware messages), then a per-square MLP
+    that reduces them to out_dim. Each head still averages over the squares it attends to, so heads can
+    specialize in kinds of relations; only the sum can tell one attacker from two. For the chess graph,
+    which brings its own self-loops.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool):
+        super().__init__()
+        self.gat = GATConv(in_dim, in_dim, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
+                           add_self_loops=False)
+        self.edge = nn.Linear(edge_dim, in_dim) if summed else None
+        width = (heads + 1 + int(summed)) * in_dim
+        self.norm = nn.LayerNorm(width)
+        self.mlp = _mlp([width, out_dim, out_dim])
+
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+        parts = [h, self.gat(h, edge_index, edge_attr)]
+        if self.edge is not None:
+            source, target = edge_index
+            messages = F.gelu(h[source] + self.edge(edge_attr))       # what the neighbour is, and how it relates
+            parts.append(messages.new_zeros(h.shape).index_add_(0, target, messages))
+        return self.mlp(self.norm(torch.cat(parts, dim=-1)))
+
+
 # ##### ##### ##### ##### #####
 #       The encoder
 
@@ -432,9 +496,15 @@ class LabyrinthEncoder(nn.Module):
             # generator (seeded from the run's seed): every other weight starts as it would without the flag
             g = torch.Generator().manual_seed(torch.initial_seed() + 1)
             self.a1_flag = nn.Parameter((torch.rand(c.gat_dim, generator=g) * 2 - 1) * c.node_feature_dim ** -0.5)
-        self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.edge_dim, c.gat_dropout,
-                                                   add_self_loops=False)
-                                         for _ in range(c.gat_layers))
+        widths = c.gat_widths
+        if c.gat_style == "split":
+            self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.edge_dim, c.gat_dropout,
+                                                       add_self_loops=False)
+                                             for _ in range(c.gat_layers))
+        else:
+            self.square_gats = nn.ModuleList(_ConcatGATBlock(widths[i], widths[i + 1], c.gat_heads, c.edge_dim,
+                                                             c.gat_dropout, c.gat_sum)
+                                             for i in range(c.gat_layers))
 
         self.unpool_layers = nn.ModuleList()
         self.unpool_gats = nn.ModuleList()
@@ -449,7 +519,7 @@ class LabyrinthEncoder(nn.Module):
         self.registers = nn.Parameter(torch.randn(c.num_registers, c.d_model) * 0.02) \
             if c.token_variant == "registers" else None
 
-        self.token_proj = nn.Linear(c.gat_dim, c.d_model)
+        self.token_proj = nn.Linear(widths[-1], c.d_model)
         # Token types (square / extra), not positions: tokens stay an unordered set
         self.token_type = nn.Parameter(torch.randn(2, c.d_model) * 0.02)
         layer = nn.TransformerEncoderLayer(c.d_model, c.transformer_heads, c.transformer_ff_mult * c.d_model,
@@ -467,7 +537,9 @@ class LabyrinthEncoder(nn.Module):
             self.queries = nn.Parameter(torch.randn(c.readout_queries, c.d_model) * 0.02)
             self.readout_attn = nn.MultiheadAttention(c.d_model, c.transformer_heads, batch_first=True)
             self.readout_norm = nn.LayerNorm(c.d_model)
-        self.readout_proj = nn.Linear((c.readout_queries if c.readout == "attention" else 1) * c.d_model, c.z_dim)
+        pooled = {"attention": c.readout_queries, "mean": 1, "mean_max": 2}[c.readout] * c.d_model
+        self.readout_proj = nn.Linear(pooled, c.z_dim) if c.readout_hidden == 0 else \
+            _mlp([pooled, c.readout_hidden, c.z_dim])
 
     def forward(
         self,
@@ -530,7 +602,11 @@ class LabyrinthEncoder(nn.Module):
             z = self.readout_proj(self.readout_norm(read).reshape(B, -1))
         else:
             keep = (~pad).unsqueeze(-1).to(tokens.dtype)
-            z = self.readout_proj((tokens * keep).sum(1) / keep.sum(1))
+            pooled = (tokens * keep).sum(1) / keep.sum(1)
+            if c.readout == "mean_max":
+                # a mean dilutes what one square holds (a king in check); the maximum keeps it
+                pooled = torch.cat([pooled, tokens.masked_fill(pad.unsqueeze(-1), float("-inf")).max(1).values], -1)
+            z = self.readout_proj(pooled)
         return EncoderOutput(z, tokens[:, :64], log_prob, entropy, (~pad).sum(1), num_decisions, actions)
 
     @staticmethod

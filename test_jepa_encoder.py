@@ -447,7 +447,9 @@ def test_loss_terms_add_up_to_the_total():
              ("squares", dict(anticollapse="vicreg")), ("squares", dict(anticollapse="none")),
              ("squares", dict(zpred_weight=0.5, projector_layers=2, projector_hidden=32, projector_dim=16)),
              ("unpool", dict(transformer_layers=0, readout="mean", anticollapse_square_mean=True)),
-             ("squares", dict(inverse_weight=0.5, move_encoding="rank_file", move_piece=True))]
+             ("squares", dict(inverse_weight=0.5, move_encoding="rank_file", move_piece=True)),
+             ("squares", dict(gat_style="concat", gat_sum=True, transformer_layers=0, readout="mean_max",
+                              readout_hidden=32))]
     for variant, kw in cases:
         cfg = small_config(variant, **kw)
         torch.manual_seed(0)
@@ -587,6 +589,51 @@ def test_orientation_flag_keeps_the_other_weights_and_breaks_the_mirror_symmetry
         hidden[[0, 64]] = True                                                      # a1 hidden in both
         z_gap, token_gap = gaps(hidden)
         assert z_gap > 1e-4 and token_gap > 1e-3, (z_gap, token_gap)
+
+
+def test_concatenated_gat_layers_and_the_mean_max_readout():
+    """
+    gat_style "concat": full-width heads side by side with the square's own features, reduced by a per-square
+    MLP to a wider width, layer by layer. The heads average, so a square hears one neighbour and two identical
+    ones alike; gat_sum's branch tells them apart. Neither, nor the mean_max readout, tells left from right.
+    """
+    x = torch.randn(3, 8)
+    x[2] = x[1]
+    one = (torch.tensor([[1], [0]]), torch.ones(1, 3))                              # square 0 hears square 1
+    two = (torch.tensor([[1, 2], [0, 0]]), torch.ones(2, 3))                        # ... and its twin, square 2
+    for summed in (False, True):
+        torch.manual_seed(0)
+        block = lje._ConcatGATBlock(8, 12, heads=2, edge_dim=3, dropout=0.0, summed=summed)
+        with torch.no_grad():
+            heard_one, heard_two = block(x[:2], *one)[0], block(x, *two)[0]
+        assert heard_one.shape == (12,)
+        assert (float((heard_one - heard_two).abs().max()) > 1e-4) == summed, summed
+    fen = FENS[3]                                                                   # no castling rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    flip = torch.tensor([s ^ 7 for s in range(64)])                                 # a <-> h, ranks kept
+    for kw in (dict(readout="mean"), dict(gat_sum=True, readout="mean_max", readout_hidden=48)):
+        cfg = small_config("squares", gat_style="concat", transformer_layers=0, **kw)
+        torch.manual_seed(0)
+        model = lje.LabyrinthJEPA(cfg)
+        assert cfg.gat_widths == [32, 48, 72]
+        assert [block.mlp[-1].out_features for block in model.encoder.square_gats] == [48, 72]
+        with torch.no_grad():
+            out = model.encoder.eval()(graphs)
+        assert out.squares.shape == (2, 64, cfg.d_model) and out.z.shape == (2, cfg.z_dim)
+        assert float((out.z[0] - out.z[1]).norm() / out.z[0].norm()) < 1e-5
+        assert float((out.squares[0] - out.squares[1][flip]).norm() / out.squares[0].norm()) < 1e-5
+        model.train().losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total.backward()
+        for part in (model.encoder.square_gats, model.encoder.readout_proj):
+            assert all(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in part.parameters()), kw
+    for variant, bad in (("squares", dict(gat_style="wide")), ("unpool", dict(gat_style="concat")),
+                         ("squares", dict(gat_style="concat", gat_growth=0.5)), ("squares", dict(gat_sum=True)),
+                         ("squares", dict(readout="max")), ("squares", dict(readout_hidden=-1))):
+        try:
+            small_config(variant, **bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
 
 
 def test_move_encodings_and_the_move_predictor():
