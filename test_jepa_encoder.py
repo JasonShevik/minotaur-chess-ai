@@ -596,18 +596,31 @@ def test_concatenated_gat_layers_and_the_mean_max_readout():
     gat_style "concat": full-width heads side by side with the square's own features, reduced by a per-square
     MLP to a wider width, layer by layer. The heads average, so a square hears one neighbour and two identical
     ones alike; gat_sum's branch tells them apart. Neither, nor the mean_max readout, tells left from right.
+    The heads, computed densely, are GATConv's, values and gradients.
     """
-    x = torch.randn(3, 8)
+    x = torch.randn(64, 8)
     x[2] = x[1]
-    one = (torch.tensor([[1], [0]]), torch.ones(1, 3))                              # square 0 hears square 1
-    two = (torch.tensor([[1, 2], [0, 0]]), torch.ones(2, 3))                        # ... and its twin, square 2
+    loops = torch.arange(1, 64).repeat(2, 1)                                        # the other squares hear themselves
+    one = torch.cat([loops, torch.tensor([[1], [0]])], 1)                           # square 0 hears square 1
+    two = torch.cat([loops, torch.tensor([[1, 2], [0, 0]])], 1)                     # ... and its twin, square 2
     for summed in (False, True):
         torch.manual_seed(0)
         block = lje._ConcatGATBlock(8, 12, heads=2, edge_dim=3, dropout=0.0, summed=summed)
         with torch.no_grad():
-            heard_one, heard_two = block(x[:2], *one)[0], block(x, *two)[0]
+            heard_one = block(x, one, torch.ones(one.size(1), 3))[0]
+            heard_two = block(x, two, torch.ones(two.size(1), 3))[0]
         assert heard_one.shape == (12,)
         assert (float((heard_one - heard_two).abs().max()) > 1e-4) == summed, summed
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in FENS[:3]])
+    attr = lje.with_orientation_anchor(graphs.edge_index, graphs.edge_attr)
+    torch.manual_seed(0)
+    block = lje._ConcatGATBlock(16, 24, heads=3, edge_dim=attr.size(1), dropout=0.0, summed=False)
+    h = torch.randn(3 * 64, 16, requires_grad=True)
+    dense, sparse = block._attend(h, graphs.edge_index, attr), block.gat(h, graphs.edge_index, attr)
+    assert float((dense - sparse).detach().abs().max()) < 1e-5
+    weights = torch.randn_like(dense)
+    grads = [torch.autograd.grad((out * weights).sum(), [h] + list(block.gat.parameters())) for out in (dense, sparse)]
+    assert all(float((a - b).abs().max()) < 1e-4 for a, b in zip(*grads))
     fen = FENS[3]                                                                   # no castling rights
     mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
     graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])

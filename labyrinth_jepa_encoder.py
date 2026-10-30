@@ -434,8 +434,14 @@ class _ConcatGATBlock(nn.Module):
     features (and, with summed = True, the sum of the neighbours' edge-aware messages), then a per-square MLP
     that reduces them to out_dim. Each head still averages over the squares it attends to, so heads can
     specialize in kinds of relations; only the sum can tell one attacker from two. For the chess graph,
-    which brings its own self-loops.
+    which brings its own self-loops. Its edges are fixed movement patterns, so a square has 24-36
+    neighbours, most of them empty; the sum is divided by their average count (a constant, so counts
+    survive), or it would be some 30 times the size of the other parts and drown them in the LayerNorm.
+    The heads are GATConv's, computed densely (see _attend): GATConv itself builds a full-width message
+    per edge and head, some 30 times the memory, more than the GPU holds at batch 256.
     """
+
+    MEAN_NEIGHBOURS = 29.0                                          # in the chess graph, self-loop included
 
     def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool):
         super().__init__()
@@ -446,12 +452,30 @@ class _ConcatGATBlock(nn.Module):
         self.norm = nn.LayerNorm(width)
         self.mlp = _mlp([width, out_dim, out_dim])
 
+    def _attend(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+        """
+        self.gat(h, edge_index, edge_attr) for graphs of 64 nodes (node = 64 * graph + square) with at most
+        one edge per square pair and an edge into every square: each head's attention as a [64, 64] matrix
+        per graph (-inf off the edges), applied by a matmul, so nothing is kept per edge but the logits.
+        """
+        gat = self.gat
+        H, C, B = gat.heads, gat.out_channels, h.size(0) // 64
+        x = gat.lin(h).view(B * 64, H, C)
+        node_src, node_dst = (x * gat.att_src).sum(-1), (x * gat.att_dst).sum(-1)              # [B*64, H]
+        edge = (gat.lin_edge.weight.view(H, C, -1) * gat.att_edge.view(H, C, 1)).sum(1)          # [H, edge_dim]
+        source, target = edge_index
+        logits = F.leaky_relu(node_src[source] + node_dst[target] + edge_attr @ edge.t(), gat.negative_slope)
+        dense = h.new_full((B, 64, 64, H), float("-inf")).index_put((target // 64, target % 64, source % 64), logits)
+        alpha = F.dropout(torch.softmax(dense.permute(0, 3, 1, 2), -1), gat.dropout, self.training)  # [B, H, to, from]
+        out = alpha @ x.view(B, 64, H, C).transpose(1, 2)                                        # [B, H, 64, C]
+        return out.transpose(1, 2).reshape(B * 64, H * C) + gat.bias
+
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
-        parts = [h, self.gat(h, edge_index, edge_attr)]
+        parts = [h, self._attend(h, edge_index, edge_attr)]
         if self.edge is not None:
             source, target = edge_index
             messages = F.gelu(h[source] + self.edge(edge_attr))       # what the neighbour is, and how it relates
-            parts.append(messages.new_zeros(h.shape).index_add_(0, target, messages))
+            parts.append(messages.new_zeros(h.shape).index_add_(0, target, messages) / self.MEAN_NEIGHBOURS)
         return self.mlp(self.norm(torch.cat(parts, dim=-1)))
 
 
