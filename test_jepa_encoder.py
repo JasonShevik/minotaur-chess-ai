@@ -621,11 +621,19 @@ def test_concatenated_gat_layers_and_the_mean_max_readout():
     weights = torch.randn_like(dense)
     grads = [torch.autograd.grad((out * weights).sum(), [h] + list(block.gat.parameters())) for out in (dense, sparse)]
     assert all(float((a - b).abs().max()) < 1e-4 for a, b in zip(*grads))
+    torch.manual_seed(0)
+    plain = lje._ConcatGATBlock(16, 24, heads=3, edge_dim=attr.size(1), dropout=0.0, summed=True)
+    torch.manual_seed(0)
+    residual = lje._ConcatGATBlock(16, 24, heads=3, edge_dim=attr.size(1), dropout=0.0, summed=True, residual=True)
+    with torch.no_grad():
+        assert plain.state_dict().keys() == residual.state_dict().keys()            # no weights of its own
+        skip = residual(h, graphs.edge_index, attr) - plain(h, graphs.edge_index, attr)
+        assert float((skip[:, :16] - h).abs().max()) < 1e-5 and float(skip[:, 16:].abs().max()) < 1e-5
     fen = FENS[3]                                                                   # no castling rights
     mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
     graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
     flip = torch.tensor([s ^ 7 for s in range(64)])                                 # a <-> h, ranks kept
-    for kw in (dict(readout="mean"), dict(gat_sum=True, readout="mean_max", readout_hidden=48)):
+    for kw in (dict(readout="mean"), dict(gat_sum=True, gat_residual=True, readout="mean_max", readout_hidden=48)):
         cfg = small_config("squares", gat_style="concat", transformer_layers=0, **kw)
         torch.manual_seed(0)
         model = lje.LabyrinthJEPA(cfg)
@@ -641,6 +649,7 @@ def test_concatenated_gat_layers_and_the_mean_max_readout():
             assert all(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in part.parameters()), kw
     for variant, bad in (("squares", dict(gat_style="wide")), ("unpool", dict(gat_style="concat")),
                          ("squares", dict(gat_style="concat", gat_growth=0.5)), ("squares", dict(gat_sum=True)),
+                         ("squares", dict(gat_residual=True)),
                          ("squares", dict(readout="max")), ("squares", dict(readout_hidden=-1))):
         try:
             small_config(variant, **bad).validate()

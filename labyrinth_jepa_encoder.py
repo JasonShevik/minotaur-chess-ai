@@ -36,7 +36,8 @@ The encoder:
                the square's own features, and a per-square MLP reduces them to gat_growth times the
                layer's input width, so the tokens widen layer by layer. Either way each head
                averages over the squares it attends to; gat_sum adds a branch that sums the
-               neighbours' messages instead, which can count them
+               neighbours' messages instead, which can count them; gat_residual adds each concat
+               layer's input to the first channels of its output, as the split layers do
     extras     token_variant decides what joins the square tokens:
                  "squares"    nothing
                  "registers"  num_registers learned tokens, the same for every position
@@ -154,6 +155,8 @@ class JEPAConfig:
     gat_growth: float = 1.5          # (concat) each layer's output width over its input width
     gat_sum: bool = False            # (concat) also sum the neighbours' edge-aware messages: the heads average over
                                      # the squares they attend to, a sum can count them
+    gat_residual: bool = False       # (concat) add the layer's input to the first channels of its output, so what a
+                                     # layer does not change passes through (training cannot simply drop it)
 
     # ----- Extra tokens -----
     token_variant: str = "unpool"    # "squares" | "registers" | "unpool"
@@ -332,6 +335,8 @@ class JEPAConfig:
             raise ValueError("gat_growth must be at least 1")
         if self.gat_sum and self.gat_style != "concat":
             raise ValueError("gat_sum needs gat_style 'concat'")
+        if self.gat_residual and self.gat_style != "concat":
+            raise ValueError("gat_residual needs gat_style 'concat' (the split layers always add their input)")
         if self.readout not in READOUTS:
             raise ValueError(f"readout must be one of {READOUTS}")
         if self.readout_hidden < 0:
@@ -432,8 +437,9 @@ class _ConcatGATBlock(nn.Module):
     """
     A GAT layer whose heads each see and return the full width, placed side by side with the square's own
     features (and, with summed = True, the sum of the neighbours' edge-aware messages), then a per-square MLP
-    that reduces them to out_dim. Each head still averages over the squares it attends to, so heads can
-    specialize in kinds of relations; only the sum can tell one attacker from two. For the chess graph,
+    that reduces them to out_dim (with residual = True, the input is added to its first in_dim channels).
+    Each head still averages over the squares it attends to, so heads can specialize in kinds of
+    relations; only the sum can tell one attacker from two. For the chess graph,
     which brings its own self-loops. Its edges are fixed movement patterns, so a square has 24-36
     neighbours, most of them empty; the sum is divided by their average count (a constant, so counts
     survive), or it would be some 30 times the size of the other parts and drown them in the LayerNorm.
@@ -443,8 +449,10 @@ class _ConcatGATBlock(nn.Module):
 
     MEAN_NEIGHBOURS = 29.0                                          # in the chess graph, self-loop included
 
-    def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool):
+    def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool,
+                 residual: bool = False):
         super().__init__()
+        self.residual = residual
         self.gat = GATConv(in_dim, in_dim, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
                            add_self_loops=False)
         self.edge = nn.Linear(edge_dim, in_dim) if summed else None
@@ -476,7 +484,8 @@ class _ConcatGATBlock(nn.Module):
             source, target = edge_index
             messages = F.gelu(h[source] + self.edge(edge_attr))       # what the neighbour is, and how it relates
             parts.append(messages.new_zeros(h.shape).index_add_(0, target, messages) / self.MEAN_NEIGHBOURS)
-        return self.mlp(self.norm(torch.cat(parts, dim=-1)))
+        out = self.mlp(self.norm(torch.cat(parts, dim=-1)))
+        return out + F.pad(h, (0, out.size(-1) - h.size(-1))) if self.residual else out
 
 
 # ##### ##### ##### ##### #####
@@ -527,7 +536,7 @@ class LabyrinthEncoder(nn.Module):
                                              for _ in range(c.gat_layers))
         else:
             self.square_gats = nn.ModuleList(_ConcatGATBlock(widths[i], widths[i + 1], c.gat_heads, c.edge_dim,
-                                                             c.gat_dropout, c.gat_sum)
+                                                             c.gat_dropout, c.gat_sum, c.gat_residual)
                                              for i in range(c.gat_layers))
 
         self.unpool_layers = nn.ModuleList()
