@@ -195,6 +195,10 @@ class JEPAConfig:
     move_dim: int = 128
     next_hidden: int = 1024
     next_layers: int = 2
+    next_residual: bool = True       # the next-position predictor adds its output to z (it predicts the change).
+                                     # False: it outputs the next z outright. Boards are seen from the side to move,
+                                     # so whatever says which side is better off changes sign every ply, and
+                                     # "no change" is as wrong as can be for it
     move_encoding: str = "tokens"    # how it is told the move's from/to squares: "tokens" (the starting position's
                                      # square tokens, which mirror with the board), "squares" (a learned embedding
                                      # per from square and per to square) or "rank_file" (learned embeddings of
@@ -735,7 +739,8 @@ class NextPredictor(nn.Module):
         if self.piece is not None:
             move = move + self.piece(piece)
         move = move + self.step.weight[step]
-        return z + self.body(torch.cat([z, move], dim=-1))     # residual: predict the change
+        change = self.body(torch.cat([z, move], dim=-1))
+        return z + change if self.config.next_residual else change      # residual: predict the change
 
 
 class FullPredictor(nn.Module):

@@ -734,6 +734,24 @@ def test_dehb_search_space_samples_build():
         assert torch.isfinite(model.losses(make_batch(cfg, FENS[:2]), rng=torch.Generator().manual_seed(0)).total)
 
 
+def test_next_predictor_can_predict_the_next_z_outright():
+    """next_residual = False drops the "+ z": same weights, and the two predictions differ by exactly z."""
+    outputs = {}
+    for residual in (True, False):
+        cfg = small_config("squares", next_residual=residual)
+        torch.manual_seed(0)
+        model = lje.LabyrinthJEPA(cfg).eval()
+        outputs[residual] = model.state_dict()
+        batch = make_batch(cfg)
+        with torch.no_grad():
+            ctx = model.encoder(batch.full)
+            outputs[residual, "z"] = ctx.z
+            outputs[residual, "pred"] = model.predict_rollout(ctx.z, ctx.squares, batch.rollout[:1])[0]
+    assert all(torch.equal(v, outputs[False][k]) for k, v in outputs[True].items())
+    parent = batch.rollout[0].parent
+    assert float((outputs[True, "pred"] - outputs[False, "pred"] - outputs[True, "z"][parent]).abs().max()) < 1e-5
+
+
 # ##### ##### ##### ##### #####
 #   Runner
 
