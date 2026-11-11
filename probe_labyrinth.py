@@ -15,6 +15,11 @@ measured three ways, on held-out positions:
                 a positive test position's neighbours that are positive, divided by the base rate (lift:
                 above 1 means positions with the label cluster), and an AUC scoring each test position
                 by its neighbours. For a numeric label: R^2 and Spearman of the neighbours' mean.
+    knn_white   the same neighbours after whitening: the vectors are projected onto their top principal
+                components (fitted on the training positions) and each is scaled to unit variance, so
+                every direction is equally loud (AUC, or R^2). Cosine neighbours follow the loudest
+                directions of z, so knn measures what z says loudly: a label near 0 on knn and well above
+                it here is held quietly; low on both, it is gone.
     max_abs_dim_corr  the strongest correlation between a single dimension of z and the label.
 
 Labels:
@@ -471,6 +476,23 @@ def knn_indices(queries: torch.Tensor, reference: torch.Tensor, k: int, chunk: i
     return torch.cat(out)
 
 
+WHITEN_COMPONENTS = 64      # past about 32 components the whitened neighbours' scores are flat
+
+
+def whiten(z: torch.Tensor, train: torch.Tensor, components: int = WHITEN_COMPONENTS) -> torch.Tensor:
+    """
+    z [N, D] projected onto the top principal components of its training rows, each scaled to unit variance
+    there (float64 inside). Directions with next to no variance are left out, not blown up.
+    """
+    x = z.double()
+    mean = x[train].mean(0)
+    centred = x[train] - mean
+    values, vectors = torch.linalg.eigh(centred.T @ centred / max(1, centred.size(0) - 1))    # ascending
+    values, vectors = values.flip(0), vectors.flip(1)
+    keep = max(1, int((values[:components] > 1e-8 * values[0]).sum()))
+    return ((x - mean) @ vectors[:, :keep] / values[:keep].clamp_min(1e-300).sqrt()).to(z.dtype)
+
+
 def probe_one_model(z: torch.Tensor, labels: LabelSet, train: np.ndarray, device, k: int = 20,
                     max_queries: int = 20000, seed: int = 0) -> List[Dict[str, object]]:
     """All metrics for every label of one data source, for one model's vectors z [N, D]."""
@@ -489,6 +511,8 @@ def probe_one_model(z: torch.Tensor, labels: LabelSet, train: np.ndarray, device
         test_rows = test_rows[torch.randperm(test_rows.numel(), generator=g)[:max_queries].to(device)]
     train_rows = tr.nonzero().flatten()
     neighbours = train_rows[knn_indices(z[test_rows], z[train_rows], k)]        # [Q, k] row indices into z
+    white = whiten(z, tr)
+    neighbours_white = train_rows[knn_indices(white[test_rows], white[train_rows], k)]
 
     rows: List[Dict[str, object]] = []
     # ---- yes/no labels: one logistic probe for all of them
@@ -507,6 +531,8 @@ def probe_one_model(z: torch.Tensor, labels: LabelSet, train: np.ndarray, device
             q_valid = valid[test_rows, j]
             nb = y0[neighbours, j] * valid[neighbours, j]
             nb_rate = nb.sum(1) / valid[neighbours, j].sum(1).clamp_min(1)
+            nb_rate_white = ((y0[neighbours_white, j] * valid[neighbours_white, j]).sum(1)
+                             / valid[neighbours_white, j].sum(1).clamp_min(1))
             q_y = y0[test_rows, j]
             pos_q = q_valid & (q_y > 0.5)
             lift = float(nb_rate[pos_q].mean() / base) if pos_q.any() and base > 0 else float("nan")
@@ -518,6 +544,7 @@ def probe_one_model(z: torch.Tensor, labels: LabelSet, train: np.ndarray, device
                 "linear_auc": auc(scores_te[m, j], y_te[m, j]),
                 "knn_auc": auc(nb_rate[q_valid], q_y[q_valid]),
                 "knn_lift": lift,
+                "knn_white_auc": auc(nb_rate_white[q_valid], q_y[q_valid]),
                 "max_abs_dim_corr": corr,
             })
     # ---- numeric labels: ridge regression, lambda picked on a slice of the training rows
@@ -540,6 +567,9 @@ def probe_one_model(z: torch.Tensor, labels: LabelSet, train: np.ndarray, device
         q_valid = valid[test_rows]
         nb_valid = valid[neighbours]
         nb_mean = (torch.nan_to_num(y[neighbours]) * nb_valid).sum(1) / nb_valid.sum(1).clamp_min(1)
+        nb_valid_white = valid[neighbours_white]
+        nb_mean_white = ((torch.nan_to_num(y[neighbours_white]) * nb_valid_white).sum(1)
+                         / nb_valid_white.sum(1).clamp_min(1))
         yq = y[test_rows][q_valid]
         rows.append({
             "label": name, "binary": False,
@@ -547,6 +577,7 @@ def probe_one_model(z: torch.Tensor, labels: LabelSet, train: np.ndarray, device
             "linear_r2": r2(pred, y[tev]), "linear_pearson": pearson(pred, y[tev]),
             "linear_spearman": spearman(pred, y[tev]),
             "knn_r2": r2(nb_mean[q_valid], yq), "knn_spearman": spearman(nb_mean[q_valid], yq),
+            "knn_white_r2": r2(nb_mean_white[q_valid], yq),
             "max_abs_dim_corr": _max_abs_corr(xa, ya),
         })
     return rows
@@ -567,8 +598,8 @@ def _max_abs_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 COLUMNS = ["model", "encoder", "view", "dataset", "kind", "is_theme", "label", "n_train", "n_test", "n_test_positive", "base_rate",
-           "linear_auc", "knn_auc", "knn_lift", "linear_r2", "linear_pearson", "linear_spearman", "knn_r2",
-           "knn_spearman", "max_abs_dim_corr", "notes"]
+           "linear_auc", "knn_auc", "knn_lift", "knn_white_auc", "linear_r2", "linear_pearson", "linear_spearman",
+           "knn_r2", "knn_spearman", "knn_white_r2", "max_abs_dim_corr", "notes"]
 
 # Caveats that apply to every row of a data source, and to particular labels
 DATASET_NOTES = {
@@ -658,7 +689,8 @@ def _fmt(v):
 
 def write_summary(results: Sequence[Dict], path: str) -> None:
     """Per model, encoder, view and kind: how many labels, and the mean of each metric over them."""
-    metrics = ["linear_auc", "knn_auc", "knn_lift", "linear_r2", "knn_r2", "max_abs_dim_corr"]
+    metrics = ["linear_auc", "knn_auc", "knn_lift", "knn_white_auc", "linear_r2", "knn_r2", "knn_white_r2",
+               "max_abs_dim_corr"]
     groups: Dict[Tuple[str, str, str, str, str], List[Dict]] = collections.defaultdict(list)
     for row in results:
         groups[(row["model"], row["encoder"], row["view"], row["dataset"], row["kind"])].append(row)
@@ -751,7 +783,7 @@ class TrainingProbes:
     @staticmethod
     def summarize(rows: Sequence[Dict[str, object]]) -> Dict[str, Dict[str, Dict[str, float]]]:
         """
-        One model's rows -> {view: {key: {"linear": x, "knn": y}}}. Keys: "<dataset>/<kind>/auc" (the
+        One model's rows -> {view: {key: {"linear": x, "knn": y, "knn_white": w}}}. Keys: "<dataset>/<kind>/auc" (the
         mean AUC of that kind's yes/no labels), "<dataset>/<kind>/r2" (the mean R^2 of its numeric
         ones), and "<dataset>/<label>" for HEADLINE_LABELS. Metrics that are NaN everywhere are left out.
         """
@@ -763,7 +795,7 @@ class TrainingProbes:
             if row["label"] in HEADLINE_LABELS:
                 keys.append(f"{row['dataset']}/{row['label']}")
             for key in keys:
-                for probe in ("linear", "knn"):
+                for probe in ("linear", "knn", "knn_white"):
                     value = row.get(f"{probe}_{metric}")
                     if isinstance(value, float) and math.isfinite(value):
                         groups[(str(row["view"]), key)][probe].append(value)

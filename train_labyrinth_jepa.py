@@ -214,15 +214,16 @@ def build_probes(run: RunConfig, val_dataset: ld.PositionDataset, log: Callable[
     return pl.TrainingProbes(sets, views=run.probe_views, seed=run.seed, batch_size=encode_batch)
 
 
-# What the log shows of each probed view: (summary key, name), as linear / nearest-neighbour pairs
+# What the log shows of each probed view: (summary key, name), as linear / nearest-neighbour / whitened
+# nearest-neighbour scores
 PROBE_HEADLINES = (("val/material_balance", "material r2"), ("labeled/eval_win_prob", "eval r2"),
                    ("puzzles/theme/auc", "themes auc"), ("labeled/best_move/auc", "best move auc"))
 
 
 def _probe_line(view_summary: Dict[str, Dict[str, float]]) -> str:
-    parts = [f"{name} {view_summary[key].get('linear', math.nan):.2f}/{view_summary[key].get('knn', math.nan):.2f}"
+    parts = [f"{name} " + "/".join(f"{view_summary[key].get(probe, math.nan):.2f}" for probe in ("linear", "knn", "knn_white"))
              for key, name in PROBE_HEADLINES if key in view_summary]
-    return "  ".join(parts) + "  (linear/knn)"
+    return "  ".join(parts) + "  (linear/knn/whitened knn)"
 
 
 def _append_probe_rows(path: str, rows: Sequence[Dict[str, Any]], step: int) -> None:

@@ -56,6 +56,25 @@ def test_ridge_knn_and_correlation_metrics():
     assert pl._max_abs_corr(torch.cat([x, y[:, None]], 1), y) > 0.999
 
 
+def test_whitened_neighbours_hear_a_quiet_direction():
+    """
+    A label held in a direction of z a hundred times quieter than the others: cosine neighbours miss it, the
+    linear probe and the whitened neighbours find it. Constant dimensions are left out, not blown up.
+    """
+    torch.manual_seed(0)
+    n = 3000
+    signal = torch.randn(n)
+    z = torch.cat([10 * torch.randn(n, 6), 0.1 * signal[:, None], torch.zeros(n, 3)], 1) @ torch.linalg.qr(torch.randn(10, 10))[0]
+    labels = pl.LabelSet("toy", [], binary={"positive": (signal > 0).float().numpy()}, numeric={"value": signal.numpy()})
+    train = np.arange(n) % 5 != 0
+    rows = {r["label"]: r for r in pl.probe_one_model(z, labels, train, "cpu")}
+    assert rows["value"]["knn_r2"] < 0.1 and rows["value"]["linear_r2"] > 0.95 and rows["value"]["knn_white_r2"] > 0.7
+    assert rows["positive"]["knn_auc"] < 0.6 and rows["positive"]["knn_white_auc"] > 0.9
+    white = pl.whiten(z, torch.as_tensor(train))
+    assert white.shape == (n, 7), "the three constant directions are dropped"
+    assert float((white[torch.as_tensor(train)].std(0) - 1).abs().max()) < 1e-3
+
+
 def test_scores_moves_and_board_labels():
     # engine scores are from White's view; probes use the side to move's
     assert pl.score_to_side_to_move("200", True)[1] == 200 and pl.score_to_side_to_move("200", False)[1] == -200
@@ -155,7 +174,8 @@ def test_training_probes_leave_the_encoder_as_they_found_it():
     assert str(rows) == str(probes.probe(encoder, "cpu")), "the same positions and split every time"   # str: NaN AUCs
     summary = pl.TrainingProbes.summarize(rows)
     material = [r for r in rows if r["view"] == "z" and r["label"] == "material_balance"][0]
-    assert summary["z"]["val/material_balance"] == {"linear": material["linear_r2"], "knn": material["knn_r2"]}
+    assert summary["z"]["val/material_balance"] == {"linear": material["linear_r2"], "knn": material["knn_r2"],
+                                                    "knn_white": material["knn_white_r2"]}
     assert {"val/board/r2", "val/board/auc"} <= set(summary["z"])
     onehot = pl.TrainingProbes.summarize(probes.probe(None, "cpu", "board_onehot", ""))
     assert set(onehot) == {"onehot"}
