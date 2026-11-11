@@ -736,6 +736,85 @@ def test_file_marks_keep_the_other_weights_and_tell_left_from_right():
     assert float(model.encoder.file_marks.grad.abs().sum()) > 0
 
 
+def test_edge_marks_keep_the_other_weights_and_tell_left_from_right():
+    """
+    orientation_edges marks which way each edge runs across the board. The weights that read the marks come
+    from their own generators, so every other weight, and the random numbers afterwards, are those of a run
+    without them. A position and its mirror image then encode apart, and the marks' weights train.
+    """
+    # in the second graph of a batch: messages into a1 from c1, a3 and c3, into c1 from a1, and a self-loop
+    a1, c1, a3, c3, f1 = 64, 66, 80, 82, 69
+    edge_index = torch.tensor([[c1, a1, a3, c3, f1], [a1, c1, a1, a1, f1]])
+    marked = lje.with_orientation_edges(edge_index, torch.zeros(5, 10))
+    assert marked.shape == (5, 12) and float(marked[:, :10].abs().sum()) == 0
+    assert marked[:, 10:].tolist() == [[1, 0], [0, 1], [0, 0], [1, 0], [0, 0]]      # (from the right, from the left)
+
+    fen = FENS[3]                                                                   # no castling rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    flip = torch.tensor([s ^ 7 for s in range(64)])                                 # a <-> h, ranks kept
+    models, after = {}, {}
+    for name, kw in (("plain", {}), ("edges", dict(orientation_edges=True))):
+        torch.manual_seed(0)
+        models[name] = lje.LabyrinthJEPA(small_config("squares", **kw))
+        after[name] = torch.rand(4)
+    cfg = models["edges"].config
+    plain, state = models["plain"].state_dict(), models["edges"].state_dict()
+    assert set(plain) == set(state) and torch.equal(after["plain"], after["edges"])
+    wider = [k for k in plain if plain[k].shape != state[k].shape]
+    assert len(wider) == 2 * cfg.gat_layers + cfg.pred_gat_layers                   # encoder, target, predictor
+    assert all(k.endswith("gat.lin_edge.weight") for k in wider)
+    for k, value in plain.items():
+        if k in wider:
+            assert state[k].shape == (value.size(0), cfg.edge_dim + 2) and torch.equal(state[k][:, :-2], value)
+            assert 0 < float(state[k][:, -2:].abs().max()) <= float(value.abs().max())
+        else:
+            assert torch.equal(state[k], value), k
+    first, second = (state[f"encoder.square_gats.{i}.gat.lin_edge.weight"][:, -2:] for i in (0, 1))
+    assert not torch.equal(first, second), "each layer draws its own"
+    assert torch.equal(state["target.square_gats.0.gat.lin_edge.weight"], state["encoder.square_gats.0.gat.lin_edge.weight"])
+    assert not torch.equal(state["mask_predictor.gats.0.gat.lin_edge.weight"][:, -2:], first)
+    torch.manual_seed(1)
+    other = lje.LabyrinthEncoder(small_config("squares", orientation_edges=True))
+    assert not torch.equal(other.square_gats[0].gat.lin_edge.weight[:, -2:], first)  # they follow the seed
+
+    def gaps(model, mask=None):
+        out = model.encoder.eval()(graphs, mask)
+        return (float((out.z[0] - out.z[1]).norm() / out.z[0].norm()),
+                float((out.squares[0] - out.squares[1][flip]).norm() / out.squares[0].norm()))
+
+    with torch.no_grad():
+        assert max(gaps(models["plain"])) < 1e-5, "without marks, mirror images encode alike"
+        z_gap, token_gap = gaps(models["edges"])
+        assert z_gap > 1e-4 and token_gap > 1e-3, (z_gap, token_gap)
+        hidden = torch.rand(128, generator=torch.Generator().manual_seed(0)) < 0.5
+        hidden[64:] = hidden[:64][flip]                                             # the mirrored squares, hidden
+        z_gap, token_gap = gaps(models["edges"], hidden)
+        assert z_gap > 1e-4 and token_gap > 1e-3, (z_gap, token_gap)
+    model = models["edges"]
+    model.losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total.backward()
+    for block in (model.encoder.square_gats[0], model.mask_predictor.gats[0]):
+        assert float(block.gat.lin_edge.weight.grad[:, -2:].abs().sum()) > 0
+
+    # the concatenating layers and their summed branch read the marks too; the unpooling layers do not
+    kw = dict(gat_style="concat", gat_sum=True, transformer_layers=0, readout="mean")
+    torch.manual_seed(0)
+    concat = lje.LabyrinthJEPA(small_config("squares", orientation_edges=True, **kw))
+    torch.manual_seed(0)
+    base = lje.LabyrinthJEPA(small_config("squares", **kw))
+    for marked_block, block in zip(concat.encoder.square_gats, base.encoder.square_gats):
+        for a, b in ((marked_block.gat.lin_edge.weight, block.gat.lin_edge.weight), (marked_block.edge.weight, block.edge.weight)):
+            assert a.shape == (b.size(0), b.size(1) + 2) and torch.equal(a[:, :-2], b)
+        assert torch.equal(marked_block.mlp[0].weight, block.mlp[0].weight)
+    with torch.no_grad():
+        assert max(gaps(base)) < 1e-5 and min(gaps(concat)) > 1e-4
+    assert torch.isfinite(concat.losses(make_batch(concat.config), rng=torch.Generator().manual_seed(0)).total)
+    unpool_cfg = small_config("unpool", orientation_edges=True)
+    assert unpool_cfg.edge_dim == unpool_cfg.num_edge_types and unpool_cfg.mark_dim == 2
+    assert torch.isfinite(lje.LabyrinthJEPA(unpool_cfg).losses(make_batch(unpool_cfg),
+                                                             rng=torch.Generator().manual_seed(0)).total)
+
+
 def test_concatenated_gat_layers_and_the_mean_max_readout():
     """
     gat_style "concat": full-width heads side by side with the square's own features, reduced by a per-square

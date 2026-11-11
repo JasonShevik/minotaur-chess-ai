@@ -85,7 +85,13 @@ rest of the board has to work its side out from there through layers that averag
 orientation_files = True tells every square its file outright instead: a learned vector per file, added
 to the input of every square on it (started and seeded as the flag is). It is the strongest signal of
 the three and the least in keeping with the rule that a square's place comes only from the graph; the
-ranks still come from the pawn edges.
+ranks still come from the pawn edges. orientation_edges = True keeps to that rule: every edge that runs
+across the board gets two more features, one set when the square the message comes from stands to the
+right of the square receiving it and one when it stands to the left, so a head can attend to one side
+only. (Edge features only steer attention here, so what the marks give depends on what the heads learn
+to do with them.) The square GAT layers and the masked-square predictor's read them; the unpooling layers
+do not, since they merge an edge's two directions. The weights reading the marks are drawn from their own
+random numbers, so every other weight starts as without them.
 
 Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
 positions get different vectors: the untrained encoder already maps every position to nearly the same
@@ -161,6 +167,8 @@ class JEPAConfig:
     orientation_flag: bool = False   # a learned vector added to a1's input (one more node feature), so left and right differ
     orientation_files: bool = False  # a learned vector per file (a to h) added to every square's input: each square is
                                      # told its file, the one thing about where it is that the graph does not say
+    orientation_edges: bool = False  # two more edge features, on the edges that run across the board: whether the
+                                     # sending square stands to the right of the receiving one, or to its left
 
     # ----- Square stage: GAT layers on the chess graph -----
     gat_dim: int = 128
@@ -322,6 +330,12 @@ class JEPAConfig:
         return self.num_edge_types + int(self.orientation_anchor)
 
     @property
+    def mark_dim(self) -> int:
+        """How many left / right mark features the square GAT layers and the masked-square predictor's read
+        on top of edge_dim (the unpooling layers do not get them)."""
+        return 2 * int(self.orientation_edges)
+
+    @property
     def gat_widths(self) -> List[int]:
         """Width of the square tokens entering each square GAT layer, then leaving the last one."""
         widths = [self.gat_dim]
@@ -455,17 +469,56 @@ def with_orientation_anchor(edge_index: torch.Tensor, edge_attr: torch.Tensor) -
     return torch.cat([edge_attr, anchor.unsqueeze(-1).to(edge_attr.dtype)], dim=-1)
 
 
+def with_orientation_edges(edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+    """
+    edge_attr with two more columns that say which way an edge runs across the board. For the edge that
+    carries a message from one square to another (edge_index[0] to edge_index[1]): the first is 1 when the
+    sending square stands to the right of the receiving one (on a later file), the second when it stands to
+    its left. Edges along a file and self-loops get neither. Like the anchor, the marks depend on nothing in
+    the position, so hidden squares keep them. (Node = 64 * graph + 8 * rank + file, and turning the board
+    for the side to move flips the ranks only, so right is always towards the h file.)
+    """
+    across = edge_index[0] % 8 - edge_index[1] % 8
+    marks = torch.stack([across > 0, across < 0], dim=-1).to(edge_attr.dtype)
+    return torch.cat([edge_attr, marks], dim=-1)
+
+
+def _mark_generator(offset: int) -> torch.Generator:
+    """The random numbers the left / right marks' weights start from: the run's seed, but their own stream."""
+    return torch.Generator().manual_seed(torch.initial_seed() + offset)
+
+
+def _add_edge_inputs(linear: nn.Module, extra: int, generator: Optional[torch.Generator]) -> None:
+    """
+    Give a layer that reads edge features (weight [out, edge features]) `extra` more of them, in place. The
+    new columns are drawn from `generator`, uniformly within the range of the existing ones, so the existing
+    weights and the global random stream are what they would be without the new features.
+    """
+    if extra <= 0:
+        return
+    weight = linear.weight.data
+    bound = float(weight.abs().max())
+    new = (torch.rand(weight.size(0), extra, generator=generator) * 2 - 1) * bound
+    linear.weight = nn.Parameter(torch.cat([weight, new.to(weight)], dim=1))
+    # The layer's recorded input size is left alone: PyG's Linear re-draws a weight of that size from the global
+    # stream whenever it is deep-copied (as the target encoder is), so changing it would shift every later weight
+
+
 class _GATBlock(nn.Module):
     """
     A residual GAT layer, h + GELU(LayerNorm(GAT(h))), its width split across the heads.
     add_self_loops=False for the chess graph, which brings its own self-loops (some carry castling
     flags; see chess_graph.to_single_graph); True for unpooled graphs, which have none.
+    marks > 0: the edge features carry that many more columns (with_orientation_edges), read by weights
+    drawn from mark_generator.
     """
 
-    def __init__(self, dim: int, heads: int, edge_dim: int, dropout: float, add_self_loops: bool = True):
+    def __init__(self, dim: int, heads: int, edge_dim: int, dropout: float, add_self_loops: bool = True,
+                 marks: int = 0, mark_generator: Optional[torch.Generator] = None):
         super().__init__()
         self.gat = GATConv(dim, dim // heads, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
                            add_self_loops=add_self_loops)
+        _add_edge_inputs(self.gat.lin_edge, marks, mark_generator)
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
@@ -489,12 +542,15 @@ class _ConcatGATBlock(nn.Module):
     MEAN_NEIGHBOURS = 29.0                                          # in the chess graph, self-loop included
 
     def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool,
-                 residual: bool = False):
+                 residual: bool = False, marks: int = 0, mark_generator: Optional[torch.Generator] = None):
         super().__init__()
         self.residual = residual
         self.gat = GATConv(in_dim, in_dim, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
                            add_self_loops=False)
+        _add_edge_inputs(self.gat.lin_edge, marks, mark_generator)     # (as _GATBlock's marks)
         self.edge = nn.Linear(edge_dim, in_dim) if summed else None
+        if summed:
+            _add_edge_inputs(self.edge, marks, mark_generator)
         width = (heads + 1 + int(summed)) * in_dim
         self.norm = nn.LayerNorm(width)
         self.mlp = _mlp([width, out_dim, out_dim])
@@ -575,13 +631,14 @@ class LabyrinthEncoder(nn.Module):
             g = torch.Generator().manual_seed(torch.initial_seed() + 2)
             self.file_marks = nn.Parameter((torch.rand(8, c.gat_dim, generator=g) * 2 - 1) * c.node_feature_dim ** -0.5)
         widths = c.gat_widths
+        marks = dict(marks=c.mark_dim, mark_generator=_mark_generator(3) if c.mark_dim else None)
         if c.gat_style == "split":
             self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.edge_dim, c.gat_dropout,
-                                                       add_self_loops=False)
+                                                       add_self_loops=False, **marks)
                                              for _ in range(c.gat_layers))
         else:
             self.square_gats = nn.ModuleList(_ConcatGATBlock(widths[i], widths[i + 1], c.gat_heads, c.edge_dim,
-                                                             c.gat_dropout, c.gat_sum, c.gat_residual)
+                                                             c.gat_dropout, c.gat_sum, c.gat_residual, **marks)
                                              for i in range(c.gat_layers))
 
         self.unpool_layers = nn.ModuleList()
@@ -647,8 +704,11 @@ class LabyrinthEncoder(nn.Module):
             # Also after the mask: a hidden square still knows where it is. Node = b * 64 + rank * 8 + file,
             # and turning the board for the side to move flips the ranks only, so a file keeps its mark
             h = h + self.file_marks[torch.arange(h.size(0), device=h.device) % 8]
+        # The left / right marks are for the square GAT layers only: the unpooling layers merge an edge's two
+        # directions, which the marks tell apart
+        gat_attr = with_orientation_edges(square_edges, square_attr) if c.orientation_edges else square_attr
         for block in self.square_gats:
-            h = block(h, square_edges, square_attr)
+            h = block(h, square_edges, gat_attr)
         square_tokens = self.token_proj(h).view(B, 64, c.d_model) + self.token_type[0]
 
         log_prob = h.new_zeros(B)
@@ -719,7 +779,9 @@ class MaskPredictor(nn.Module):
         self.config = c = config
         self.inp = nn.Linear(c.d_model, c.pred_dim)
         self.target_flag = nn.Parameter(torch.randn(c.pred_dim) * 0.02)
-        self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.edge_dim, 0.0, add_self_loops=False)
+        marks = _mark_generator(4) if c.mark_dim else None
+        self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.edge_dim, 0.0, add_self_loops=False,
+                                            marks=c.mark_dim, mark_generator=marks)
                                   for _ in range(c.pred_gat_layers))
         # Optional attention across the whole board, after the local GAT steps (the squares stay an unordered set)
         self.transformer = nn.TransformerEncoder(
@@ -735,6 +797,8 @@ class MaskPredictor(nn.Module):
         edge_index, edge_attr = graphs.edge_index, graphs.edge_attr
         if self.config.orientation_anchor:
             edge_attr = with_orientation_anchor(edge_index, edge_attr)
+        if self.config.orientation_edges:
+            edge_attr = with_orientation_edges(edge_index, edge_attr)
         for block in self.gats:
             h = block(h, edge_index, edge_attr)
         if self.transformer is not None:
