@@ -124,7 +124,7 @@ class RunConfig:
 
 def parameter_groups(model: lje.LabyrinthJEPA, weight_decay: float) -> List[Dict[str, Any]]:
     """Weight decay on weight matrices only: not on biases, norms, or learned tokens and queries."""
-    no_decay_names = ("mask_token", "token_type", "registers", "queries", "target_flag")
+    no_decay_names = ("mask_token", "token_type", "registers", "queries", "target_flag", "file_marks")
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if name.startswith("target.") or not p.requires_grad:

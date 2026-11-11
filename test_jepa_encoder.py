@@ -685,6 +685,57 @@ def test_orientation_flag_keeps_the_other_weights_and_breaks_the_mirror_symmetry
         assert z_gap > 1e-4 and token_gap > 1e-3, (z_gap, token_gap)
 
 
+def test_file_marks_keep_the_other_weights_and_tell_left_from_right():
+    """
+    orientation_files tells every square its file. Like the a1 flag it starts from its own generator, so
+    the other weights and the random numbers afterwards are those of a run without it; unlike the flag it
+    needs no relay across the board, so a position and its mirror encode much further apart.
+    """
+    fen = FENS[3]                                                                   # no castling rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    flip = torch.tensor([s ^ 7 for s in range(64)])                                 # a <-> h, ranks kept
+    models, after = {}, {}
+    for name, kw in (("plain", {}), ("flag", dict(orientation_flag=True)), ("files", dict(orientation_files=True)),
+                     ("both", dict(orientation_flag=True, orientation_files=True))):
+        torch.manual_seed(0)
+        models[name] = lje.LabyrinthJEPA(small_config("squares", **kw))
+        after[name] = torch.rand(4)
+    plain, marked = models["plain"].state_dict(), models["files"].state_dict()
+    assert all(torch.equal(value, marked[name]) for name, value in plain.items())
+    assert sorted(set(marked) - set(plain)) == ["encoder.file_marks", "target.file_marks"]
+    assert all(torch.equal(after["plain"], a) for a in after.values())
+    marks = marked["encoder.file_marks"]
+    assert marks.shape == (8, models["files"].config.gat_dim) and torch.equal(marks, marked["target.file_marks"])
+    assert 0 < float(marks.abs().max()) <= models["files"].config.node_feature_dim ** -0.5
+    assert len({tuple(row.tolist()) for row in marks}) == 8, "every file has its own mark"
+    assert not torch.equal(marks[0], models["flag"].state_dict()["encoder.a1_flag"])   # not the flag's numbers
+    assert torch.equal(models["both"].state_dict()["encoder.file_marks"], marks)
+
+    def gaps(model, mask=None):
+        out = model.encoder.eval()(graphs, mask)
+        return (float((out.z[0] - out.z[1]).norm() / out.z[0].norm()),
+                float((out.squares[0] - out.squares[1][flip]).norm() / out.squares[0].norm()))
+
+    with torch.no_grad():
+        assert max(gaps(models["plain"])) < 1e-5, "without a mark, mirror images encode alike"
+        z_flag, token_flag = gaps(models["flag"])
+        z_files, token_files = gaps(models["files"])
+        assert z_files > 2 * z_flag and token_files > 2 * token_flag, (z_files, z_flag, token_files, token_flag)
+        hidden = torch.rand(128, generator=torch.Generator().manual_seed(0)) < 0.5
+        hidden[64:] = hidden[:64][flip]                                             # the mirrored squares, hidden
+        z_hidden, token_hidden = gaps(models["files"], hidden)
+        assert z_hidden > 2 * z_flag and token_hidden > 2 * token_flag, "hidden squares keep their marks"
+        # the same file on every rank, whichever side is to move: only the files tell the squares apart
+        empty = ld.pack_views([ld.build_views("8/8/8/8/8/8/8/8 w - - 0 1", torch.zeros(64, dtype=torch.bool))[0]])
+        encoder = models["files"].encoder
+        start = encoder.input_proj(empty.x) + encoder.file_marks[torch.arange(64) % 8]
+        assert torch.allclose(start.view(8, 8, -1)[0], start.view(8, 8, -1)[5])
+    model = models["files"]
+    model.losses(make_batch(model.config), rng=torch.Generator().manual_seed(0)).total.backward()
+    assert float(model.encoder.file_marks.grad.abs().sum()) > 0
+
+
 def test_concatenated_gat_layers_and_the_mean_max_readout():
     """
     gat_style "concat": full-width heads side by side with the square's own features, reduced by a per-square

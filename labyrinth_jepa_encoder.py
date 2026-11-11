@@ -80,7 +80,12 @@ leave the model at the mirror-symmetric point, where to first order a flag on a1
 no weight is rewarded for telling them apart.) Nothing makes the model use either while moves are
 described by square tokens, which mirror with the board. Naming the squares instead (move_encoding
 "squares" or "rank_file", or the move predictor) does: on a lopsided position, "b1 to c3" and "g1 to f3"
-lead to different places, so z must know which side is which.
+lead to different places, so z must know which side is which. Both of these mark one square, and the
+rest of the board has to work its side out from there through layers that average their neighbours.
+orientation_files = True tells every square its file outright instead: a learned vector per file, added
+to the input of every square on it (started and seeded as the flag is). It is the strongest signal of
+the three and the least in keeping with the rule that a square's place comes only from the graph; the
+ranks still come from the pawn edges.
 
 Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
 positions get different vectors: the untrained encoder already maps every position to nearly the same
@@ -154,6 +159,8 @@ class JEPAConfig:
     num_edge_types: int = cg.NUM_EDGE_TYPES
     orientation_anchor: bool = False # one more edge feature, on a1's self-loop only, so left and right differ
     orientation_flag: bool = False   # a learned vector added to a1's input (one more node feature), so left and right differ
+    orientation_files: bool = False  # a learned vector per file (a to h) added to every square's input: each square is
+                                     # told its file, the one thing about where it is that the graph does not say
 
     # ----- Square stage: GAT layers on the chess graph -----
     gat_dim: int = 128
@@ -561,6 +568,12 @@ class LabyrinthEncoder(nn.Module):
             # generator (seeded from the run's seed): every other weight starts as it would without the flag
             g = torch.Generator().manual_seed(torch.initial_seed() + 1)
             self.a1_flag = nn.Parameter((torch.rand(c.gat_dim, generator=g) * 2 - 1) * c.node_feature_dim ** -0.5)
+        self.file_marks = None
+        if c.orientation_files:
+            # Like eight more node features, one per file, set on every square of that file: the flag's idea
+            # without the relay from a1 across the board. Also from its own generator, so runs stay paired
+            g = torch.Generator().manual_seed(torch.initial_seed() + 2)
+            self.file_marks = nn.Parameter((torch.rand(8, c.gat_dim, generator=g) * 2 - 1) * c.node_feature_dim ** -0.5)
         widths = c.gat_widths
         if c.gat_style == "split":
             self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.edge_dim, c.gat_dropout,
@@ -630,6 +643,10 @@ class LabyrinthEncoder(nn.Module):
             # After the mask: the flag says nothing about the position, so a hidden a1 keeps it
             a1 = torch.arange(h.size(0), device=h.device) % 64 == 0
             h = h + a1.unsqueeze(-1).to(h.dtype) * self.a1_flag
+        if self.file_marks is not None:
+            # Also after the mask: a hidden square still knows where it is. Node = b * 64 + rank * 8 + file,
+            # and turning the board for the side to move flips the ranks only, so a file keeps its mark
+            h = h + self.file_marks[torch.arange(h.size(0), device=h.device) % 8]
         for block in self.square_gats:
             h = block(h, square_edges, square_attr)
         square_tokens = self.token_proj(h).view(B, 64, c.d_model) + self.token_type[0]
