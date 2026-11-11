@@ -434,6 +434,32 @@ def test_sibling_moves_are_other_first_moves_from_the_same_position():
         assert torch.equal(with_siblings.parent, without.parent) and torch.equal(with_siblings.index, without.index)
 
 
+def test_legal_moves_are_listed_in_the_graphs_frame():
+    boards = random_positions(12, seed=31, per_start=6)
+    boards += [chess.Board(f, chess960=True) for f in (
+        "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",              # castling both ways, black to move
+        "8/4P3/8/8/8/8/k7/7K w - - 0 1",                      # four promotions along one edge
+        "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",   # en passant
+        "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")]                    # stalemate: no legal move
+    samples = [ld.build_sample(ld.fen_of(b), random.Random(i), rollout_steps=2) for i, b in enumerate(boards)]
+    for board, sample in zip(boards, samples):
+        board = chess.Board(ld.fen_of(board), chess960=True)
+        orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+        pairs = {(orient(m.from_square), orient(m.to_square)) for m in board.legal_moves}
+        assert sample.legal == sorted(a * 64 + b for a, b in pairs)
+        # every legal move runs along an edge of the position's graph, from a square holding the mover's piece
+        edges = set(zip(sample.full.edge_index[0].tolist(), sample.full.edge_index[1].tolist()))
+        assert pairs <= edges
+        assert all(float(sample.full.x[a, 1:7].sum()) == 1 and float(sample.full.x[a, 0]) == 0 for a, _ in pairs)
+    assert samples[-1].legal == [] and samples[-1].rollout == []
+    assert len(samples[-3].legal) == 1 + 3, "one pawn move (its four promotions count once) and three king moves"
+    assert any(b.has_castling_rights(b.turn) and any(b.is_castling(m) for m in b.legal_moves) for b in boards)
+
+    batch = ld.collate_jepa(samples)
+    assert batch.legal.tolist() == [i * 4096 + code for i, s in enumerate(samples) for code in s.legal]
+    assert torch.equal(batch.pin_memory().legal, batch.legal) and torch.equal(batch.to("cpu").legal, batch.legal)
+
+
 def test_loader_rollout_length_and_mid_epoch_resume():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         path = os.path.join(tmp, "fens.txt")

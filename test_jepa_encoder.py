@@ -14,6 +14,7 @@ They check contracts, not learning:
   * LiDAR, RankMe and the self-consistency ratio behave as defined on constructed embeddings;
   * the DEHB search space samples valid configurations.
 """
+import math
 import random
 import sys
 import traceback
@@ -497,6 +498,69 @@ def test_loss_terms_add_up_to_the_total():
         expected |= {"zpred"} if cfg.zpred_weight > 0 else set()
         expected |= {"inverse"} if cfg.inverse_weight > 0 else set()
         assert set(out.terms) == expected, (variant, kw, sorted(out.terms))
+
+
+def test_heads_graded_against_the_board():
+    """The piece-count decoder and the legal-move head: their labels, their losses, and the other weights' start."""
+    kw = dict(transformer_layers=0, readout="mean")
+    cfg = small_config("squares", count_weight=1.0, count_hidden=32, legal_weight=1.0, legal_hidden=32, **kw)
+    batch = make_batch(cfg, seed=4)
+
+    counts = lje.piece_counts(batch.full)
+    graded, legal = lje.legal_move_edges(batch)
+    src, dst = batch.full.edge_index
+    for i, fen in enumerate(FENS):
+        board = chess.Board(fen, chess960=True)
+        mine = [len(board.pieces(t, board.turn)) for t in chess.PIECE_TYPES]
+        theirs = [len(board.pieces(t, not board.turn)) for t in chess.PIECE_TYPES]
+        assert counts[i].tolist() == mine + theirs
+        orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+        pairs = {(orient(m.from_square), orient(m.to_square)) for m in board.legal_moves}
+        here = batch.full.batch[src] == i
+        found = {(int(a) % 64, int(b) % 64) for a, b in zip(src[here & legal], dst[here & legal])}
+        assert found == pairs, "the edges labelled legal are exactly the position's legal moves"
+        assert not bool((here & legal & ~graded).any()), "and every one of them is graded"
+        own = {s for s in chess.SQUARES if board.color_at(s) == board.turn}
+        assert {int(a) % 64 for a in src[here & graded]} == {orient(s) for s in own}
+    assert not bool((graded & (src == dst)).any())
+
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+    torch.manual_seed(0)
+    plain = lje.LabyrinthJEPA(small_config("squares", **kw))
+    assert plain.count_decoder is None and plain.legal_head is None
+    theirs = plain.state_dict()
+    assert theirs and all(torch.equal(v, model.state_dict()[k]) for k, v in theirs.items()),         "the heads are built last: every other weight starts as without them"
+
+    out = model.losses(batch, rng=torch.Generator().manual_seed(0))
+    assert {"count", "legal"} <= set(out.terms) and abs(float(sum(out.terms.values()) - out.total)) < 1e-5
+    for key in ("loss_count", "count_error", "count_exact", "loss_legal", "legal_rate", "legal_precision", "legal_recall"):
+        assert key in out.stats and math.isfinite(out.stats[key]), key
+    assert abs(out.stats["legal_rate"] - float(legal[graded].float().mean())) < 1e-6
+    # the count loss reaches the encoder through z, the legal-move loss through the square tokens
+    encoder = [p for p in model.encoder.parameters()]
+    for term, head in (("count", model.count_decoder), ("legal", model.legal_head)):
+        grads = torch.autograd.grad(out.terms[term], encoder + list(head.parameters()), retain_graph=True,
+                                    allow_unused=True)
+        assert float(sum(g.abs().sum() for g in grads[:len(encoder)] if g is not None)) > 0, term
+        assert all(g is not None and float(g.abs().sum()) > 0 for g in grads[len(encoder):]), term
+    readout = torch.autograd.grad(out.terms["legal"], model.encoder.readout_proj.weight, allow_unused=True)[0]
+    assert readout is None, "the legal-move head reads the square tokens, not z"
+
+    # each head alone, and neither without a rollout to share the whole board's encoding with
+    for only in (dict(count_weight=0.5, count_hidden=32), dict(legal_weight=0.5, legal_hidden=32)):
+        single = lje.LabyrinthJEPA(small_config("squares", **only, **kw))
+        o = single.losses(batch, rng=torch.Generator().manual_seed(0))
+        assert ("count" in o.terms) == ("count_weight" in only) and ("legal" in o.terms) == ("legal_weight" in only)
+        ended = ld.collate_jepa([ld.build_sample("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", random.Random(i), cfg.mask_config())
+                                 for i in range(2)])     # stalemate
+        assert not ended.rollout and torch.isfinite(single.losses(ended, rng=torch.Generator().manual_seed(0)).total)
+    for bad in (dict(count_weight=-1.0), dict(legal_weight=-1.0)):
+        try:
+            small_config("squares", **bad).validate()
+            raise AssertionError("a negative weight should be rejected")
+        except ValueError:
+            pass
 
 
 def test_whole_board_predictor_projector_and_regularized_views():

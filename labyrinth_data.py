@@ -25,7 +25,9 @@ DataLoader worker processes so the GPU never waits.
             described by squares of the STARTING position's graph, so a model rolling the moves forward in
             latent space never sees the intermediate positions,
           * optionally (siblings > 1) other legal first moves from the same position and the positions
-            they lead to: several different moves to predict from one board.
+            they lead to: several different moves to predict from one board,
+          * the position's legal moves, as from/to square pairs of its graph: labels the rules give, for
+            heads graded against the board itself instead of against the target encoder.
         Every random choice comes from a generator seeded by (seed, epoch, index), so a run is
         reproducible whatever the number of workers.
 
@@ -526,6 +528,9 @@ class JEPASample:
     mask: torch.Tensor     # [64] bool, True on the masked squares
     rollout: List[NextPosition]   # up to rollout_steps moves; shorter when the game ends (mate or stalemate)
     siblings: List[NextPosition] = field(default_factory=list)   # other first moves from the same position
+    legal: List[int] = field(default_factory=list)   # the position's legal moves, each as from * 64 + to in its
+                                                     # graph's frame (the rook's square for castling; the
+                                                     # promotions of one pawn move count once), sorted
 
     @property
     def next(self) -> Optional[NextPosition]:
@@ -587,9 +592,11 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
                             (t.is_castling, t.is_capture, t.is_en_passant), view), t.next_castling_rook_squares
 
     current, current_rooks = board, rook_squares
+    first_moves = list(board.legal_moves)
+    legal = sorted({orient(m.from_square) * 64 + orient(m.to_square) for m in first_moves})
     other_first_moves: List[chess.Move] = []
     for k in range(1, rollout_steps + 1):
-        moves = list(current.legal_moves)
+        moves = first_moves if k == 1 else list(current.legal_moves)
         if not moves:
             break
         move = rng.choice(moves)
@@ -604,7 +611,7 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     if siblings > 1:
         extra = [play(board, move, rook_squares, 1)[0]
                  for move in rng.sample(other_first_moves, min(siblings - 1, len(other_first_moves)))]
-    return JEPASample(fen, full, context, mask, rollout, extra)
+    return JEPASample(fen, full, context, mask, rollout, extra, legal)
 
 
 # ##### ##### ##### ##### #####
@@ -687,6 +694,8 @@ class JEPABatch:
       mask              [B*64] bool, aligned with the nodes of full and context
       rollout           one RolloutStep per move ahead (empty when no position has a legal move)
       fens, moves       for inspection (moves: each position's rollout moves, in UCI)
+      legal             [M] every position's legal moves, each as b * 4096 + from * 64 + to (squares of
+                        full / context's graphs); None for a batch put together without them
     next, next_index, move_from, move_to, promotion and move_flags are the first move's, as before rollouts.
     """
     full: GraphBatch
@@ -695,6 +704,7 @@ class JEPABatch:
     rollout: List[RolloutStep]
     fens: List[str] = field(default_factory=list)
     moves: List[List[str]] = field(default_factory=list)
+    legal: Optional[torch.Tensor] = None
 
     @property
     def num_graphs(self) -> int:
@@ -732,11 +742,13 @@ class JEPABatch:
     def to(self, device, non_blocking: bool = False) -> "JEPABatch":
         return JEPABatch(self.full.to(device, non_blocking), self.context.to(device, non_blocking),
                          self.mask.to(device, non_blocking=non_blocking),
-                         [step.to(device, non_blocking) for step in self.rollout], self.fens, self.moves)
+                         [step.to(device, non_blocking) for step in self.rollout], self.fens, self.moves,
+                         self.legal.to(device, non_blocking=non_blocking) if self.legal is not None else None)
 
     def pin_memory(self) -> "JEPABatch":
         return JEPABatch(_pin_graphs(self.full), _pin_graphs(self.context), self.mask.pin_memory(),
-                         [step.pin_memory() for step in self.rollout], self.fens, self.moves)
+                         [step.pin_memory() for step in self.rollout], self.fens, self.moves,
+                         self.legal.pin_memory() if self.legal is not None else None)
 
 
 def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
@@ -773,6 +785,7 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
         rollout=steps,
         fens=[s.fen for s in samples],
         moves=[[m.move for m in s.rollout] for s in samples],
+        legal=torch.tensor([b * 4096 + code for b, s in enumerate(samples) for code in s.legal], dtype=torch.long),
     )
 
 

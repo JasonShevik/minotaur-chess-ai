@@ -28,6 +28,17 @@ answers the predictors are graded against. Two predictors give the training sign
                      after the rollout's first move, name the move's from and to squares (inverse
                      dynamics: a classification, nothing is reconstructed).
 
+Every target above is something the target encoder makes, so the encoder is only ever asked to agree
+with a copy of itself, and it can meet that by keeping less. Two optional heads are graded against the
+board instead, with answers the rules of chess give (no engine, no game results):
+
+    piece counts     (count_weight > 0) From z of the whole board, how many pawns, knights, bishops,
+                     rooks, queens and kings each side has: a decoder of the part of the position
+                     that needs no square names.
+    legal moves      (legal_weight > 0) For every edge of the chess graph that leaves one of the mover's
+                     pieces, from the square tokens at its two ends and the edge's relation types: does
+                     a legal move go along it? This grades the square tokens, and z only through them.
+
 The encoder:
 
     squares    the 64 square features are embedded (hidden squares get a learned mask token) and
@@ -215,6 +226,15 @@ class JEPAConfig:
     zpred_hidden: int = 1024
     zpred_layers: int = 2
 
+    # ----- Heads graded against the board (the rules' answers, not the target encoder's) -----
+    count_weight: float = 0.0        # piece-count decoder's loss weight; 0 leaves it out. From z of the whole
+                                     # board: how many of each piece type each side has (12 numbers)
+    count_hidden: int = 1024
+    legal_weight: float = 0.0        # legal-move head's loss weight; 0 leaves it out. For each edge of the chess
+                                     # graph leaving one of the mover's pieces, from the square tokens at its two
+                                     # ends: whether a legal move goes along it
+    legal_hidden: int = 256
+
     # ----- Objectives -----
     mask_weight: float = 1.0
     next_weight: float = 1.0
@@ -365,6 +385,8 @@ class JEPAConfig:
             raise ValueError("move_encoding 'rank_file' needs an even d_model")
         if self.inverse_weight < 0:
             raise ValueError("inverse_weight must be at least 0")
+        if self.count_weight < 0 or self.legal_weight < 0:
+            raise ValueError("count_weight and legal_weight must be at least 0")
         if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
             raise ValueError("need 0 < rollout_ramp_fraction <= 1 and rollout_step_decay > 0")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
@@ -785,6 +807,62 @@ class MovePredictor(nn.Module):
         return logits[:, :64], logits[:, 64:]
 
 
+class CountDecoder(nn.Module):
+    """
+    Reads from z how many pawns, knights, bishops, rooks, queens and kings each side has (piece_counts
+    gives the answers). Unlike the predictors above, it is graded against the board, so the encoder
+    cannot make its job easier by keeping less.
+    """
+
+    def __init__(self, config: JEPAConfig):
+        super().__init__()
+        c = config
+        self.body = _mlp([c.z_dim, c.count_hidden, 12])
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.body(z)
+
+
+def piece_counts(graphs: ld.GraphBatch) -> torch.Tensor:
+    """[B, 12]: the side to move's pawns, knights, bishops, rooks, queens and kings, then the other side's."""
+    x = graphs.x.view(graphs.num_graphs, 64, -1)
+    hostile, pieces = x[..., :1], x[..., 1:7]
+    return torch.cat([(pieces * (1 - hostile)).sum(1), (pieces * hostile).sum(1)], dim=-1)
+
+
+class LegalMoveHead(nn.Module):
+    """
+    For an edge of the chess graph: does a legal move go from its first square to its second? It reads
+    the square tokens at the two ends and the edge's relation types, so where the squares are comes only
+    from the graph, as everywhere else in the model. Graded against the rules (legal_move_edges).
+    """
+
+    def __init__(self, config: JEPAConfig):
+        super().__init__()
+        c = config
+        self.body = _mlp([2 * c.d_model + c.num_edge_types, c.legal_hidden, 1])
+
+    def forward(self, squares: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+        """squares [B*64, d_model], edge_index [2, E] node indices, edge_attr [E, num_edge_types] -> logits [E]."""
+        return self.body(torch.cat([squares[edge_index[0]], squares[edge_index[1]], edge_attr], dim=-1)).squeeze(-1)
+
+
+def legal_move_edges(batch: ld.JEPABatch) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    For every edge of batch.full, two [E] bool tensors:
+      graded   the edge leaves a square holding one of the side to move's pieces, and is not a self-loop.
+               Every legal move runs along such an edge: the graph joins all queen-move and knight-move
+               pairs of squares, which also covers a castling king's square and its rook's.
+      legal    a legal move goes from the edge's first square to its second.
+    """
+    g = batch.full
+    src, dst = g.edge_index
+    own = (g.x[:, 1:7].sum(-1) > 0) & (g.x[:, 0] == 0)
+    legal = torch.zeros(g.num_graphs * 4096, dtype=torch.bool, device=g.x.device)
+    legal[batch.legal] = True
+    return own[src] & (src != dst), legal[src * 64 + dst % 64]      # src = b * 64 + from
+
+
 # ##### ##### ##### ##### #####
 #       Anti-collapse regularizers
 
@@ -854,14 +932,14 @@ class JEPALosses:
     rl: torch.Tensor            # REINFORCE + baseline + entropy terms (0 without unpooling or with unpool_rl off)
     anticollapse: torch.Tensor  # the SIGReg / VICReg term (0 with anticollapse = "none")
     stats: Dict[str, float]     # diagnostics for logging
-    # Each term's weighted share of total, which they add up to: "mask", "next", "zpred", "inverse",
-    # "anticollapse_<embedding>" (masked, full, squares), "decorrelation", "rl". For measuring what each
+    # Each term's weighted share of total, which they add up to: "mask", "next", "zpred", "inverse", "count",
+    # "legal", "anticollapse_<embedding>" (masked, full, squares), "decorrelation", "rl". For measuring what each
     # term alone does to the gradient.
     terms: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
 
 
 class LabyrinthJEPA(nn.Module):
-    """The encoder, its moving-average target, both predictors, and the training losses."""
+    """The encoder, its moving-average target, the predictors and optional heads, and the training losses."""
 
     def __init__(self, config: JEPAConfig):
         super().__init__()
@@ -881,6 +959,9 @@ class LabyrinthJEPA(nn.Module):
         # Learned baselines for the unpooling rewards: each position's expected loss, from its z
         self.baselines = nn.ModuleDict({k: _mlp([config.z_dim, 256, 1]) for k in ("mask", "next")}) \
             if config.uses_unpool else None
+        # The heads graded against the board. Built last, so every weight above starts as it would without them
+        self.count_decoder = CountDecoder(config) if config.count_weight > 0 else None
+        self.legal_head = LegalMoveHead(config) if config.legal_weight > 0 else None
 
     def trainable_parameters(self) -> List[nn.Parameter]:
         return [p for n, p in self.named_parameters() if not n.startswith("target.")]
@@ -997,6 +1078,36 @@ class LabyrinthJEPA(nn.Module):
             stats["inverse_accuracy"] = float(((from_logits.argmax(-1) == from_square)
                                                & (to_logits.argmax(-1) == to_square)).float().mean())
 
+        # ---- the board's own facts, from the online encoder's reading of the whole board ----
+        if self.count_decoder is not None or self.legal_head is not None:
+            whole = ctx_full if ctx_full is not None else self.encoder(batch.full, rng=rng)
+        if self.count_decoder is not None:
+            counts = piece_counts(batch.full)
+            predicted = self.count_decoder(whole.z)
+            count_loss = F.smooth_l1_loss(predicted, counts)
+            contributions["count"] = c.count_weight * count_loss
+            total = total + contributions["count"]
+            with torch.no_grad():
+                stats["loss_count"] = float(count_loss)
+                stats["count_error"] = float((predicted - counts).abs().mean())       # pieces, per count
+                stats["count_exact"] = float((predicted.round() == counts).all(-1).float().mean())  # all 12 right
+        if self.legal_head is not None:
+            if batch.legal is None:
+                raise ValueError("the legal-move head needs the batch's legal moves (collate_jepa adds them)")
+            graded, legal = legal_move_edges(batch)
+            logits = self.legal_head(whole.squares.reshape(B * 64, -1), batch.full.edge_index[:, graded],
+                                     batch.full.edge_attr[graded])
+            labels = legal[graded]
+            legal_loss = F.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
+            contributions["legal"] = c.legal_weight * legal_loss
+            total = total + contributions["legal"]
+            with torch.no_grad():
+                said = logits > 0
+                stats["loss_legal"] = float(legal_loss)
+                stats["legal_rate"] = float(labels.float().mean())                    # the share of graded edges that are moves
+                stats["legal_precision"] = float((said & labels).sum() / said.sum().clamp_min(1))
+                stats["legal_recall"] = float((said & labels).sum() / labels.sum().clamp_min(1))
+
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
         if c.anticollapse != "none":
@@ -1095,6 +1206,8 @@ def describe(config: JEPAConfig) -> Dict[str, Any]:
         "next_predictor_params": count_parameters(model.next_predictor),
         "full_predictor_params": count_parameters(model.full_predictor) if model.full_predictor is not None else 0,
         "move_predictor_params": count_parameters(model.move_predictor) if model.move_predictor is not None else 0,
+        "count_decoder_params": count_parameters(model.count_decoder) if model.count_decoder is not None else 0,
+        "legal_head_params": count_parameters(model.legal_head) if model.legal_head is not None else 0,
         "projector_params": count_parameters(model.projector) if model.projector is not None else 0,
         "max_tokens": config.max_tokens,
         "z_dim": config.z_dim,
