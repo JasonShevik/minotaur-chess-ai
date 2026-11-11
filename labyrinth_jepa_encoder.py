@@ -21,6 +21,7 @@ answers the predictors are graded against. Two predictors give the training sign
                      rollout_stage_positions training positions, up to rollout_max_steps (see
                      rollout_schedule). With rollout_targets = "log" only a few steps are graded (see
                      rollout_target_steps), so a long rollout needs few target encodings.
+                     rollout_siblings > 1 adds other first moves from the same position (one ply each).
     whole board      (zpred_weight > 0) From z of the masked board, predict the target encoder's z of
                      the whole board: the masked-square task at the level of the position vector.
     the move         (inverse_weight > 0) From z of a position and the target encoder's z of the position
@@ -249,6 +250,9 @@ class JEPAConfig:
     rollout_targets: str = "all"     # which steps get a loss (and a target graph): "all", or "log" (1, 2, 3, every
                                      # power of two and the step after it, and the last two), so long rollouts need
                                      # few target encodings
+    rollout_siblings: int = 1        # different first moves predicted from each position: the rollout's own and
+                                     # this many less one other legal moves (one ply each, graded as step 1), so a
+                                     # batch asks what tells the moves of one board apart
 
     # ----- Unpooling decisions (REINFORCE) -----
     unpool_rl: bool = True           # False freezes the decision policy; everything else still trains
@@ -329,6 +333,8 @@ class JEPAConfig:
             raise ValueError("need 1 <= rollout_start_steps <= rollout_max_steps")
         if self.rollout_targets not in ROLLOUT_TARGETS:
             raise ValueError(f"rollout_targets must be one of {ROLLOUT_TARGETS}")
+        if self.rollout_siblings < 1:
+            raise ValueError("rollout_siblings must be at least 1")
         if self.anticollapse_views not in ANTICOLLAPSE_VIEWS:
             raise ValueError(f"anticollapse_views must be one of {ANTICOLLAPSE_VIEWS}")
         if self.gat_style not in GAT_STYLES:
@@ -895,7 +901,8 @@ class LabyrinthJEPA(nn.Module):
     def predict_rollout(self, z: torch.Tensor, squares: torch.Tensor, steps: Sequence[ld.RolloutStep]) -> List[torch.Tensor]:
         """
         Latent rollout: z [B, z_dim] and squares [B, 64, d_model] of the starting positions (online
-        encoder) -> one prediction per step, [B_k, z_dim], each from the previous step's prediction.
+        encoder) -> one prediction per step, [B_k, z_dim], each from the previous step's prediction
+        (step 1's rows may include sibling moves: other first moves from the same positions).
         Uses only the starting positions and the moves; the steps' graphs (the intermediate positions)
         are never read here, only encoded as targets elsewhere.
         """

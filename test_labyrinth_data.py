@@ -393,6 +393,47 @@ def test_rollouts_build_graphs_only_for_target_steps():
     assert moved.rollout[2].graphs is None and torch.equal(moved.rollout[2].move_from, batch.rollout[2].move_from)
 
 
+def test_sibling_moves_are_other_first_moves_from_the_same_position():
+    rng = random.Random(26)
+    boards = random_positions(8, seed=26, per_start=3)
+    boards.append(chess.Board("7k/8/8/8/8/8/8/K6R b - - 0 1", chess960=True))   # in check, two legal moves
+    seeds = [rng.randrange(10 ** 9) for _ in boards]
+    alone = [ld.build_sample(ld.fen_of(b), random.Random(s), rollout_steps=3) for b, s in zip(boards, seeds)]
+    samples = [ld.build_sample(ld.fen_of(b), random.Random(s), rollout_steps=3, siblings=4) for b, s in zip(boards, seeds)]
+    for board, a, s in zip(boards, alone, samples):
+        # the mask and the rollout are the same with and without siblings
+        assert torch.equal(a.mask, s.mask) and [m.move for m in a.rollout] == [m.move for m in s.rollout]
+        assert a.siblings == []
+        legal = {m.uci() for m in chess.Board(ld.fen_of(board), chess960=True).legal_moves}
+        assert len(s.siblings) == min(3, len(legal) - 1)
+        names = [m.move for m in s.siblings]
+        assert len(set(names)) == len(names) and set(names) <= legal - {s.rollout[0].move}
+        for m in s.siblings:
+            after = chess.Board(ld.fen_of(board), chess960=True)
+            after.push_uci(m.move)
+            assert m.next_fen == ld.fen_of(after) and m.view is not None
+    assert len(samples[-1].siblings) == 1, "a position with two legal moves has one sibling move"
+    # no graph for the siblings when step 1 is not a target
+    bare = ld.build_sample(ld.fen_of(boards[0]), random.Random(seeds[0]), rollout_steps=3, target_steps=[2], siblings=4)
+    assert all(m.view is None for m in bare.siblings)
+
+    batch, plain = ld.collate_jepa(samples), ld.collate_jepa(alone)
+    first, n = batch.rollout[0], plain.rollout[0].index.numel()
+    extra = [i for i, s in enumerate(samples) for _ in s.siblings]
+    # the rollouts' own first moves keep their rows; the siblings follow, each pointing at its position
+    assert first.index.tolist() == plain.rollout[0].index.tolist() + extra
+    assert torch.equal(first.parent, first.index) and first.graphs.num_graphs == n + len(extra)
+    assert torch.equal(first.move_from[:n], plain.rollout[0].move_from)
+    row = n
+    for i, s in enumerate(samples):
+        for m in s.siblings:
+            assert int(first.move_from[row]) == i * 64 + m.from_square and int(first.move_to[row]) == i * 64 + m.to_square
+            assert int(first.piece[row]) == m.piece and int(first.promotion[row]) == m.promotion
+            row += 1
+    for with_siblings, without in zip(batch.rollout[1:], plain.rollout[1:]):
+        assert torch.equal(with_siblings.parent, without.parent) and torch.equal(with_siblings.index, without.index)
+
+
 def test_loader_rollout_length_and_mid_epoch_resume():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         path = os.path.join(tmp, "fens.txt")

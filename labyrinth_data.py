@@ -23,7 +23,9 @@ DataLoader worker processes so the GPU never waits.
             to (for predicting positions one, two, ... moves ahead): of every one, or only of the target
             steps set with set_rollout_steps (long rollouts need far fewer graphs than moves). Every move is
             described by squares of the STARTING position's graph, so a model rolling the moves forward in
-            latent space never sees the intermediate positions.
+            latent space never sees the intermediate positions,
+          * optionally (siblings > 1) other legal first moves from the same position and the positions
+            they lead to: several different moves to predict from one board.
         Every random choice comes from a generator seeded by (seed, epoch, index), so a run is
         reproducible whatever the number of workers.
 
@@ -523,6 +525,7 @@ class JEPASample:
     context: GraphView     # the masked board: what the context encoder sees for masked-square prediction
     mask: torch.Tensor     # [64] bool, True on the masked squares
     rollout: List[NextPosition]   # up to rollout_steps moves; shorter when the game ends (mate or stalemate)
+    siblings: List[NextPosition] = field(default_factory=list)   # other first moves from the same position
 
     @property
     def next(self) -> Optional[NextPosition]:
@@ -550,15 +553,18 @@ def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, che
 
 def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskConfig(),
                  mask: Optional[torch.Tensor] = None, rollout_steps: int = 1,
-                 target_steps: Optional[Sequence[int]] = None) -> JEPASample:
+                 target_steps: Optional[Sequence[int]] = None, siblings: int = 1) -> JEPASample:
     """
     Everything one position contributes to a training step. fen should be normalized (normalize_fen);
     the cache already is. mask: use this mask instead of sampling one. rollout_steps: how many random
     legal moves to play from the position (fewer if the game ends first). target_steps: the steps
     (1 = the first move) whose positions get a graph, as prediction targets; None: every step.
+    siblings: how many different first moves the position gets in all: the rollout's own, and
+    siblings - 1 other legal moves drawn without repeats (fewer when the position has fewer moves),
+    each with its position as a target when step 1 is one.
 
-    The random draws come in a fixed order (mask, then move 1, move 2, ...), so for a given rng the
-    mask and the first moves are the same whatever rollout_steps is.
+    The random draws come in a fixed order (mask, then move 1, move 2, ..., then the sibling moves), so
+    for a given rng the mask and the rollout's moves are the same whatever rollout_steps and siblings are.
     """
     if mask is None:
         mask = sample_mask(rng, mask_config)
@@ -569,22 +575,36 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
     rollout: List[NextPosition] = []
     targets = None if target_steps is None else set(target_steps)
+
+    def play(current: chess.Board, move: chess.Move, rooks, k: int):
+        """Move k, played from `current`: its NextPosition and the castling rook squares after it."""
+        t = cg.move_transition(current, move, rooks)
+        view = None
+        if targets is None or k in targets:
+            view = GraphView.from_edge_lists(*cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares))
+        return NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
+                            current.piece_type_at(move.from_square), t.promotion,
+                            (t.is_castling, t.is_capture, t.is_en_passant), view), t.next_castling_rook_squares
+
     current, current_rooks = board, rook_squares
+    other_first_moves: List[chess.Move] = []
     for k in range(1, rollout_steps + 1):
         moves = list(current.legal_moves)
         if not moves:
             break
         move = rng.choice(moves)
-        t = cg.move_transition(current, move, current_rooks)
-        view = None
-        if targets is None or k in targets:
-            view = GraphView.from_edge_lists(*cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares))
-        rollout.append(NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
-                                    current.piece_type_at(move.from_square), t.promotion, (t.is_castling, t.is_capture, t.is_en_passant), view))
+        if k == 1:
+            other_first_moves = [m for m in moves if m != move]
+        step, next_rooks = play(current, move, current_rooks, k)
+        rollout.append(step)
         current = current.copy(stack=False)
         current.push(move)
-        current_rooks = t.next_castling_rook_squares
-    return JEPASample(fen, full, context, mask, rollout)
+        current_rooks = next_rooks
+    extra: List[NextPosition] = []
+    if siblings > 1:
+        extra = [play(board, move, rook_squares, 1)[0]
+                 for move in rng.sample(other_first_moves, min(siblings - 1, len(other_first_moves)))]
+    return JEPASample(fen, full, context, mask, rollout, extra)
 
 
 # ##### ##### ##### ##### #####
@@ -621,7 +641,8 @@ def pack_views(views: Sequence[GraphView]) -> GraphBatch:
 class RolloutStep:
     """
     Move k of the rollouts in a batch, for the B_k positions whose rollout reaches it (B_k shrinks when
-    games end).
+    games end). Move 1 may carry more rows after those: the positions' sibling moves (other first moves
+    from the same position, see build_sample), which no later move continues from.
       graphs     GraphBatch of the positions after move k (the targets); None when move k is not a target step
       index      [B_k] which of the batch's B positions each row belongs to
       parent     [B_k] the row each one continues from: for move 1 an index into the B positions, for
@@ -724,10 +745,14 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
     for k in range(max((len(s.rollout) for s in samples), default=0)):
         ids = [i for i, s in enumerate(samples) if len(s.rollout) > k]
         moves = [samples[i].rollout[k] for i in ids]
-        index = torch.tensor(ids, dtype=torch.long)
         if k == 0:
+            # Sibling moves go after the rollouts' own first moves, so the rows that move 2 continues from stay put
+            rows = ids + [i for i, s in enumerate(samples) for _ in s.siblings]
+            moves = moves + [m for s in samples for m in s.siblings]
+            index = torch.tensor(rows, dtype=torch.long)
             parent = index.clone()
         else:
+            index = torch.tensor(ids, dtype=torch.long)
             row_of = {sample: row for row, sample in enumerate(previous)}
             parent = torch.tensor([row_of[i] for i in ids], dtype=torch.long)
         steps.append(RolloutStep(
@@ -772,6 +797,7 @@ class PositionDataset(Dataset):
         self.epoch = 0
         self.rollout_steps = 1
         self.rollout_targets: Optional[List[int]] = None     # None: every step is a target
+        self.siblings = 1                                     # different first moves per position (build_sample)
         self._positions: Optional[np.ndarray] = None
         total = len(np.load(self.path, mmap_mode="r"))
         self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
@@ -800,7 +826,7 @@ class PositionDataset(Dataset):
 
     def __getitem__(self, i: int) -> JEPASample:
         return build_sample(self.fen(i), self.rng_for(i), self.mask_config, rollout_steps=self.rollout_steps,
-                            target_steps=self.rollout_targets)
+                            target_steps=self.rollout_targets, siblings=self.siblings)
 
 
 class _EpochShuffle(Sampler):
@@ -834,8 +860,9 @@ class JEPALoader:
     def __init__(self, cache_dir: str, split: str, batch_size: int, *, num_workers: int = 4,
                  mask_config: MaskConfig = MaskConfig(), seed: int = 0, shuffle: bool = True,
                  drop_last: bool = False, indices: Optional[Sequence[int]] = None, pin_memory: bool = False,
-                 prefetch_factor: int = 4):
+                 prefetch_factor: int = 4, siblings: int = 1):
         self.dataset = PositionDataset(cache_dir, split, mask_config, seed, indices)
+        self.dataset.siblings = int(siblings)
         self.sampler = _EpochShuffle(self.dataset, shuffle)
         self.loader_kwargs = dict(batch_size=batch_size, sampler=self.sampler, num_workers=num_workers,
                                   collate_fn=collate_jepa, drop_last=drop_last, pin_memory=pin_memory)

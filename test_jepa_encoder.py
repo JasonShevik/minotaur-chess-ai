@@ -397,6 +397,36 @@ def test_long_rollouts_grade_only_the_target_steps():
     assert float(model.next_predictor.step.weight.grad[10].abs().sum()) > 0
 
 
+def test_sibling_moves_are_graded_with_the_first_step():
+    cfg = small_config("squares", rollout_max_steps=3, rollout_siblings=3, move_encoding="rank_file",
+                       inverse_weight=0.1, inverse_hidden=32)
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+
+    def batch_with(siblings: int) -> ld.JEPABatch:      # one generator per position, as the dataset has
+        return ld.collate_jepa([ld.build_sample(f, random.Random(33 + i), cfg.mask_config(), rollout_steps=3,
+                                                siblings=siblings) for i, f in enumerate(FENS[:4])])
+
+    alone, batch = batch_with(1), batch_with(cfg.rollout_siblings)
+    rows = alone.rollout[0].index.numel()
+    more = sum(min(2, chess.Board(f, chess960=True).legal_moves.count() - 1) for f in FENS[:4])
+    assert more > 4 and batch.rollout[0].index.numel() == rows + more, "up to two more first moves per position"
+    with torch.no_grad():
+        enc = model.encoder(batch.full)
+        a = model.predict_rollout(enc.z, enc.squares, alone.rollout)
+        b = model.predict_rollout(enc.z, enc.squares, batch.rollout)
+    # the siblings are extra rows of step 1; the rollouts themselves are untouched
+    assert all(torch.allclose(x, y[:x.size(0)], atol=1e-6) for x, y in zip(a, b))
+    assert b[1].size(0) == a[1].size(0) and b[2].size(0) == a[2].size(0)
+    # different moves from one position get different predictions
+    own, sibling = b[0][0], b[0][rows]
+    assert int(batch.rollout[0].index[rows]) == 0 and float((own - sibling).abs().max()) > 0
+    losses = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0, 1.0, 1.0])
+    assert torch.isfinite(losses.total) and "loss_inverse" in losses.stats
+    losses.total.backward()
+    assert float(model.next_predictor.names[0].weight.grad.abs().sum()) > 0
+
+
 def test_latent_rollout_trains_every_step_without_peeking():
     cfg = small_config("registers", rollout_max_steps=3)
     model = lje.LabyrinthJEPA(cfg)

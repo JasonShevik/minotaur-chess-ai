@@ -397,14 +397,15 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
         indices = random.Random(run.seed).sample(range(train_size), run.max_train_positions)
     loader = ld.JEPALoader(run.cache_dir, "train", batch_size, num_workers=run.num_workers,
                            mask_config=config.mask_config(), seed=run.seed, indices=indices,
-                           pin_memory=device.type == "cuda", drop_last=True)
+                           pin_memory=device.type == "cuda", drop_last=True, siblings=config.rollout_siblings)
     if len(loader) == 0:
         raise ValueError(f"the training set ({len(loader.dataset)} positions) is smaller than one batch ({batch_size})")
     val_dataset = ld.PositionDataset(run.cache_dir, "val")
     eval_fens = [val_dataset.fen(i) for i in range(min(run.eval_positions, len(val_dataset)))]
     n_val = min(len(val_dataset), run.val_loss_batches * batch_size)
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
-                               seed=run.seed + 1, shuffle=False, indices=list(range(n_val))) if n_val else None
+                               seed=run.seed + 1, shuffle=False, indices=list(range(n_val)),
+                               siblings=config.rollout_siblings) if n_val else None
 
     # Evaluation and probes encode no more positions at once than a training step does: the unpool
     # variant's enlarged graphs make a few hundred positions at once far heavier than its training batch
