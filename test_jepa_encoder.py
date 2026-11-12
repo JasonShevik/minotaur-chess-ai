@@ -815,6 +815,111 @@ def test_edge_marks_keep_the_other_weights_and_tell_left_from_right():
                                                              rng=torch.Generator().manual_seed(0)).total)
 
 
+def test_sum_branch_keeps_the_other_weights_and_counts_neighbours():
+    """
+    gat_sum gives every square GAT layer a branch that sums the neighbours' messages. The heads average, so a
+    square hears one neighbour and two identical ones alike; with the branch it does not. The branch's weights
+    come from their own generators, so every other weight, and the random numbers afterwards, are those of a
+    run without it: in both layer styles, with and without the left / right edge marks.
+    """
+    x = torch.randn(64, 8)
+    x[2] = x[1]
+    loops = torch.arange(1, 64).repeat(2, 1)                                        # the other squares hear themselves
+    one = torch.cat([loops, torch.tensor([[1], [0]])], 1)                           # square 0 hears square 1
+    two = torch.cat([loops, torch.tensor([[1, 2], [0, 0]])], 1)                     # ... and its twin, square 2
+    for summed in (False, True):
+        torch.manual_seed(0)
+        block = lje._GATBlock(8, 2, edge_dim=3, dropout=0.0, add_self_loops=False, summed=summed)
+        with torch.no_grad():
+            heard_one = block(x, one, torch.ones(one.size(1), 3))[0]
+            heard_two = block(x, two, torch.ones(two.size(1), 3))[0]
+        assert (float((heard_one - heard_two).abs().max()) > 1e-4) == summed, summed
+    messages = lje._summed_messages(x, two, torch.ones(two.size(1), 3), torch.nn.Linear(3, 8))
+    alone = lje._summed_messages(x, one, torch.ones(one.size(1), 3), lambda attr: 0.0)
+    assert messages.shape == x.shape and float(alone[0].abs().max()) > 0
+    both = lje._summed_messages(x, two, torch.ones(two.size(1), 3), lambda attr: 0.0)
+    assert torch.allclose(both[0], 2 * alone[0]) and torch.equal(both[1:], alone[1:])
+
+    def build(seed=0, **kw):
+        torch.manual_seed(seed)
+        model = lje.LabyrinthJEPA(small_config("squares", transformer_layers=0, readout="mean", **kw))
+        return model, model.state_dict(), torch.rand(4)
+
+    fen = FENS[3]                                                                   # no castling rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    for style in (dict(), dict(gat_style="concat", gat_residual=True)):
+        concat = bool(style)
+        own = ("edge.weight", "edge.bias") + (() if concat else ("sum_out.weight",))
+        states = {}
+        for marks in (dict(), dict(orientation_edges=True)):
+            _, base, base_after = build(**style, **marks)
+            model, state, after = build(gat_sum=True, **style, **marks)
+            states[bool(marks)] = state
+            cfg = model.config
+            assert torch.equal(base_after, after), "the global random stream is left alone"
+            added = sorted(set(state) - set(base))
+            assert set(base) <= set(state) and len(added) == 2 * cfg.gat_layers * len(own)    # encoder and target
+            assert all(k.split(".")[1] == "square_gats" and k.endswith(own) for k in added), added
+            for k, value in base.items():
+                if concat and k.endswith("mlp.0.weight") and ".square_gats." in k:
+                    width = state[k].size(1) - value.size(1)                        # the sum's columns come last
+                    assert width > 0 and torch.equal(state[k][:, :-width], value), k
+                    assert 0 < float(state[k][:, -width:].abs().max()) <= float(value.abs().max())
+                elif concat and ".square_gats." in k and k.split(".")[-2] == "norm":
+                    assert torch.equal(state[k][:value.numel()], value), k           # the LayerNorm over the parts
+                else:
+                    assert torch.equal(state[k], value), k                          # the marks' weights too
+            for k in added:
+                assert float(state[k].abs().max()) > 0
+                assert torch.equal(state[k], state["target." + k.split(".", 1)[1]]), "the target starts as a copy"
+            _, other, _ = build(seed=1, gat_sum=True, **style, **marks)
+            assert not torch.equal(other["encoder.square_gats.0.edge.weight"], state["encoder.square_gats.0.edge.weight"])
+            if not concat:                                                          # each layer draws its own
+                assert not torch.equal(state["encoder.square_gats.0.edge.weight"], state["encoder.square_gats.1.edge.weight"])
+                assert not torch.equal(state["encoder.square_gats.0.sum_out.weight"], state["encoder.square_gats.1.sum_out.weight"])
+            with torch.no_grad():
+                out = model.encoder.eval()(graphs)
+                gap = float((out.z[0] - out.z[1]).norm() / out.z[0].norm())
+            assert (gap > 1e-4) == bool(marks), (style, marks, gap)                 # the sum alone is mirror-blind
+            model.train().losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total.backward()
+            for block in model.encoder.square_gats:
+                assert float(block.edge.weight.grad.abs().sum()) > 0
+                if concat:
+                    assert float(block.mlp[0].weight.grad[:, -block.edge.out_features:].abs().sum()) > 0
+                else:
+                    assert float(block.sum_out.weight.grad.abs().sum()) > 0
+        # the marks leave the branch's other weights alone too
+        for k, value in states[False].items():
+            marked = states[True][k]
+            if k.endswith(("lin_edge.weight", "edge.weight")) and ".square_gats." in k or ".gats." in k and k.endswith("lin_edge.weight"):
+                assert marked.shape == (value.size(0), value.size(1) + 2) and torch.equal(marked[:, :-2], value), k
+            else:
+                assert torch.equal(marked, value), k
+
+    # hidden squares stay hidden: the branch reads the tokens, where a hidden square is the mask token
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(small_config("squares", gat_sum=True, orientation_edges=True)).eval()
+    board = chess.Board(FENS[0], chess960=True)
+    mask = torch.zeros(64, dtype=torch.bool)
+    orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+    other = board.copy(stack=False)
+    hidden = [sq for sq in chess.SQUARES if board.piece_at(sq) is not None and board.piece_type_at(sq) != chess.KING][:6]
+    for sq in hidden:
+        mask[orient(sq)] = True
+        other.remove_piece_at(sq)
+    outs = []
+    for f in (ld.fen_of(board), ld.fen_of(other)):
+        ctx = ld.pack_views([ld.build_views(f, mask)[1]])
+        with torch.no_grad():
+            enc = model.encoder(ctx, mask=mask)
+            outs.append((enc.z, enc.squares, model.mask_predictor(enc.squares, ctx, mask)))
+    assert all(torch.equal(a, b) for a, b in zip(*outs))
+    # the unpooling variant takes the branch in its square layers
+    cfg = small_config("unpool", gat_sum=True)
+    assert torch.isfinite(lje.LabyrinthJEPA(cfg).losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total)
+
+
 def test_concatenated_gat_layers_and_the_mean_max_readout():
     """
     gat_style "concat": full-width heads side by side with the square's own features, reduced by a per-square
@@ -872,8 +977,7 @@ def test_concatenated_gat_layers_and_the_mean_max_readout():
         for part in (model.encoder.square_gats, model.encoder.readout_proj):
             assert all(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in part.parameters()), kw
     for variant, bad in (("squares", dict(gat_style="wide")), ("unpool", dict(gat_style="concat")),
-                         ("squares", dict(gat_style="concat", gat_growth=0.5)), ("squares", dict(gat_sum=True)),
-                         ("squares", dict(gat_residual=True)),
+                         ("squares", dict(gat_style="concat", gat_growth=0.5)), ("squares", dict(gat_residual=True)),
                          ("squares", dict(readout="max")), ("squares", dict(readout_hidden=-1))):
         try:
             small_config(variant, **bad).validate()

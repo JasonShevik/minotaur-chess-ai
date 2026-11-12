@@ -48,8 +48,11 @@ The encoder:
                the square's own features, and a per-square MLP reduces them to gat_growth times the
                layer's input width, so the tokens widen layer by layer. Either way each head
                averages over the squares it attends to; gat_sum adds a branch that sums the
-               neighbours' messages instead, which can count them; gat_residual adds each concat
-               layer's input to the first channels of its output, as the split layers do
+               neighbours' messages instead, which can count them ("split": a linear map of the
+               sum joins the heads' output; "concat": the sum is one more part beside the heads).
+               The branch's weights are drawn from their own random numbers, so every other weight
+               starts as without it. gat_residual adds each concat layer's input to the first
+               channels of its output, as the split layers do
     extras     token_variant decides what joins the square tokens:
                  "squares"    nothing
                  "registers"  num_registers learned tokens, the same for every position
@@ -180,8 +183,8 @@ class JEPAConfig:
                                      # side with the square's own features, and a per-square MLP reduces them to a
                                      # width gat_growth times the layer's input
     gat_growth: float = 1.5          # (concat) each layer's output width over its input width
-    gat_sum: bool = False            # (concat) also sum the neighbours' edge-aware messages: the heads average over
-                                     # the squares they attend to, a sum can count them
+    gat_sum: bool = False            # also sum the neighbours' edge-aware messages: the heads average over the
+                                     # squares they attend to, a sum can count them
     gat_residual: bool = False       # (concat) add the layer's input to the first channels of its output, so what a
                                      # layer does not change passes through (training cannot simply drop it)
 
@@ -384,8 +387,6 @@ class JEPAConfig:
             raise ValueError("gat_style 'concat' widens the square tokens, which the unpooling layers do not take")
         if self.gat_growth < 1:
             raise ValueError("gat_growth must be at least 1")
-        if self.gat_sum and self.gat_style != "concat":
-            raise ValueError("gat_sum needs gat_style 'concat'")
         if self.gat_residual and self.gat_style != "concat":
             raise ValueError("gat_residual needs gat_style 'concat' (the split layers always add their input)")
         if self.readout not in READOUTS:
@@ -483,16 +484,19 @@ def with_orientation_edges(edge_index: torch.Tensor, edge_attr: torch.Tensor) ->
     return torch.cat([edge_attr, marks], dim=-1)
 
 
-def _mark_generator(offset: int) -> torch.Generator:
-    """The random numbers the left / right marks' weights start from: the run's seed, but their own stream."""
+def _own_generator(offset: int) -> torch.Generator:
+    """
+    The random numbers an option's own weights start from (the left / right marks', the sum branch's): the
+    run's seed, but a stream of their own, so every other weight starts as it would without the option.
+    """
     return torch.Generator().manual_seed(torch.initial_seed() + offset)
 
 
-def _add_edge_inputs(linear: nn.Module, extra: int, generator: Optional[torch.Generator]) -> None:
+def _add_inputs(linear: nn.Module, extra: int, generator: Optional[torch.Generator]) -> None:
     """
-    Give a layer that reads edge features (weight [out, edge features]) `extra` more of them, in place. The
-    new columns are drawn from `generator`, uniformly within the range of the existing ones, so the existing
-    weights and the global random stream are what they would be without the new features.
+    Give a linear layer (weight [out, in]) `extra` more inputs, in place. The new columns come last and are
+    drawn from `generator`, uniformly within the range of the existing ones, so the existing weights and the
+    global random stream are what they would be without the new inputs.
     """
     if extra <= 0:
         return
@@ -504,6 +508,33 @@ def _add_edge_inputs(linear: nn.Module, extra: int, generator: Optional[torch.Ge
     # stream whenever it is deep-copied (as the target encoder is), so changing it would shift every later weight
 
 
+def _linear_from(generator: Optional[torch.Generator], in_dim: int, out_dim: int, bias: bool = True) -> nn.Linear:
+    """nn.Linear(in_dim, out_dim) in its usual starting range, drawn from `generator` (None: the global stream)."""
+    layer = nn.utils.skip_init(nn.Linear, in_dim, out_dim, bias=bias)
+    bound = in_dim ** -0.5
+    with torch.no_grad():
+        layer.weight.copy_((torch.rand(out_dim, in_dim, generator=generator) * 2 - 1) * bound)
+        if bias:
+            layer.bias.copy_((torch.rand(out_dim, generator=generator) * 2 - 1) * bound)
+    return layer
+
+
+MEAN_NEIGHBOURS = 29.0                                              # of a square in the chess graph, self-loop included
+
+
+def _summed_messages(h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor, edge: nn.Module) -> torch.Tensor:
+    """
+    gat_sum's branch: for every square, the sum over the squares it hears of GELU(neighbour + edge(what the
+    edge says)): what each neighbour is and how it relates, added up, so two attackers weigh twice one. The
+    chess graph's edges are fixed movement patterns, so a square has 24-36 neighbours, most of them empty;
+    the sum is divided by their average count (a constant, so counts survive), or it would be some 30 times
+    the size of what it joins and drown it in the LayerNorm.
+    """
+    source, target = edge_index
+    messages = F.gelu(h[source] + edge(edge_attr))
+    return messages.new_zeros(h.shape).index_add_(0, target, messages) / MEAN_NEIGHBOURS
+
+
 class _GATBlock(nn.Module):
     """
     A residual GAT layer, h + GELU(LayerNorm(GAT(h))), its width split across the heads.
@@ -511,18 +542,31 @@ class _GATBlock(nn.Module):
     flags; see chess_graph.to_single_graph); True for unpooled graphs, which have none.
     marks > 0: the edge features carry that many more columns (with_orientation_edges), read by weights
     drawn from mark_generator.
+    summed: a branch beside the heads (for the chess graph), h + GELU(LayerNorm(GAT(h) + W sum)), where sum is
+    _summed_messages: each head averages over the squares it attends to, so only the sum can tell one
+    attacker from two. The branch's weights are drawn from sum_generators[0], those reading its marks from
+    sum_generators[1], so the heads' weights (marks included) are those of a layer without the branch.
     """
 
     def __init__(self, dim: int, heads: int, edge_dim: int, dropout: float, add_self_loops: bool = True,
-                 marks: int = 0, mark_generator: Optional[torch.Generator] = None):
+                 marks: int = 0, mark_generator: Optional[torch.Generator] = None, summed: bool = False,
+                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None)):
         super().__init__()
         self.gat = GATConv(dim, dim // heads, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
                            add_self_loops=add_self_loops)
-        _add_edge_inputs(self.gat.lin_edge, marks, mark_generator)
+        _add_inputs(self.gat.lin_edge, marks, mark_generator)
+        self.edge = self.sum_out = None
+        if summed:
+            self.edge = _linear_from(sum_generators[0], edge_dim, dim)
+            _add_inputs(self.edge, marks, sum_generators[1])
+            self.sum_out = _linear_from(sum_generators[0], dim, dim, bias=False)
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
-        return h + F.gelu(self.norm(self.gat(h, edge_index, edge_attr)))
+        out = self.gat(h, edge_index, edge_attr)
+        if self.edge is not None:
+            out = out + self.sum_out(_summed_messages(h, edge_index, edge_attr, self.edge))
+        return h + F.gelu(self.norm(out))
 
 
 class _ConcatGATBlock(nn.Module):
@@ -531,29 +575,34 @@ class _ConcatGATBlock(nn.Module):
     features (and, with summed = True, the sum of the neighbours' edge-aware messages), then a per-square MLP
     that reduces them to out_dim (with residual = True, the input is added to its first in_dim channels).
     Each head still averages over the squares it attends to, so heads can specialize in kinds of
-    relations; only the sum can tell one attacker from two. For the chess graph,
-    which brings its own self-loops. Its edges are fixed movement patterns, so a square has 24-36
-    neighbours, most of them empty; the sum is divided by their average count (a constant, so counts
-    survive), or it would be some 30 times the size of the other parts and drown them in the LayerNorm.
+    relations; only the sum (_summed_messages) can tell one attacker from two. For the chess graph,
+    which brings its own self-loops.
+    The sum's weights (its edge layer and its columns of the MLP's first layer) are drawn from
+    sum_generators[0] and those reading its marks from sum_generators[1], so every other weight is that of
+    a layer without the sum.
     The heads are GATConv's, computed densely (see _attend): GATConv itself builds a full-width message
     per edge and head, some 30 times the memory, more than the GPU holds at batch 256.
     """
 
-    MEAN_NEIGHBOURS = 29.0                                          # in the chess graph, self-loop included
+    MEAN_NEIGHBOURS = MEAN_NEIGHBOURS
 
     def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool,
-                 residual: bool = False, marks: int = 0, mark_generator: Optional[torch.Generator] = None):
+                 residual: bool = False, marks: int = 0, mark_generator: Optional[torch.Generator] = None,
+                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None)):
         super().__init__()
         self.residual = residual
         self.gat = GATConv(in_dim, in_dim, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
                            add_self_loops=False)
-        _add_edge_inputs(self.gat.lin_edge, marks, mark_generator)     # (as _GATBlock's marks)
-        self.edge = nn.Linear(edge_dim, in_dim) if summed else None
+        _add_inputs(self.gat.lin_edge, marks, mark_generator)     # (as _GATBlock's marks)
+        self.edge = None
         if summed:
-            _add_edge_inputs(self.edge, marks, mark_generator)
-        width = (heads + 1 + int(summed)) * in_dim
-        self.norm = nn.LayerNorm(width)
+            self.edge = _linear_from(sum_generators[0], edge_dim, in_dim)
+            _add_inputs(self.edge, marks, sum_generators[1])
+        width = (heads + 1) * in_dim
+        self.norm = nn.LayerNorm(width + int(summed) * in_dim)
         self.mlp = _mlp([width, out_dim, out_dim])
+        if summed:
+            _add_inputs(self.mlp[0], in_dim, sum_generators[0])     # the sum's part comes last
 
     def _attend(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         """
@@ -576,9 +625,7 @@ class _ConcatGATBlock(nn.Module):
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         parts = [h, self._attend(h, edge_index, edge_attr)]
         if self.edge is not None:
-            source, target = edge_index
-            messages = F.gelu(h[source] + self.edge(edge_attr))       # what the neighbour is, and how it relates
-            parts.append(messages.new_zeros(h.shape).index_add_(0, target, messages) / self.MEAN_NEIGHBOURS)
+            parts.append(_summed_messages(h, edge_index, edge_attr, self.edge))
         out = self.mlp(self.norm(torch.cat(parts, dim=-1)))
         return out + F.pad(h, (0, out.size(-1) - h.size(-1))) if self.residual else out
 
@@ -631,14 +678,18 @@ class LabyrinthEncoder(nn.Module):
             g = torch.Generator().manual_seed(torch.initial_seed() + 2)
             self.file_marks = nn.Parameter((torch.rand(8, c.gat_dim, generator=g) * 2 - 1) * c.node_feature_dim ** -0.5)
         widths = c.gat_widths
-        marks = dict(marks=c.mark_dim, mark_generator=_mark_generator(3) if c.mark_dim else None)
+        marks = dict(marks=c.mark_dim, mark_generator=_own_generator(3) if c.mark_dim else None)
+        # The sum branch's weights, and those reading its left / right marks, each from a stream of their own:
+        # a run with the branch starts from the other weights of the run without it, marks or no marks
+        sums = dict(summed=c.gat_sum,
+                    sum_generators=(_own_generator(5), _own_generator(6)) if c.gat_sum else (None, None))
         if c.gat_style == "split":
             self.square_gats = nn.ModuleList(_GATBlock(c.gat_dim, c.gat_heads, c.edge_dim, c.gat_dropout,
-                                                       add_self_loops=False, **marks)
+                                                       add_self_loops=False, **marks, **sums)
                                              for _ in range(c.gat_layers))
         else:
             self.square_gats = nn.ModuleList(_ConcatGATBlock(widths[i], widths[i + 1], c.gat_heads, c.edge_dim,
-                                                             c.gat_dropout, c.gat_sum, c.gat_residual, **marks)
+                                                             c.gat_dropout, residual=c.gat_residual, **marks, **sums)
                                              for i in range(c.gat_layers))
 
         self.unpool_layers = nn.ModuleList()
@@ -779,7 +830,7 @@ class MaskPredictor(nn.Module):
         self.config = c = config
         self.inp = nn.Linear(c.d_model, c.pred_dim)
         self.target_flag = nn.Parameter(torch.randn(c.pred_dim) * 0.02)
-        marks = _mark_generator(4) if c.mark_dim else None
+        marks = _own_generator(4) if c.mark_dim else None
         self.gats = nn.ModuleList(_GATBlock(c.pred_dim, c.pred_heads, c.edge_dim, 0.0, add_self_loops=False,
                                             marks=c.mark_dim, mark_generator=marks)
                                   for _ in range(c.pred_gat_layers))
