@@ -184,7 +184,8 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
             sums["val_loss_mask"] += float(out.mask)
             sums["val_loss_next"] += float(out.next)
             for key in ("loss_zpred", "loss_inverse", "inverse_accuracy", "loss_count", "count_error", "count_exact",
-                        "loss_legal", "legal_rate", "legal_precision", "legal_recall"):
+                        "loss_legal", "legal_rate", "legal_precision", "legal_recall",
+                        "loss_decode", "decode_squares", "decode_pieces", "decode_exact"):
                 if key in out.stats:
                     sums[f"val_{key}"] = sums.get(f"val_{key}", 0.0) + out.stats[key]
             n += 1
@@ -555,6 +556,9 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             if "loss_legal" in entry:
                 zpred += (f"legal={entry['loss_legal']:.4f} (precision {entry['legal_precision']:.0%}, "
                           f"recall {entry['legal_recall']:.0%}) ")
+            if "loss_decode" in entry:
+                zpred += (f"decode={entry['loss_decode']:.4f} (pieces {entry['decode_pieces']:.0%}, "
+                          f"boards {entry['decode_exact']:.0%}) ")
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
                 f"{zpred}K={len(rollout_weights)} "
                 f"reg={entry['anticollapse']:.3f} z_std={entry['z_std']:.3f} z_cos={entry['z_mean_cosine']:.3f} "

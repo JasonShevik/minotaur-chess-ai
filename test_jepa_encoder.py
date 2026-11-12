@@ -563,6 +563,66 @@ def test_heads_graded_against_the_board():
             pass
 
 
+def test_position_decoder_reads_every_square_from_z():
+    """The position decoder: its labels are the board, its loss reaches the encoder through z, it is built last."""
+    kw = dict(transformer_layers=0, readout="mean")
+    cfg = small_config("squares", decode_weight=1.0, decode_hidden=48, count_weight=1.0, count_hidden=32,
+                       legal_weight=1.0, legal_hidden=32, **kw)
+    batch = make_batch(cfg, seed=4)
+    classes = lje.square_classes(batch.full)
+    assert classes.shape == (len(FENS), 64) and classes.dtype == torch.long
+    en_passant = 0
+    for i, fen in enumerate(FENS):
+        board = chess.Board(fen, chess960=True)
+        orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+        for sq in chess.SQUARES:
+            piece = board.piece_at(sq)
+            if piece is not None:
+                expected = piece.piece_type + (0 if piece.color == board.turn else 6)
+            else:
+                expected = lje.SQUARE_CLASSES - 1 if sq == board.ep_square else 0
+            en_passant += expected == lje.SQUARE_CLASSES - 1
+            assert int(classes[i, orient(sq)]) == expected, (fen, chess.square_name(sq))
+    assert en_passant == 1, "one of the positions has an en passant square"
+
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+    torch.manual_seed(0)
+    plain = lje.LabyrinthJEPA(small_config("squares", count_weight=1.0, count_hidden=32, legal_weight=1.0,
+                                           legal_hidden=32, **kw))
+    assert plain.board_decoder is None
+    theirs, ours = plain.state_dict(), model.state_dict()
+    assert all(torch.equal(v, ours[k]) for k, v in theirs.items()), "built last: the other weights start as without it"
+    assert all(k.startswith("board_decoder.") for k in set(ours) - set(theirs)) and len(ours) > len(theirs)
+    assert model.board_decoder(torch.randn(3, cfg.z_dim)).shape == (3, 64, lje.SQUARE_CLASSES)
+
+    out = model.losses(batch, rng=torch.Generator().manual_seed(0))
+    assert "decode" in out.terms and abs(float(sum(out.terms.values()) - out.total)) < 1e-5
+    for key in ("loss_decode", "decode_squares", "decode_pieces", "decode_exact"):
+        assert key in out.stats and math.isfinite(out.stats[key]) and out.stats[key] >= 0, key
+    assert abs(out.stats["loss_decode"] - math.log(lje.SQUARE_CLASSES)) < 1.0, "an untrained decoder guesses"
+    encoder = list(model.encoder.parameters())
+    grads = torch.autograd.grad(out.terms["decode"], encoder + list(model.board_decoder.parameters()),
+                                retain_graph=True, allow_unused=True)
+    assert float(sum(g.abs().sum() for g in grads[:len(encoder)] if g is not None)) > 0
+    assert all(g is not None and float(g.abs().sum()) > 0 for g in grads[len(encoder):])
+    readout = torch.autograd.grad(out.terms["decode"], model.encoder.readout_proj.weight)[0]
+    assert float(readout.abs().sum()) > 0, "the decoder reads z"
+    assert all(p.grad is None for p in model.target.parameters())
+
+    # alone, and without a rollout to share the whole board's encoding with
+    single = lje.LabyrinthJEPA(small_config("squares", decode_weight=0.5, decode_hidden=48, **kw))
+    assert "decode" in single.losses(batch, rng=torch.Generator().manual_seed(0)).terms
+    ended = ld.collate_jepa([ld.build_sample("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", random.Random(i), cfg.mask_config())
+                             for i in range(2)])         # stalemate
+    assert not ended.rollout and torch.isfinite(single.losses(ended, rng=torch.Generator().manual_seed(0)).total)
+    try:
+        small_config("squares", decode_weight=-1.0).validate()
+        raise AssertionError("a negative weight should be rejected")
+    except ValueError:
+        pass
+
+
 def test_whole_board_predictor_projector_and_regularized_views():
     batch = make_batch(small_config("squares"))
     rng = lambda: torch.Generator().manual_seed(0)
