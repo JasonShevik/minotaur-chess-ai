@@ -518,6 +518,9 @@ class NextPosition:
     promotion: int         # 0, or the python-chess piece type promoted to
     flags: Tuple[bool, bool, bool]   # (is_castling, is_capture, is_en_passant)
     view: Optional[GraphView]        # the next position's graph; None when this step is not a target
+    legal: List[int] = field(default_factory=list)   # the next position's legal moves, as JEPASample.legal lists
+                                                     # the starting position's, in the NEXT position's own frame
+                                                     # (its side to move at the bottom); only for target steps
 
 
 @dataclass
@@ -536,6 +539,16 @@ class JEPASample:
     def next(self) -> Optional[NextPosition]:
         """The first move of the rollout, or None when the position has no legal move."""
         return self.rollout[0] if self.rollout else None
+
+
+def legal_codes(board: chess.Board, moves: Optional[Sequence[chess.Move]] = None) -> List[int]:
+    """
+    The board's legal moves (or `moves`, when they are already listed), each as from * 64 + to in the board's
+    graph's frame (the side to move at the bottom; the rook's square for castling; the promotions of one
+    pawn move count once), sorted.
+    """
+    orient = (lambda sq: sq) if board.turn == chess.WHITE else (lambda sq: sq ^ 56)
+    return sorted({orient(m.from_square) * 64 + orient(m.to_square) for m in (board.legal_moves if moves is None else moves)})
 
 
 def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, chess.Board, Tuple[int, int, int, int]]:
@@ -566,7 +579,8 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     (1 = the first move) whose positions get a graph, as prediction targets; None: every step.
     siblings: how many different first moves the position gets in all: the rollout's own, and
     siblings - 1 other legal moves drawn without repeats (fewer when the position has fewer moves),
-    each with its position as a target when step 1 is one.
+    each with its position as a target when step 1 is one. A target step also lists the legal moves of
+    the position it leads to.
 
     The random draws come in a fixed order (mask, then move 1, move 2, ..., then the sibling moves), so
     for a given rng the mask and the rollout's moves are the same whatever rollout_steps and siblings are.
@@ -582,31 +596,36 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     targets = None if target_steps is None else set(target_steps)
 
     def play(current: chess.Board, move: chess.Move, rooks, k: int):
-        """Move k, played from `current`: its NextPosition and the castling rook squares after it."""
+        """Move k, played from `current`: its NextPosition, the board and the castling rook squares after
+        it, and that board's legal moves when the step is a target (else None: not listed yet)."""
         t = cg.move_transition(current, move, rooks)
-        view = None
+        after = current.copy(stack=False)
+        after.push(move)
+        view, after_moves = None, None
         if targets is None or k in targets:
             view = GraphView.from_edge_lists(*cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares))
-        return NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
+            after_moves = list(after.legal_moves)
+        step = NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
                             current.piece_type_at(move.from_square), t.promotion,
-                            (t.is_castling, t.is_capture, t.is_en_passant), view), t.next_castling_rook_squares
+                            (t.is_castling, t.is_capture, t.is_en_passant), view,
+                            legal_codes(after, after_moves) if after_moves is not None else [])
+        return step, after, t.next_castling_rook_squares, after_moves
 
     current, current_rooks = board, rook_squares
     first_moves = list(board.legal_moves)
-    legal = sorted({orient(m.from_square) * 64 + orient(m.to_square) for m in first_moves})
+    legal = legal_codes(board, first_moves)
     other_first_moves: List[chess.Move] = []
+    moves: Optional[List[chess.Move]] = first_moves
     for k in range(1, rollout_steps + 1):
-        moves = first_moves if k == 1 else list(current.legal_moves)
+        if moves is None:
+            moves = list(current.legal_moves)
         if not moves:
             break
         move = rng.choice(moves)
         if k == 1:
             other_first_moves = [m for m in moves if m != move]
-        step, next_rooks = play(current, move, current_rooks, k)
+        step, current, current_rooks, moves = play(current, move, current_rooks, k)
         rollout.append(step)
-        current = current.copy(stack=False)
-        current.push(move)
-        current_rooks = next_rooks
     extra: List[NextPosition] = []
     if siblings > 1:
         extra = [play(board, move, rook_squares, 1)[0]
@@ -659,6 +678,9 @@ class RolloutStep:
       promotion  [B_k] 0, or the piece type promoted to
       flags      [B_k, 3] (is_castling, is_capture, is_en_passant) as floats
       piece      [B_k] the moving piece's type (python-chess: 1 pawn ... 6 king)
+      legal      [M] the legal moves of the positions after move k, each as row * 4096 + from * 64 + to (row:
+                 which of the B_k rows; squares of that position's own graph); None when move k is not a
+                 target step, or for a step put together without them
     """
     graphs: Optional[GraphBatch]
     index: torch.Tensor
@@ -668,11 +690,13 @@ class RolloutStep:
     promotion: torch.Tensor
     flags: torch.Tensor
     piece: torch.Tensor
+    legal: Optional[torch.Tensor] = None
 
     def _map(self, fn, graph_fn) -> "RolloutStep":
         graphs = graph_fn(self.graphs) if self.graphs is not None else None
         return RolloutStep(graphs, fn(self.index), fn(self.parent), fn(self.move_from),
-                           fn(self.move_to), fn(self.promotion), fn(self.flags), fn(self.piece))
+                           fn(self.move_to), fn(self.promotion), fn(self.flags), fn(self.piece),
+                           fn(self.legal) if self.legal is not None else None)
 
     def to(self, device, non_blocking: bool = False) -> "RolloutStep":
         return self._map(lambda t: t.to(device, non_blocking=non_blocking), lambda g: g.to(device, non_blocking))
@@ -776,6 +800,8 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
             promotion=torch.tensor([m.promotion for m in moves], dtype=torch.long),
             flags=torch.tensor([m.flags for m in moves], dtype=torch.float32).reshape(-1, 3),
             piece=torch.tensor([m.piece for m in moves], dtype=torch.long),
+            legal=torch.tensor([row * 4096 + code for row, m in enumerate(moves) for code in m.legal],
+                               dtype=torch.long) if moves[0].view is not None else None,
         ))
         previous = ids
     return JEPABatch(

@@ -459,6 +459,36 @@ def test_legal_moves_are_listed_in_the_graphs_frame():
     assert batch.legal.tolist() == [i * 4096 + code for i, s in enumerate(samples) for code in s.legal]
     assert torch.equal(batch.pin_memory().legal, batch.legal) and torch.equal(batch.to("cpu").legal, batch.legal)
 
+    # the positions the moves lead to list theirs too, each in its own frame (its side to move at the bottom)
+    listed = 0
+    for sample in samples:
+        for step in sample.rollout + sample.siblings:
+            after = chess.Board(step.next_fen, chess960=True)
+            assert step.legal == ld.legal_codes(after) and step.view is not None
+            turn = (lambda sq: sq) if after.turn == chess.WHITE else (lambda sq: sq ^ 56)
+            assert step.legal == sorted({turn(m.from_square) * 64 + turn(m.to_square) for m in after.legal_moves})
+            edges = set(zip(step.view.edge_index[0].tolist(), step.view.edge_index[1].tolist()))
+            assert {(code // 64, code % 64) for code in step.legal} <= edges
+            listed += len(step.legal)
+    assert listed > 0
+    for k, step in enumerate(batch.rollout):
+        moves = [s.rollout[k] for s in samples if len(s.rollout) > k]
+        assert step.legal.tolist() == [row * 4096 + code for row, m in enumerate(moves) for code in m.legal]
+        assert int(step.legal.max()) // 4096 < step.graphs.num_graphs
+        assert torch.equal(step.pin_memory().legal, step.legal) and torch.equal(step.to("cpu").legal, step.legal)
+    # steps that are not targets list nothing, and the moves drawn are the same either way
+    for i, board in enumerate(boards):
+        every = ld.build_sample(ld.fen_of(board), random.Random(i), rollout_steps=3)
+        some = ld.build_sample(ld.fen_of(board), random.Random(i), rollout_steps=3, target_steps=[2], siblings=3)
+        assert [m.move for m in every.rollout] == [m.move for m in some.rollout]
+        assert all((m.legal == [] and m.view is None) == (k != 2) or not ld.legal_codes(chess.Board(m.next_fen, chess960=True))
+                   for k, m in enumerate(some.rollout, start=1))
+        assert all(a.legal == b.legal for k, (a, b) in enumerate(zip(every.rollout, some.rollout), start=1) if k == 2)
+        assert all(m.view is None and m.legal == [] for m in some.siblings)
+    skipped = ld.collate_jepa([ld.build_sample(ld.fen_of(b), random.Random(i), rollout_steps=2, target_steps=[2])
+                               for i, b in enumerate(boards[:4])])
+    assert skipped.rollout[0].legal is None and skipped.rollout[0].graphs is None and skipped.rollout[1].legal is not None
+
 
 def test_loader_rollout_length_and_mid_epoch_resume():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

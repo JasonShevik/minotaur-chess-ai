@@ -42,6 +42,22 @@ board instead, with answers the rules of chess give (no engine, no game results)
                      a decoder of the whole position. Its outputs are in board order, so z has to say
                      where every piece is, left and right included (a mirror-blind z cannot).
 
+Two heads read nothing but z, as whatever uses the trained encoder will, and can judge a PREDICTED z by the
+board it should stand for: the position decoder above, and a legal-move head (given z and a move named by
+its squares' files and ranks: is the move legal?). Each can be asked about three z:
+
+    the position's own z      decode_weight, zlegal_weight: the online encoder's z of the whole board. The
+                              loss trains the head and the encoder together (not a prediction).
+    the predicted next z      decode_next_weight, zlegal_next_weight: the next-position predictor's output,
+                              judged against the position the move leads to.
+    the predicted whole z     decode_masked_weight, zlegal_masked_weight: the whole-board predictor's output
+                              from the masked board's z (zpred_weight > 0), judged against the whole board.
+
+For the two predicted z the head learns only from the target encoder's z of real positions (no gradient
+reaches the encoder that way) and is held fixed while it judges a prediction, so that loss moves the
+predictor and the encoder, never the head: the board reaches the encoder only through a prediction made
+in latent space. The heads read z layer-normalized, the form the predictors are trained to produce.
+
 The encoder:
 
     squares    the 64 square features are embedded (hidden squares get a learned mask token) and
@@ -259,6 +275,15 @@ class JEPAConfig:
                                      # what stands on each of the 64 squares (see square_classes)
     decode_hidden: int = 1024
 
+    # ----- The heads that read only z, judging predicted z (see the module docstring) -----
+    decode_next_weight: float = 0.0     # the decoder on the predicted next z, against the next position
+    decode_masked_weight: float = 0.0   # the decoder on the whole-board z predicted from the masked board's z
+    zlegal_weight: float = 0.0          # the z-level legal-move head on the position's own (online) z
+    zlegal_next_weight: float = 0.0     # ... on the predicted next z, against the next position's legal moves
+    zlegal_masked_weight: float = 0.0   # ... on the whole-board z predicted from the masked board's z
+    zlegal_hidden: int = 1024           # the head's two MLPs (one for z, one for the move) have this hidden width
+    zlegal_dim: int = 512               # and compare vectors of this size
+
     # ----- Objectives -----
     mask_weight: float = 1.0
     next_weight: float = 1.0
@@ -339,6 +364,14 @@ class JEPAConfig:
         return self.num_edge_types + int(self.orientation_anchor)
 
     @property
+    def decodes_predictions(self) -> bool:
+        return self.decode_next_weight > 0 or self.decode_masked_weight > 0
+
+    @property
+    def zlegal_judges_predictions(self) -> bool:
+        return self.zlegal_next_weight > 0 or self.zlegal_masked_weight > 0
+
+    @property
     def mark_dim(self) -> int:
         """How many left / right mark features the square GAT layers and the masked-square predictor's read
         on top of edge_dim (the unpooling layers do not get them)."""
@@ -415,6 +448,12 @@ class JEPAConfig:
             raise ValueError("inverse_weight must be at least 0")
         if self.count_weight < 0 or self.legal_weight < 0 or self.decode_weight < 0:
             raise ValueError("count_weight, legal_weight and decode_weight must be at least 0")
+        if min(self.decode_next_weight, self.decode_masked_weight, self.zlegal_weight, self.zlegal_next_weight,
+               self.zlegal_masked_weight) < 0:
+            raise ValueError("the z heads' weights must be at least 0")
+        if (self.decode_masked_weight > 0 or self.zlegal_masked_weight > 0) and self.zpred_weight <= 0:
+            raise ValueError("decode_masked_weight and zlegal_masked_weight judge the whole-board predictor's "
+                             "output: they need zpred_weight > 0")
         if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
             raise ValueError("need 0 < rollout_ramp_fraction <= 1 and rollout_step_decay > 0")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
@@ -982,9 +1021,14 @@ class BoardDecoder(nn.Module):
         super().__init__()
         c = config
         self.body = _mlp([c.z_dim, c.decode_hidden, 64 * SQUARE_CLASSES])
+        # When it judges predicted z it reads every z layer-normalized: the form the predictors are trained to
+        # produce (their targets are layer-normalized)
+        self.normalize = c.decodes_predictions
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """-> [B, 64, SQUARE_CLASSES] logits."""
+        if self.normalize:
+            z = F.layer_norm(z, z.shape[-1:])
         return self.body(z).view(z.size(0), 64, SQUARE_CLASSES)
 
 
@@ -999,6 +1043,97 @@ def square_classes(graphs: ld.GraphBatch) -> torch.Tensor:
     occupied = pieces.sum(-1) > 0
     classes = torch.where(occupied, 1 + pieces.argmax(-1) + 6 * (x[..., 0] > 0).long(), 0)
     return torch.where(~occupied & (x[..., 7] > 0), SQUARE_CLASSES - 1, classes)
+
+
+def decode_scores(logits: torch.Tensor, classes: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """The decoder's cross-entropy against square_classes, and the shares of all squares, of the occupied
+    squares and of whole boards it gets right."""
+    loss = F.cross_entropy(logits.reshape(-1, SQUARE_CLASSES), classes.reshape(-1))
+    with torch.no_grad():
+        right = logits.argmax(-1) == classes
+        occupied = (classes > 0) & (classes < SQUARE_CLASSES - 1)
+        scores = {"squares": float(right.float().mean()),
+                  "pieces": float((right & occupied).sum() / occupied.sum().clamp_min(1)),
+                  "exact": float(right.all(-1).float().mean())}
+    return loss, scores
+
+
+def move_pairs() -> torch.Tensor:
+    """
+    [1792, 2] every ordered pair of different squares a queen or a knight could travel between on an empty
+    board (from, to; square = 8 * rank + file): the pairs the chess graph has an edge for. Every legal move
+    is one of them (castling is the king to its rook's square, along the rank).
+    """
+    pairs = []
+    for a in range(64):
+        for b in range(64):
+            files, ranks = abs(a % 8 - b % 8), abs(a // 8 - b // 8)
+            if a != b and (files == 0 or ranks == 0 or files == ranks or {files, ranks} == {1, 2}):
+                pairs.append((a, b))
+    return torch.tensor(pairs, dtype=torch.long)
+
+
+class ZLegalHead(nn.Module):
+    """
+    Is a move legal? From z of a position (layer-normalized) and the move, named by the files and ranks of
+    its from and to squares in the position's frame (the side to move at the bottom). An MLP turns z into
+    a vector, another turns the move's name into a vector, and their dot product (plus a bias the move's
+    MLP gives) is the logit, so one pass answers for every one of move_pairs()'s moves. Nothing but z says
+    what the position is. Graded against the rules (the batch's legal moves).
+    """
+
+    NAME_DIM = 32
+
+    def __init__(self, config: JEPAConfig):
+        super().__init__()
+        c = config
+        self.names = nn.ModuleList(nn.Embedding(8, self.NAME_DIM) for _ in range(4))   # from file, from rank, to file, to rank
+        self.position = _mlp([c.z_dim, c.zlegal_hidden, c.zlegal_dim])
+        self.move = _mlp([4 * self.NAME_DIM, c.zlegal_hidden, c.zlegal_dim + 1])
+        pairs = move_pairs()
+        a, b = pairs[:, 0], pairs[:, 1]
+        pair_of = torch.full((4096,), -1, dtype=torch.long)
+        pair_of[a * 64 + b] = torch.arange(pairs.size(0))
+        self.register_buffer("parts", torch.stack([a % 8, a // 8, b % 8, b // 8]), persistent=False)
+        self.register_buffer("pair_of", pair_of, persistent=False)      # from * 64 + to -> its row, or -1
+
+    @property
+    def num_pairs(self) -> int:
+        return self.parts.size(1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z [R, z_dim] -> [R, num_pairs] logits, one per move of move_pairs()."""
+        move = self.move(torch.cat([names(part) for names, part in zip(self.names, self.parts)], dim=-1))
+        position = self.position(F.layer_norm(z, z.shape[-1:]))
+        return position @ move[:, :-1].t() * position.size(-1) ** -0.5 + move[:, -1]
+
+    def labels(self, legal: torch.Tensor, rows: int) -> torch.Tensor:
+        """legal: moves as row * 4096 + from * 64 + to (JEPABatch.legal, RolloutStep.legal) -> [rows, num_pairs] bool."""
+        pair = self.pair_of[legal % 4096]
+        if bool((pair < 0).any()):
+            raise ValueError("a legal move that is not among move_pairs()")
+        labels = torch.zeros(rows * self.num_pairs, dtype=torch.bool, device=legal.device)
+        labels[torch.div(legal, 4096, rounding_mode="floor") * self.num_pairs + pair] = True
+        return labels.view(rows, self.num_pairs)
+
+
+def legal_scores(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Binary cross-entropy with the legal moves and the illegal ones weighing the same (some 30 of the 1,792
+    pairs are legal in a position), and the shares of legal moves found and of illegal ones rejected.
+    """
+    per = F.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype), reduction="none")
+    n_legal, n_illegal = labels.sum().clamp_min(1), (~labels).sum().clamp_min(1)
+    loss = 0.5 * (per[labels].sum() / n_legal + per[~labels].sum() / n_illegal)
+    with torch.no_grad():
+        said = logits > 0
+        scores = {"found": float((said & labels).sum() / n_legal), "rejected": float((~said & ~labels).sum() / n_illegal)}
+    return loss, scores
+
+
+def held_fixed(head: nn.Module, *inputs: torch.Tensor) -> torch.Tensor:
+    """head(*inputs) with the head's weights held fixed: the gradient reaches the inputs, not the head."""
+    return torch.func.functional_call(head, {name: p.detach() for name, p in head.named_parameters()}, inputs)
 
 
 class LegalMoveHead(nn.Module):
@@ -1104,7 +1239,8 @@ class JEPALosses:
     anticollapse: torch.Tensor  # the SIGReg / VICReg term (0 with anticollapse = "none")
     stats: Dict[str, float]     # diagnostics for logging
     # Each term's weighted share of total, which they add up to: "mask", "next", "zpred", "inverse", "count",
-    # "legal", "decode", "anticollapse_<embedding>" (masked, full, squares), "decorrelation", "rl". For measuring what each
+    # "legal", "decode", "decode_fit", "decode_next", "decode_masked", "zlegal", "zlegal_fit", "zlegal_next",
+    # "zlegal_masked", "anticollapse_<embedding>" (masked, full, squares), "decorrelation", "rl". For measuring what each
     # term alone does to the gradient.
     terms: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
 
@@ -1133,7 +1269,10 @@ class LabyrinthJEPA(nn.Module):
         # The heads graded against the board. Built last, so every weight above starts as it would without them
         self.count_decoder = CountDecoder(config) if config.count_weight > 0 else None
         self.legal_head = LegalMoveHead(config) if config.legal_weight > 0 else None
-        self.board_decoder = BoardDecoder(config) if config.decode_weight > 0 else None      # (after the two above)
+        self.board_decoder = BoardDecoder(config) \
+            if config.decode_weight > 0 or config.decodes_predictions else None              # (after the two above)
+        self.zlegal_head = ZLegalHead(config) \
+            if config.zlegal_weight > 0 or config.zlegal_judges_predictions else None        # (and after that)
 
     def trainable_parameters(self) -> List[nn.Parameter]:
         return [p for n, p in self.named_parameters() if not n.startswith("target.")]
@@ -1206,6 +1345,7 @@ class LabyrinthJEPA(nn.Module):
         mask_loss = mask_per_pos.mean()
 
         # ---- next positions: a latent rollout, a loss at every step ----
+        predictions: List[torch.Tensor] = []
         if steps:
             ctx_full = self.encoder(batch.full, rng=rng)
             predictions = self.predict_rollout(ctx_full.z, ctx_full.squares, steps)
@@ -1232,8 +1372,10 @@ class LabyrinthJEPA(nn.Module):
         total = contributions["mask"] + contributions["next"]
 
         # ---- the whole board's z from the masked board's z ----
+        whole_pred = None
         if self.full_predictor is not None:
-            zpred_loss = self._distance(self.full_predictor(ctx_masked.z), target_full.z).mean()
+            whole_pred = self.full_predictor(ctx_masked.z)
+            zpred_loss = self._distance(whole_pred, target_full.z).mean()
             contributions["zpred"] = c.zpred_weight * zpred_loss
             total = total + contributions["zpred"]
             stats["loss_zpred"] = float(zpred_loss.detach())
@@ -1251,7 +1393,7 @@ class LabyrinthJEPA(nn.Module):
                                                & (to_logits.argmax(-1) == to_square)).float().mean())
 
         # ---- the board's own facts, from the online encoder's reading of the whole board ----
-        if self.count_decoder is not None or self.legal_head is not None or self.board_decoder is not None:
+        if self.count_decoder is not None or self.legal_head is not None or c.decode_weight > 0 or c.zlegal_weight > 0:
             whole = ctx_full if ctx_full is not None else self.encoder(batch.full, rng=rng)
         if self.count_decoder is not None:
             counts = piece_counts(batch.full)
@@ -1279,7 +1421,7 @@ class LabyrinthJEPA(nn.Module):
                 stats["legal_rate"] = float(labels.float().mean())                    # the share of graded edges that are moves
                 stats["legal_precision"] = float((said & labels).sum() / said.sum().clamp_min(1))
                 stats["legal_recall"] = float((said & labels).sum() / labels.sum().clamp_min(1))
-        if self.board_decoder is not None:
+        if c.decode_weight > 0:
             classes = square_classes(batch.full)
             logits = self.board_decoder(whole.z)
             decode_loss = F.cross_entropy(logits.reshape(-1, SQUARE_CLASSES), classes.reshape(-1))
@@ -1292,6 +1434,59 @@ class LabyrinthJEPA(nn.Module):
                 stats["decode_squares"] = float(right.float().mean())                  # squares right, of all 64
                 stats["decode_pieces"] = float((right & occupied).sum() / occupied.sum().clamp_min(1))   # of the occupied
                 stats["decode_exact"] = float(right.all(-1).float().mean())            # whole boards right
+
+        # ---- the heads that read only z, judging predicted z ----
+        # The real positions a head learns from: the target encoder's z of the whole board and of the graded
+        # rollout positions (no gradient reaches the encoder). A prediction is judged with the head held fixed.
+        graded = [(k, step, pred, w) for k, (step, pred, target_z, w)
+                  in enumerate(zip(steps, predictions, target_steps, weights), start=1) if target_z is not None]
+        real_z = torch.cat([target_full.z] + [target_steps[k - 1] for k, _, _, _ in graded])
+
+        def add(name: str, weight: float, loss: torch.Tensor, scores: Dict[str, float]) -> None:
+            nonlocal total
+            contributions[name] = weight * loss
+            total = total + contributions[name]
+            stats[f"loss_{name}"] = float(loss.detach())
+            stats.update({f"{name}_{key}": value for key, value in scores.items()})
+
+        def over_steps(judge) -> Tuple[torch.Tensor, Dict[str, float]]:
+            """judge(step, prediction) -> (loss, scores), averaged over the graded steps by the rollout weights."""
+            results = [judge(step, pred) for _, step, pred, _ in graded]
+            ws = [w for _, _, _, w in graded]
+            scale = max(sum(ws), 1e-12)
+            loss = sum(w * r[0] for w, r in zip(ws, results)) / scale
+            scores = {key: sum(w * r[1][key] for w, r in zip(ws, results)) / scale for key in results[0][1]}
+            for (k, _, _, _), r in zip(graded, results):
+                scores.update({f"{key}_{k}": value for key, value in r[1].items()})
+            return loss, scores
+
+        if c.decodes_predictions:
+            decoder = self.board_decoder
+            real_classes = torch.cat([square_classes(batch.full)] + [square_classes(step.graphs) for _, step, _, _ in graded])
+            add("decode_fit", 1.0, *decode_scores(decoder(real_z), real_classes))
+            if c.decode_next_weight > 0 and graded:
+                add("decode_next", c.decode_next_weight, *over_steps(
+                    lambda step, pred: decode_scores(held_fixed(decoder, pred), square_classes(step.graphs))))
+            if c.decode_masked_weight > 0:
+                add("decode_masked", c.decode_masked_weight,
+                    *decode_scores(held_fixed(decoder, whole_pred), square_classes(batch.full)))
+
+        if self.zlegal_head is not None:
+            head = self.zlegal_head
+            if batch.legal is None or (c.zlegal_judges_predictions and any(step.legal is None for _, step, _, _ in graded)):
+                raise ValueError("the z-level legal-move head needs the batch's legal moves (collate_jepa adds them)")
+            now = head.labels(batch.legal, B)
+            if c.zlegal_weight > 0:
+                add("zlegal", c.zlegal_weight, *legal_scores(head(whole.z), now))
+            if c.zlegal_judges_predictions:
+                after = [head.labels(step.legal, pred.size(0)) for _, step, pred, _ in graded]
+                add("zlegal_fit", 1.0, *legal_scores(head(real_z), torch.cat([now] + after)))
+                if c.zlegal_next_weight > 0 and graded:
+                    by_step = {id(step): labels for (_, step, _, _), labels in zip(graded, after)}
+                    add("zlegal_next", c.zlegal_next_weight, *over_steps(
+                        lambda step, pred: legal_scores(held_fixed(head, pred), by_step[id(step)])))
+                if c.zlegal_masked_weight > 0:
+                    add("zlegal_masked", c.zlegal_masked_weight, *legal_scores(held_fixed(head, whole_pred), now))
 
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
@@ -1394,6 +1589,7 @@ def describe(config: JEPAConfig) -> Dict[str, Any]:
         "count_decoder_params": count_parameters(model.count_decoder) if model.count_decoder is not None else 0,
         "legal_head_params": count_parameters(model.legal_head) if model.legal_head is not None else 0,
         "board_decoder_params": count_parameters(model.board_decoder) if model.board_decoder is not None else 0,
+        "zlegal_head_params": count_parameters(model.zlegal_head) if model.zlegal_head is not None else 0,
         "projector_params": count_parameters(model.projector) if model.projector is not None else 0,
         "max_tokens": config.max_tokens,
         "z_dim": config.z_dim,

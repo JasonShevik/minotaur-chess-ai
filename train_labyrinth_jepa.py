@@ -183,11 +183,10 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
             out = model.losses(batch.to(device), rng=gen, rollout_weights=rollout_weights)
             sums["val_loss_mask"] += float(out.mask)
             sums["val_loss_next"] += float(out.next)
-            for key in ("loss_zpred", "loss_inverse", "inverse_accuracy", "loss_count", "count_error", "count_exact",
-                        "loss_legal", "legal_rate", "legal_precision", "legal_recall",
-                        "loss_decode", "decode_squares", "decode_pieces", "decode_exact"):
-                if key in out.stats:
-                    sums[f"val_{key}"] = sums.get(f"val_{key}", 0.0) + out.stats[key]
+            for key, value in out.stats.items():       # the optional predictors' and heads' losses and scores
+                if key.startswith(("loss_zpred", "loss_inverse", "inverse_accuracy", "loss_count", "count_", "loss_legal",
+                                   "legal_", "loss_decode", "decode_", "loss_zlegal", "zlegal_")):
+                    sums[f"val_{key}"] = sums.get(f"val_{key}", 0.0) + value
             n += 1
         metrics.update({k: v / max(1, n) for k, v in sums.items()})
     model.train(was_training)
@@ -559,6 +558,14 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             if "loss_decode" in entry:
                 zpred += (f"decode={entry['loss_decode']:.4f} (pieces {entry['decode_pieces']:.0%}, "
                           f"boards {entry['decode_exact']:.0%}) ")
+            for name, label in (("decode_fit", "real z"), ("decode_next", "next z"), ("decode_masked", "masked z")):
+                if f"loss_{name}" in entry:
+                    zpred += f"decode {label}={entry[f'loss_{name}']:.3f} (pieces {entry[f'{name}_pieces']:.0%}) "
+            for name, label in (("zlegal", "z"), ("zlegal_fit", "real z"), ("zlegal_next", "next z"),
+                                ("zlegal_masked", "masked z")):
+                if f"loss_{name}" in entry:
+                    zpred += (f"legal {label}={entry[f'loss_{name}']:.3f} (found {entry[f'{name}_found']:.0%}, "
+                              f"rejected {entry[f'{name}_rejected']:.0%}) ")
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
                 f"{zpred}K={len(rollout_weights)} "
                 f"reg={entry['anticollapse']:.3f} z_std={entry['z_std']:.3f} z_cos={entry['z_mean_cosine']:.3f} "

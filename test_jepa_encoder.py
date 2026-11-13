@@ -623,6 +623,129 @@ def test_position_decoder_reads_every_square_from_z():
         pass
 
 
+def test_z_heads_judge_predictions_with_the_head_held_fixed():
+    """
+    The heads that read only z (the position decoder, the z-level legal-move head), asked about the position's
+    own z, the predicted next z and the whole-board z predicted from the masked board. Their labels are the
+    board's; a head learns from the target encoder's z (nothing reaches the encoder that way) and is held
+    fixed while it judges a prediction (that loss reaches the predictor and the encoder, not the head).
+    """
+    kw = dict(transformer_layers=0, readout="mean", move_encoding="rank_file", orientation_edges=True,
+              decode_hidden=48, zlegal_hidden=48, zlegal_dim=24, zpred_hidden=64)
+    rnd = random.Random(2)
+    cfg = small_config("squares", **kw)
+    samples = [ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=2) for f in FENS]
+    batch = ld.collate_jepa(samples)
+    weights = [1.0, 0.5]
+
+    # the moves asked about, and their labels
+    pairs = lje.move_pairs()
+    assert pairs.shape == (1792, 2) and len({(int(a), int(b)) for a, b in pairs}) == 1792
+    head = lje.ZLegalHead(cfg)
+    assert head.num_pairs == 1792 and not [k for k in head.state_dict() if "pair" in k or "parts" in k]
+    now = head.labels(batch.legal, len(FENS))
+    for i, fen in enumerate(FENS):
+        assert {(int(a), int(b)) for a, b in pairs[now[i]]} == {(code // 64, code % 64) for code in samples[i].legal}
+        assert samples[i].legal == ld.legal_codes(chess.Board(fen, chess960=True))
+    for step in batch.rollout:
+        after = head.labels(step.legal, step.graphs.num_graphs)
+        assert int(after.sum()) == step.legal.numel() and after.shape == (step.index.numel(), 1792)
+    try:
+        head.labels(torch.tensor([0 * 64 + 11]), 1)                     # a1 to d2 is no queen or knight path
+        raise AssertionError("a move outside move_pairs() should be rejected")
+    except ValueError:
+        pass
+    z = torch.randn(3, cfg.z_dim)
+    assert head(z).shape == (3, 1792) and torch.allclose(head(z), head(2.5 * z + 1.0), atol=1e-4), "it reads z normalized"
+    assert torch.equal(lje.held_fixed(head, z), head(z))
+    loss, scores = lje.legal_scores(torch.tensor([[4.0, -4.0, -4.0, 4.0]]), torch.tensor([[True, False, False, False]]))
+    assert scores["found"] == 1.0 and abs(scores["rejected"] - 2 / 3) < 1e-6
+    assert abs(float(loss) - 0.5 * (0.0181 + (2 * 0.0181 + 4.0181) / 3)) < 1e-3, "legal and illegal weigh the same"
+
+    def build(seed=0, **weights_kw):
+        torch.manual_seed(seed)
+        return lje.LabyrinthJEPA(small_config("squares", **kw, **weights_kw))
+
+    def reached(term, *parts):
+        """Which of the parts a loss term's gradient reaches."""
+        out = []
+        for part in parts:
+            params = [p for p in part.parameters() if p.requires_grad]
+            grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+            out.append(any(g is not None and float(g.abs().sum()) > 0 for g in grads))
+        return out
+
+    base, control = build(), build(zpred_weight=1.0)
+    assert base.board_decoder is None and base.zlegal_head is None
+    arms = {
+        "decode_next": (dict(decode_next_weight=1.0), base, "board_decoder", "next_predictor"),
+        "decode_masked": (dict(decode_masked_weight=1.0, zpred_weight=1.0), control, "board_decoder", "full_predictor"),
+        "zlegal_next": (dict(zlegal_next_weight=1.0), base, "zlegal_head", "next_predictor"),
+        "zlegal_masked": (dict(zlegal_masked_weight=1.0, zpred_weight=1.0), control, "zlegal_head", "full_predictor"),
+    }
+    for name, (weights_kw, without, head_name, predictor_name) in arms.items():
+        model = build(**weights_kw)
+        theirs, ours = without.state_dict(), model.state_dict()
+        assert all(torch.equal(v, ours[k]) for k, v in theirs.items()), f"{name}: the other weights start as without it"
+        assert {k.split(".")[0] for k in set(ours) - set(theirs)} == {head_name}
+        head_module, predictor = getattr(model, head_name), getattr(model, predictor_name)
+        other = model.zlegal_head if head_name == "board_decoder" else model.board_decoder
+        assert other is None and (head_name != "board_decoder" or head_module.normalize)
+        out = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=weights)
+        fit = name.split("_")[0] + "_fit"
+        assert {name, fit} <= set(out.terms) and abs(float(sum(out.terms.values()) - out.total)) < 1e-4, name
+        assert reached(out.terms[fit], head_module, model.encoder, predictor) == [True, False, False], \
+            f"{name}: the head learns from the target encoder's z alone"
+        assert reached(out.terms[name], head_module, model.encoder, predictor) == [False, True, True], \
+            f"{name}: a prediction is judged with the head held fixed"
+        assert all(p.grad is None for p in model.target.parameters())
+        for key in (f"loss_{fit}", f"loss_{name}"):
+            assert math.isfinite(out.stats[key]) and out.stats[key] > 0, key
+        scores = ("pieces", "squares", "exact") if head_name == "board_decoder" else ("found", "rejected")
+        for key in scores:
+            assert 0 <= out.stats[f"{name}_{key}"] <= 1 and 0 <= out.stats[f"{fit}_{key}"] <= 1
+            if name.endswith("_next"):                                  # each graded step, and their weighted mean
+                each = [out.stats[f"{name}_{key}_{k}"] for k in (1, 2)]
+                assert abs(out.stats[f"{name}_{key}"] - (each[0] + 0.5 * each[1]) / 1.5) < 1e-6
+        # without a rollout the next-z term is left out and the rest still stands
+        ended = ld.collate_jepa([ld.build_sample("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", random.Random(i), cfg.mask_config())
+                                 for i in range(2)])                     # stalemate
+        o = model.losses(ended, rng=torch.Generator().manual_seed(0))
+        assert not ended.rollout and torch.isfinite(o.total) and fit in o.terms
+        assert (name in o.terms) == name.endswith("_masked")
+
+    # asked about the position's own z, a head and the encoder learn together (not a prediction)
+    for name, weights_kw, head_name in (("zlegal", dict(zlegal_weight=1.0), "zlegal_head"),
+                                        ("decode", dict(decode_weight=1.0), "board_decoder")):
+        model = build(**weights_kw)
+        theirs, ours = base.state_dict(), model.state_dict()
+        assert all(torch.equal(v, ours[k]) for k, v in theirs.items())
+        out = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=weights)
+        assert name in out.terms and name + "_fit" not in out.terms
+        assert reached(out.terms[name], getattr(model, head_name), model.encoder, model.next_predictor) == [True, True, False]
+        assert head_name != "board_decoder" or not model.board_decoder.normalize     # as in the runs before these
+    both = build(zlegal_weight=1.0, zlegal_next_weight=1.0, decode_weight=1.0, decode_masked_weight=1.0, zpred_weight=1.0)
+    out = both.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=weights)
+    assert {"zlegal", "zlegal_fit", "zlegal_next", "decode", "decode_fit", "decode_masked"} <= set(out.terms)
+    assert "zlegal_masked" not in out.terms and "decode_next" not in out.terms and both.board_decoder.normalize
+    assert abs(float(sum(out.terms.values()) - out.total)) < 1e-4
+
+    stripped = ld.collate_jepa(samples)
+    stripped.rollout[0].legal = None
+    try:
+        build(zlegal_next_weight=1.0).losses(stripped, rng=torch.Generator().manual_seed(0), rollout_weights=weights)
+        raise AssertionError("judging next positions' legal moves needs them")
+    except ValueError:
+        pass
+    for bad in (dict(decode_masked_weight=1.0), dict(zlegal_masked_weight=1.0), dict(zlegal_weight=-1.0),
+                dict(decode_next_weight=-1.0)):
+        try:
+            small_config("squares", **bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+
+
 def test_whole_board_predictor_projector_and_regularized_views():
     batch = make_batch(small_config("squares"))
     rng = lambda: torch.Generator().manual_seed(0)
