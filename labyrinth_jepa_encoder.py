@@ -57,6 +57,9 @@ For the two predicted z the head learns only from the target encoder's z of real
 reaches the encoder that way) and is held fixed while it judges a prediction, so that loss moves the
 predictor and the encoder, never the head: the board reaches the encoder only through a prediction made
 in latent space. The heads read z layer-normalized, the form the predictors are trained to produce.
+zhead_fit = "online" has a head that judges predictions learn instead from the online encoder's z of the
+whole board, with the gradient on (the own-z term, weight 1), so the board also reaches the encoder
+directly; it is still held fixed while it judges a prediction.
 
 The encoder:
 
@@ -170,6 +173,7 @@ ANTICOLLAPSE_VIEWS = ("both", "full", "masked")
 READOUTS = ("attention", "mean", "mean_max")
 GAT_STYLES = ("split", "concat")
 TOKEN_MIXERS = ("attention", "mlp", "mixer")
+ZHEAD_FITS = ("target", "online")
 MOVE_ENCODINGS = ("tokens", "squares", "rank_file")
 ROLLOUT_TARGETS = ("all", "log")
 
@@ -286,6 +290,9 @@ class JEPAConfig:
     zlegal_masked_weight: float = 0.0   # ... on the whole-board z predicted from the masked board's z
     zlegal_hidden: int = 1024           # the head's two MLPs (one for z, one for the move) have this hidden width
     zlegal_dim: int = 512               # and compare vectors of this size
+    zhead_fit: str = "target"           # what a head judging predictions learns from: "target" (the target
+                                        # encoder's z of real positions, no gradient into the encoder) or
+                                        # "online" (the online encoder's z of the whole board, gradient on)
 
     # ----- Objectives -----
     mask_weight: float = 1.0
@@ -456,6 +463,12 @@ class JEPAConfig:
         if min(self.decode_next_weight, self.decode_masked_weight, self.zlegal_weight, self.zlegal_next_weight,
                self.zlegal_masked_weight) < 0:
             raise ValueError("the z heads' weights must be at least 0")
+        if self.zhead_fit not in ZHEAD_FITS:
+            raise ValueError(f"zhead_fit must be one of {ZHEAD_FITS}")
+        if self.zhead_fit == "online" and ((self.decodes_predictions and self.decode_weight > 0)
+                                           or (self.zlegal_judges_predictions and self.zlegal_weight > 0)):
+            raise ValueError("with zhead_fit 'online' a head judging predictions already learns from the online z "
+                             "of the whole board: leave decode_weight / zlegal_weight at 0")
         if (self.decode_masked_weight > 0 or self.zlegal_masked_weight > 0) and self.zpred_weight <= 0:
             raise ValueError("decode_masked_weight and zlegal_masked_weight judge the whole-board predictor's "
                              "output: they need zpred_weight > 0")
@@ -1399,7 +1412,9 @@ class LabyrinthJEPA(nn.Module):
                                                & (to_logits.argmax(-1) == to_square)).float().mean())
 
         # ---- the board's own facts, from the online encoder's reading of the whole board ----
-        if self.count_decoder is not None or self.legal_head is not None or c.decode_weight > 0 or c.zlegal_weight > 0:
+        online_fit = c.zhead_fit == "online" and (c.decodes_predictions or c.zlegal_judges_predictions)
+        if (self.count_decoder is not None or self.legal_head is not None or c.decode_weight > 0 or c.zlegal_weight > 0
+                or online_fit):
             whole = ctx_full if ctx_full is not None else self.encoder(batch.full, rng=rng)
         if self.count_decoder is not None:
             counts = piece_counts(batch.full)
@@ -1443,10 +1458,12 @@ class LabyrinthJEPA(nn.Module):
 
         # ---- the heads that read only z, judging predicted z ----
         # The real positions a head learns from: the target encoder's z of the whole board and of the graded
-        # rollout positions (no gradient reaches the encoder). A prediction is judged with the head held fixed.
+        # rollout positions (no gradient reaches the encoder), or with zhead_fit "online" the online encoder's
+        # z of the whole board (gradient on). A prediction is judged with the head held fixed.
         graded = [(k, step, pred, w) for k, (step, pred, target_z, w)
                   in enumerate(zip(steps, predictions, target_steps, weights), start=1) if target_z is not None]
-        real_z = torch.cat([target_full.z] + [target_steps[k - 1] for k, _, _, _ in graded])
+        real_z = whole.z if online_fit else torch.cat([target_full.z] + [target_steps[k - 1] for k, _, _, _ in graded])
+        fit_steps = [] if online_fit else graded
 
         def add(name: str, weight: float, loss: torch.Tensor, scores: Dict[str, float]) -> None:
             nonlocal total
@@ -1468,7 +1485,7 @@ class LabyrinthJEPA(nn.Module):
 
         if c.decodes_predictions:
             decoder = self.board_decoder
-            real_classes = torch.cat([square_classes(batch.full)] + [square_classes(step.graphs) for _, step, _, _ in graded])
+            real_classes = torch.cat([square_classes(batch.full)] + [square_classes(step.graphs) for _, step, _, _ in fit_steps])
             add("decode_fit", 1.0, *decode_scores(decoder(real_z), real_classes))
             if c.decode_next_weight > 0 and graded:
                 add("decode_next", c.decode_next_weight, *over_steps(
@@ -1486,7 +1503,7 @@ class LabyrinthJEPA(nn.Module):
                 add("zlegal", c.zlegal_weight, *legal_scores(head(whole.z), now))
             if c.zlegal_judges_predictions:
                 after = [head.labels(step.legal, pred.size(0)) for _, step, pred, _ in graded]
-                add("zlegal_fit", 1.0, *legal_scores(head(real_z), torch.cat([now] + after)))
+                add("zlegal_fit", 1.0, *legal_scores(head(real_z), torch.cat([now] + after[:len(fit_steps)])))
                 if c.zlegal_next_weight > 0 and graded:
                     by_step = {id(step): labels for (_, step, _, _), labels in zip(graded, after)}
                     add("zlegal_next", c.zlegal_next_weight, *over_steps(

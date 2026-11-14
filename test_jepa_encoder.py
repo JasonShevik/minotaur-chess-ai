@@ -730,6 +730,32 @@ def test_z_heads_judge_predictions_with_the_head_held_fixed():
     assert "zlegal_masked" not in out.terms and "decode_next" not in out.terms and both.board_decoder.normalize
     assert abs(float(sum(out.terms.values()) - out.total)) < 1e-4
 
+    # zhead_fit "online": a head judging predictions learns from the online z of the whole board instead, so its
+    # fit term reaches the encoder too; a prediction is still judged with the head held fixed
+    for name, weights_kw, head_name, predictor_name in (
+            ("decode_next", dict(decode_next_weight=1.0), "board_decoder", "next_predictor"),
+            ("decode_masked", dict(decode_masked_weight=1.0, zpred_weight=1.0), "board_decoder", "full_predictor"),
+            ("zlegal_next", dict(zlegal_next_weight=1.0), "zlegal_head", "next_predictor")):
+        target_model, model = build(**weights_kw), build(zhead_fit="online", **weights_kw)
+        assert all(torch.equal(v, model.state_dict()[k]) for k, v in target_model.state_dict().items())
+        out = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=weights)
+        fit = name.split("_")[0] + "_fit"
+        head_module, predictor = getattr(model, head_name), getattr(model, predictor_name)
+        assert reached(out.terms[fit], head_module, model.encoder, predictor) == [True, True, False], name
+        assert reached(out.terms[name], head_module, model.encoder, predictor) == [False, True, True], name
+        assert abs(float(sum(out.terms.values()) - out.total)) < 1e-4
+        if head_name == "board_decoder":                                # the fit sees the whole board alone
+            whole = model.encoder(batch.full, rng=torch.Generator().manual_seed(0))
+            expected, _ = lje.decode_scores(model.board_decoder(whole.z), lje.square_classes(batch.full))
+            assert abs(float(out.terms[fit]) - float(expected)) < 1e-5
+    for bad in (dict(zhead_fit="both"), dict(zhead_fit="online", decode_next_weight=1.0, decode_weight=1.0),
+                dict(zhead_fit="online", zlegal_masked_weight=1.0, zpred_weight=1.0, zlegal_weight=1.0)):
+        try:
+            small_config("squares", **kw, **bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+
     stripped = ld.collate_jepa(samples)
     stripped.rollout[0].legal = None
     try:
