@@ -56,6 +56,18 @@ def test_ridge_knn_and_correlation_metrics():
     assert pl._max_abs_corr(torch.cat([x, y[:, None]], 1), y) > 0.999
 
 
+def test_logistic_probe_fits_each_label_as_if_alone():
+    """A label's logistic probe, weight decay included, does not depend on how many other labels share the call."""
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(400, 12, generator=g)
+    y = (x @ torch.randn(12, 30, generator=g) + torch.randn(400, 30, generator=g) > 0).float()
+    mask = (torch.rand(400, 30, generator=g) < 0.9).float()
+    w_all, b_all = pl.train_logistic(x, y, mask, steps=60, weight_decay=1e-2)
+    w_one, b_one = pl.train_logistic(x, y[:, :1], mask[:, :1], steps=60, weight_decay=1e-2)
+    assert float((w_all[:, :1] - w_one).abs().max()) < 1e-4 and float((b_all[:1] - b_one).abs().max()) < 1e-4
+    assert float(w_one.abs().max()) > 0.05
+
+
 def test_whitened_neighbours_hear_a_quiet_direction():
     """
     A label held in a direction of z a hundred times quieter than the others: cosine neighbours miss it, the

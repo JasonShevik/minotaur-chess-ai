@@ -445,14 +445,20 @@ def r2(pred: torch.Tensor, y: torch.Tensor) -> float:
 
 def train_logistic(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, steps: int = 300, lr: float = 0.05,
                    weight_decay: float = 1e-4) -> Tuple[torch.Tensor, torch.Tensor]:
-    """One-vs-rest logistic regression for every label column at once (mask: which entries count)."""
+    """
+    One-vs-rest logistic regression for every label column at once (mask: which entries count). The loss is
+    each column's own mean, summed over the columns, so a label is fitted, weight decay included, exactly as
+    if it were probed alone. (Until 2026-11-14 it was one mean over every entry of every column, which made
+    the decay as many times stronger as there were columns: 41 for the best moves, 121 for the puzzles.
+    Linear AUCs moved by at most about 0.01 with the change.)
+    """
     w = torch.zeros(x.size(1), y.size(1), device=x.device, requires_grad=True)
     b = torch.zeros(y.size(1), device=x.device, requires_grad=True)
     opt = torch.optim.Adam([w, b], lr=lr)
     for _ in range(steps):
         logits = x @ w + b
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, y, reduction="none")
-        loss = (loss * mask).sum() / mask.sum().clamp_min(1) + weight_decay * (w ** 2).sum()
+        loss = ((loss * mask).sum(0) / mask.sum(0).clamp_min(1)).sum() + weight_decay * (w ** 2).sum()
         opt.zero_grad()
         loss.backward()
         opt.step()
