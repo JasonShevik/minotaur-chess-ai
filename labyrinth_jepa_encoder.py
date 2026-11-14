@@ -113,7 +113,9 @@ right of the square receiving it and one when it stands to the left, so a head c
 only. (Edge features only steer attention here, so what the marks give depends on what the heads learn
 to do with them.) The square GAT layers and the masked-square predictor's read them; the unpooling layers
 do not, since they merge an edge's two directions. The weights reading the marks are drawn from their own
-random numbers, so every other weight starts as without them.
+random numbers, so every other weight starts as without them. mark_init_scale multiplies the encoder's
+(not the predictor's) starting weights on the marks, the same draw made larger: a stronger left / right
+signal from the first step, and still every other weight as without it.
 
 Spreading the embeddings. Without negatives, nothing in the prediction losses makes different
 positions get different vectors: the untrained encoder already maps every position to nearly the same
@@ -191,6 +193,7 @@ class JEPAConfig:
                                      # told its file, the one thing about where it is that the graph does not say
     orientation_edges: bool = False  # two more edge features, on the edges that run across the board: whether the
                                      # sending square stands to the right of the receiving one, or to its left
+    mark_init_scale: float = 1.0     # the encoder's starting weights on those marks, times this (the same draw)
 
     # ----- Square stage: GAT layers on the chess graph -----
     gat_dim: int = 128
@@ -418,6 +421,8 @@ class JEPAConfig:
             raise ValueError(f"rollout_targets must be one of {ROLLOUT_TARGETS}")
         if self.rollout_siblings < 1:
             raise ValueError("rollout_siblings must be at least 1")
+        if self.mark_init_scale <= 0:
+            raise ValueError("mark_init_scale must be positive")
         if self.anticollapse_views not in ANTICOLLAPSE_VIEWS:
             raise ValueError(f"anticollapse_views must be one of {ANTICOLLAPSE_VIEWS}")
         if self.gat_style not in GAT_STYLES:
@@ -537,17 +542,17 @@ def _own_generator(offset: int) -> torch.Generator:
     return torch.Generator().manual_seed(torch.initial_seed() + offset)
 
 
-def _add_inputs(linear: nn.Module, extra: int, generator: Optional[torch.Generator]) -> None:
+def _add_inputs(linear: nn.Module, extra: int, generator: Optional[torch.Generator], scale: float = 1.0) -> None:
     """
     Give a linear layer (weight [out, in]) `extra` more inputs, in place. The new columns come last and are
-    drawn from `generator`, uniformly within the range of the existing ones, so the existing weights and the
-    global random stream are what they would be without the new inputs.
+    drawn from `generator`, uniformly within the range of the existing ones (times `scale`), so the existing
+    weights and the global random stream are what they would be without the new inputs.
     """
     if extra <= 0:
         return
     weight = linear.weight.data
     bound = float(weight.abs().max())
-    new = (torch.rand(weight.size(0), extra, generator=generator) * 2 - 1) * bound
+    new = (torch.rand(weight.size(0), extra, generator=generator) * 2 - 1) * bound * scale
     linear.weight = nn.Parameter(torch.cat([weight, new.to(weight)], dim=1))
     # The layer's recorded input size is left alone: PyG's Linear re-draws a weight of that size from the global
     # stream whenever it is deep-copied (as the target encoder is), so changing it would shift every later weight
@@ -586,7 +591,7 @@ class _GATBlock(nn.Module):
     add_self_loops=False for the chess graph, which brings its own self-loops (some carry castling
     flags; see chess_graph.to_single_graph); True for unpooled graphs, which have none.
     marks > 0: the edge features carry that many more columns (with_orientation_edges), read by weights
-    drawn from mark_generator.
+    drawn from mark_generator, times mark_scale.
     summed: a branch beside the heads (for the chess graph), h + GELU(LayerNorm(GAT(h) + W sum)), where sum is
     _summed_messages: each head averages over the squares it attends to, so only the sum can tell one
     attacker from two. The branch's weights are drawn from sum_generators[0], those reading its marks from
@@ -595,15 +600,15 @@ class _GATBlock(nn.Module):
 
     def __init__(self, dim: int, heads: int, edge_dim: int, dropout: float, add_self_loops: bool = True,
                  marks: int = 0, mark_generator: Optional[torch.Generator] = None, summed: bool = False,
-                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None)):
+                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None), mark_scale: float = 1.0):
         super().__init__()
         self.gat = GATConv(dim, dim // heads, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
                            add_self_loops=add_self_loops)
-        _add_inputs(self.gat.lin_edge, marks, mark_generator)
+        _add_inputs(self.gat.lin_edge, marks, mark_generator, mark_scale)
         self.edge = self.sum_out = None
         if summed:
             self.edge = _linear_from(sum_generators[0], edge_dim, dim)
-            _add_inputs(self.edge, marks, sum_generators[1])
+            _add_inputs(self.edge, marks, sum_generators[1], mark_scale)
             self.sum_out = _linear_from(sum_generators[0], dim, dim, bias=False)
         self.norm = nn.LayerNorm(dim)
 
@@ -633,16 +638,16 @@ class _ConcatGATBlock(nn.Module):
 
     def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool,
                  residual: bool = False, marks: int = 0, mark_generator: Optional[torch.Generator] = None,
-                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None)):
+                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None), mark_scale: float = 1.0):
         super().__init__()
         self.residual = residual
         self.gat = GATConv(in_dim, in_dim, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
                            add_self_loops=False)
-        _add_inputs(self.gat.lin_edge, marks, mark_generator)     # (as _GATBlock's marks)
+        _add_inputs(self.gat.lin_edge, marks, mark_generator, mark_scale)     # (as _GATBlock's marks)
         self.edge = None
         if summed:
             self.edge = _linear_from(sum_generators[0], edge_dim, in_dim)
-            _add_inputs(self.edge, marks, sum_generators[1])
+            _add_inputs(self.edge, marks, sum_generators[1], mark_scale)
         width = (heads + 1) * in_dim
         self.norm = nn.LayerNorm(width + int(summed) * in_dim)
         self.mlp = _mlp([width, out_dim, out_dim])
@@ -723,7 +728,8 @@ class LabyrinthEncoder(nn.Module):
             g = torch.Generator().manual_seed(torch.initial_seed() + 2)
             self.file_marks = nn.Parameter((torch.rand(8, c.gat_dim, generator=g) * 2 - 1) * c.node_feature_dim ** -0.5)
         widths = c.gat_widths
-        marks = dict(marks=c.mark_dim, mark_generator=_own_generator(3) if c.mark_dim else None)
+        marks = dict(marks=c.mark_dim, mark_generator=_own_generator(3) if c.mark_dim else None,
+                     mark_scale=c.mark_init_scale)
         # The sum branch's weights, and those reading its left / right marks, each from a stream of their own:
         # a run with the branch starts from the other weights of the run without it, marks or no marks
         sums = dict(summed=c.gat_sum,

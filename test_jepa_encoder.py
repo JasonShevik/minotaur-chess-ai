@@ -998,6 +998,40 @@ def test_edge_marks_keep_the_other_weights_and_tell_left_from_right():
                                                              rng=torch.Generator().manual_seed(0)).total)
 
 
+def test_mark_init_scale_enlarges_only_the_encoders_mark_weights():
+    """
+    mark_init_scale multiplies the encoder's starting weights on the left / right marks: the same draw, made
+    larger, in both layer styles and the summed branch. The masked-square predictor's mark weights and every
+    other weight stay those of a run without it, and the encoder tells a position from its mirror image by more.
+    """
+    fen = FENS[3]
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    for kw in (dict(), dict(gat_style="concat", gat_residual=True, gat_sum=True, transformer_layers=0, readout="mean")):
+        models = {}
+        for scale in (1.0, 4.0):
+            torch.manual_seed(0)
+            models[scale] = lje.LabyrinthJEPA(small_config("squares", orientation_edges=True, mark_init_scale=scale, **kw))
+        plain, state = models[1.0].state_dict(), models[4.0].state_dict()
+        scaled = [k for k in plain if k.startswith(("encoder.square_gats", "target.square_gats"))
+                  and k.endswith(("gat.lin_edge.weight", ".edge.weight"))]
+        assert len(scaled) == (2 if kw else 1) * 2 * models[1.0].config.gat_layers
+        for k, value in plain.items():
+            if k in scaled:
+                assert torch.equal(state[k][:, :-2], value[:, :-2]) and torch.allclose(state[k][:, -2:], 4 * value[:, -2:]), k
+            else:
+                assert torch.equal(state[k], value), k
+        with torch.no_grad():
+            gap = {scale: float((lambda z: (z[0] - z[1]).norm() / z[0].norm())(m.encoder.eval()(graphs).z))
+                   for scale, m in models.items()}
+        assert gap[4.0] > gap[1.0] > 1e-5, gap
+    try:
+        small_config("squares", orientation_edges=True, mark_init_scale=0.0).validate()
+        raise AssertionError("a scale of 0 should be rejected")
+    except ValueError:
+        pass
+
+
 def test_sum_branch_keeps_the_other_weights_and_counts_neighbours():
     """
     gat_sum gives every square GAT layer a branch that sums the neighbours' messages. The heads average, so a
