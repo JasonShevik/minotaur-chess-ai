@@ -15,8 +15,11 @@ answers the predictors are graded against. Two predictors give the training sign
                      always described in the STARTING position's terms, so the rollout never sees an
                      intermediate position, only predicts it. move_encoding says how: by that
                      position's from/to square tokens, or by the squares' names (learned embeddings of
-                     the squares, or of their files and ranks); move_piece adds the moving piece's
-                     type. A curriculum lengthens it:
+                     the squares, or of their files and ranks; move_frame = "mover" gives the names
+                     in the frame of the side making each move instead, the frame of the z the move
+                     is applied to); move_piece adds the moving piece's type. predictor_input_norm
+                     layer-normalizes z where it enters a predictor: the form the targets have, and
+                     what a rollout's later steps are fed anyway. A curriculum lengthens it:
                      rollout_start_steps moves (plies) ahead at first, one more every
                      rollout_stage_positions training positions, up to rollout_max_steps (see
                      rollout_schedule). With rollout_targets = "log" only a few steps are graded (see
@@ -175,6 +178,7 @@ GAT_STYLES = ("split", "concat")
 TOKEN_MIXERS = ("attention", "mlp", "mixer")
 ZHEAD_FITS = ("target", "online")
 MOVE_ENCODINGS = ("tokens", "squares", "rank_file")
+MOVE_FRAMES = ("start", "mover")
 ROLLOUT_TARGETS = ("all", "log")
 
 
@@ -260,6 +264,14 @@ class JEPAConfig:
                                      # per from square and per to square) or "rank_file" (learned embeddings of
                                      # their files and ranks); the last two name squares in the side to move's frame
     move_piece: bool = False         # also tell it the moving piece's type
+    move_frame: str = "start"        # the frame named squares ("squares" / "rank_file") are given in: "start" (the
+                                     # starting position's, at every step, so on the other side's moves the ranks
+                                     # run against the z the move is applied to) or "mover" (the side making the
+                                     # move: the frame of that z, and one rule for every step)
+    predictor_input_norm: bool = False   # layer-normalize z where it enters the next-position, whole-board and
+                                         # move predictors. Their targets are layer-normalized and a rollout's later
+                                         # steps are fed the previous prediction, so with raw z the first step alone
+                                         # reads another scale and the "+ z" of a residual predictor starts off it
 
     # ----- Move predictor (inverse dynamics): z before and after a move -> the move's from/to squares -----
     inverse_weight: float = 0.0      # its loss weight; 0 leaves the predictor out
@@ -456,6 +468,11 @@ class JEPAConfig:
             raise ValueError(f"move_encoding must be one of {MOVE_ENCODINGS}")
         if self.move_encoding == "rank_file" and self.d_model % 2:
             raise ValueError("move_encoding 'rank_file' needs an even d_model")
+        if self.move_frame not in MOVE_FRAMES:
+            raise ValueError(f"move_frame must be one of {MOVE_FRAMES}")
+        if self.move_frame == "mover" and self.move_encoding == "tokens":
+            raise ValueError("move_frame 'mover' needs named squares (move_encoding 'squares' or 'rank_file'): "
+                             "the square tokens exist only in the starting position's frame")
         if self.inverse_weight < 0:
             raise ValueError("inverse_weight must be at least 0")
         if self.count_weight < 0 or self.legal_weight < 0 or self.decode_weight < 0:
@@ -927,6 +944,7 @@ class NextPredictor(nn.Module):
     the previous rollout step) and the move. The move's squares are described in the starting position's
     terms (move_encoding: its square tokens, or the squares' names), and a learned embedding of the step
     number tells the predictor which side is moving and how far the board has drifted from that position.
+    With move_frame "mover" the names are in the moving side's frame instead: ranks flipped on even steps.
     """
 
     def __init__(self, config: JEPAConfig):
@@ -944,13 +962,16 @@ class NextPredictor(nn.Module):
         self.body = _mlp([c.z_dim + c.move_dim] + [c.next_hidden] * c.next_layers + [c.z_dim])
 
     def describe_squares(self, squares: torch.Tensor, move_from: torch.Tensor,
-                         move_to: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                         move_to: torch.Tensor, step: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
         """squares [B*64, d_model] (the starting positions' tokens), move_from / move_to [B_k] node indices
-        (b*64 + square) -> the from and to squares as the predictor reads them, [B_k, d_model] each."""
+        (b*64 + square, in the starting position's frame), step: which rollout step the move is
+        -> the from and to squares as the predictor reads them, [B_k, d_model] each."""
         encoding = self.config.move_encoding
         if encoding == "tokens":
             return squares[move_from], squares[move_to]
         a, b = move_from % 64, move_to % 64
+        if self.config.move_frame == "mover" and step % 2 == 0:     # the other side's move: its ranks run the other way
+            a, b = a ^ 56, b ^ 56
         if encoding == "squares":
             return self.names[0](a), self.names[1](b)
         return (torch.cat([self.names[0](a % 8), self.names[1](a // 8)], dim=-1),
@@ -963,6 +984,8 @@ class NextPredictor(nn.Module):
         if self.piece is not None:
             move = move + self.piece(piece)
         move = move + self.step.weight[step]
+        if self.config.predictor_input_norm:
+            z = F.layer_norm(z, z.shape[-1:])
         change = self.body(torch.cat([z, move], dim=-1))
         return z + change if self.config.next_residual else change      # residual: predict the change
 
@@ -978,9 +1001,12 @@ class FullPredictor(nn.Module):
     def __init__(self, config: JEPAConfig):
         super().__init__()
         c = config
+        self.normalize = c.predictor_input_norm
         self.body = _mlp([c.z_dim] + [c.zpred_hidden] * (c.zpred_layers - 1) + [c.z_dim])
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if self.normalize:
+            z = F.layer_norm(z, z.shape[-1:])
         return z + self.body(z)                                # residual: predict what the mask hid
 
 
@@ -995,10 +1021,13 @@ class MovePredictor(nn.Module):
     def __init__(self, config: JEPAConfig):
         super().__init__()
         c = config
+        self.normalize = c.predictor_input_norm
         self.body = _mlp([2 * c.z_dim, c.inverse_hidden, 128])
 
     def forward(self, z: torch.Tensor, z_next: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """-> logits over the from square and over the to square, [B, 64] each."""
+        if self.normalize:
+            z = F.layer_norm(z, z.shape[-1:])
         logits = self.body(torch.cat([z, F.layer_norm(z_next, z_next.shape[-1:])], dim=-1))
         return logits[:, :64], logits[:, 64:]
 
@@ -1320,7 +1349,7 @@ class LabyrinthJEPA(nn.Module):
         flat = squares.reshape(-1, squares.size(-1))
         source, predictions = z, []
         for k, step in enumerate(steps, start=1):
-            from_square, to_square = self.next_predictor.describe_squares(flat, step.move_from, step.move_to)
+            from_square, to_square = self.next_predictor.describe_squares(flat, step.move_from, step.move_to, k)
             pred = self.next_predictor(source[step.parent], from_square, to_square, step.promotion, step.flags,
                                        step.piece, k)
             predictions.append(pred)

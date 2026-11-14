@@ -1305,6 +1305,77 @@ def test_dehb_search_space_samples_build():
         assert torch.isfinite(model.losses(make_batch(cfg, FENS[:2]), rng=torch.Generator().manual_seed(0)).total)
 
 
+def test_predictors_can_read_z_layer_normalized():
+    """
+    predictor_input_norm layer-normalizes z where it enters the next-position, whole-board and move predictors:
+    no new weights, and a prediction no longer depends on z's own scale or offset (with raw z it does).
+    """
+    states, preds = {}, {}
+    for norm in (False, True):
+        cfg = small_config("squares", predictor_input_norm=norm, zpred_weight=1.0, inverse_weight=1.0)
+        torch.manual_seed(0)
+        model = lje.LabyrinthJEPA(cfg).eval()
+        states[norm] = model.state_dict()
+        batch = make_batch(cfg)
+        first = batch.rollout[0]
+        with torch.no_grad():
+            ctx = model.encoder(batch.full)
+            for name, z in (("z", ctx.z), ("moved", 2.5 * ctx.z + 0.3)):
+                preds[norm, name] = (model.predict_rollout(z, ctx.squares, batch.rollout[:1])[0], model.full_predictor(z),
+                                     torch.cat(model.move_predictor(z[first.index], ctx.z[first.index])))
+        assert torch.isfinite(model.losses(batch, rng=torch.Generator().manual_seed(0)).total)
+    assert all(torch.equal(v, states[True][k]) for k, v in states[False].items())
+    for a, b in zip(preds[True, "z"], preds[True, "moved"]):
+        assert float((a - b).abs().max()) < 1e-3
+    for a, b in zip(preds[False, "z"], preds[False, "moved"]):
+        assert float((a - b).abs().max()) > 1e-2
+    # normalized, the residual predictors add their output to the normalized z
+    cfg = small_config("squares", predictor_input_norm=True, zpred_weight=1.0)
+    model = lje.LabyrinthJEPA(cfg).eval()
+    with torch.no_grad():
+        z = model.encoder(make_batch(cfg).full).z
+        normed = torch.nn.functional.layer_norm(z, z.shape[-1:])
+        assert torch.allclose(model.full_predictor(z), normed + model.full_predictor.body(normed), atol=1e-6)
+
+
+def test_named_moves_can_be_given_in_the_movers_frame():
+    """
+    move_frame "mover": on even steps (the other side's moves) the named squares have their ranks flipped, so
+    every move is named in the frame of the z it is applied to. Odd steps and the weights are unchanged.
+    """
+    move_from, move_to = torch.tensor([12, 64 + 57]), torch.tensor([28, 64 + 42])
+    flip = lambda nodes: (nodes // 64) * 64 + ((nodes % 64) ^ 56)
+    for encoding in ("squares", "rank_file"):
+        models = {}
+        for frame in lje.MOVE_FRAMES:
+            torch.manual_seed(0)
+            models[frame] = lje.LabyrinthJEPA(small_config("squares", move_encoding=encoding, move_frame=frame,
+                                                           rollout_max_steps=3)).eval()
+        assert all(torch.equal(v, models["mover"].state_dict()[k]) for k, v in models["start"].state_dict().items())
+        start, mover = models["start"].next_predictor, models["mover"].next_predictor
+        squares = torch.zeros(128, 32)                                  # named squares never read the tokens
+        with torch.no_grad():
+            for step in (1, 2, 3):
+                a = start.describe_squares(squares, move_from, move_to, step)
+                b = mover.describe_squares(squares, move_from, move_to, step)
+                assert all(torch.equal(x, y) for x, y in zip(a, b)) == (step % 2 == 1), (encoding, step)
+            flipped = start.describe_squares(squares, flip(move_from), flip(move_to), 2)
+            assert all(torch.equal(x, y) for x, y in zip(flipped, mover.describe_squares(squares, move_from, move_to, 2)))
+        rnd = random.Random(0)
+        cfg = models["mover"].config
+        batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=2) for f in FENS[:4]])
+        both = [m.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0, 1.0]) for m in models.values()]
+        assert all(torch.isfinite(l.total) for l in both)
+        assert abs(both[0].stats["loss_next_1"] - both[1].stats["loss_next_1"]) < 1e-6      # step 1: the same frame
+        assert abs(both[0].stats["loss_next_2"] - both[1].stats["loss_next_2"]) > 1e-7      # step 2: ranks flipped
+    for bad in (dict(move_frame="mover"), dict(move_encoding="squares", move_frame="white")):
+        try:
+            small_config("squares", **bad).validate()                   # the tokens have only the starting frame
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+
+
 def test_next_predictor_can_predict_the_next_z_outright():
     """next_residual = False drops the "+ z": same weights, and the two predictions differ by exactly z."""
     outputs = {}
