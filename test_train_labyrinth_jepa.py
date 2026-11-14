@@ -203,6 +203,22 @@ def test_schedules_and_weight_decay_groups():
     assert len(decay_names) + len(no_decay_names) == len(model.trainable_parameters())
 
 
+def test_evaluations_use_one_random_draw_of_the_validation_split():
+    run = tj.RunConfig(eval_positions=50, val_loss_batches=2)
+    eval_rows, val_rows = tj.evaluation_positions(run, 1000, 16)
+    assert len(eval_rows) == 50 and len(set(eval_rows)) == 50 and val_rows == eval_rows[:32]
+    assert max(eval_rows) > 100, "not the split's first rows"
+    assert tj.evaluation_positions(replace(run, seed=5), 1000, 16) == (eval_rows, val_rows)     # the same in every run
+    assert tj.evaluation_positions(replace(run, eval_subset="first"), 1000, 16) == (list(range(50)), list(range(32)))
+    small_eval, small_val = tj.evaluation_positions(run, 20, 16)                                # a split smaller than asked
+    assert sorted(small_eval) == list(range(20)) and len(small_val) == 20
+    try:
+        tj.evaluation_positions(replace(run, eval_subset="last"), 1000, 16)
+        raise AssertionError("an unknown eval_subset should be rejected")
+    except ValueError:
+        pass
+
+
 def test_parameter_parts_and_snapshot_steps():
     for variant in lje.TOKEN_VARIANTS:
         parts = {n: tj.parameter_part(n) for n, _ in lje.LabyrinthJEPA(tiny_config(variant)).named_parameters()

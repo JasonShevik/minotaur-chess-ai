@@ -97,6 +97,9 @@ class RunConfig:
     eval_mask_min_ratio: float = 0.05                # members also get a fresh light mask, as LiDAR does for
     eval_mask_max_ratio: float = 0.15                # I-JEPA, so variants without unpooling are measured fairly
     val_loss_batches: int = 8
+    eval_subset: str = "random"                      # the validation rows evaluations use: "random" (one fixed draw,
+                                                     # the same in every run) or "first" (the split's first rows, which
+                                                     # are sorted by FEN and endgame-heavy; all runs before 2026-11-14)
     checkpoint_every: int = 2_000                    # 0: only at the end
     resume: bool = True
     seed: int = 0
@@ -191,6 +194,27 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
         metrics.update({k: v / max(1, n) for k, v in sums.items()})
     model.train(was_training)
     return metrics
+
+
+EVAL_SUBSET_SEED = 20261114      # one draw for every run and seed, so evaluations compare across runs
+
+
+def evaluation_positions(run: RunConfig, val_size: int, batch_size: int) -> Tuple[List[int], List[int]]:
+    """
+    The validation rows an evaluation uses: (for RankMe / LiDAR / self-consistency, for the validation losses).
+    eval_subset "random": a fixed random draw of the split, the same for every run and seed. "first": the
+    split's first rows; the split is sorted by FEN, so those are endgame-heavy (about 18 pieces a position
+    against 24 for a random draw). Every run before 2026-11-14 used "first": their validation losses, RankMe
+    and LiDAR compare with each other, not with "random" runs. The probes always drew random positions.
+    """
+    n_eval, n_val = min(run.eval_positions, val_size), min(val_size, run.val_loss_batches * batch_size)
+    if run.eval_subset == "first":
+        order = list(range(max(n_eval, n_val)))
+    elif run.eval_subset == "random":
+        order = random.Random(EVAL_SUBSET_SEED).sample(range(val_size), max(n_eval, n_val))
+    else:
+        raise ValueError("eval_subset must be 'random' or 'first'")
+    return order[:n_eval], order[:n_val]
 
 
 def build_probes(run: RunConfig, val_dataset: ld.PositionDataset, log: Callable[[str], None] = print,
@@ -402,10 +426,11 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     if len(loader) == 0:
         raise ValueError(f"the training set ({len(loader.dataset)} positions) is smaller than one batch ({batch_size})")
     val_dataset = ld.PositionDataset(run.cache_dir, "val")
-    eval_fens = [val_dataset.fen(i) for i in range(min(run.eval_positions, len(val_dataset)))]
-    n_val = min(len(val_dataset), run.val_loss_batches * batch_size)
+    eval_rows, val_rows = evaluation_positions(run, len(val_dataset), batch_size)
+    eval_fens = [val_dataset.fen(i) for i in eval_rows]
+    n_val = len(val_rows)
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
-                               seed=run.seed + 1, shuffle=False, indices=list(range(n_val)),
+                               seed=run.seed + 1, shuffle=False, indices=val_rows,
                                siblings=config.rollout_siblings) if n_val else None
 
     # Evaluation and probes encode no more positions at once than a training step does: the unpool
