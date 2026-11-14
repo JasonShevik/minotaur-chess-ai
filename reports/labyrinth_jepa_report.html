@@ -1,0 +1,664 @@
+<title>Labyrinth JEPA Findings</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: one reading column (~68ch) with wider breakout tables and figures; sections follow the investigation's themes, not its calendar */
+:root {
+  --bg: #f5f7f5;
+  --surface: #ffffff;
+  --fg: #17201b;
+  --muted: #56635b;
+  --rule: #d3dbd6;
+  --accent: #2a6a4b;
+  --accent-soft: #e2eee7;
+  --amber: #8e6110;
+  --amber-soft: #f5ead3;
+  --pos: #2a7a4a;
+  --neg: #ad4237;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-head: "IBM Plex Sans Condensed", "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111614; --surface: #171e1a; --fg: #e2e9e4; --muted: #9ba79f; --rule: #2a3530;
+    --accent: #7cc6a0; --accent-soft: #1b2a22; --amber: #e2b45c; --amber-soft: #2a2416;
+    --pos: #7cc6a0; --neg: #e8877b;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111614; --surface: #171e1a; --fg: #e2e9e4; --muted: #9ba79f; --rule: #2a3530;
+  --accent: #7cc6a0; --accent-soft: #1b2a22; --amber: #e2b45c; --amber-soft: #2a2416;
+  --pos: #7cc6a0; --neg: #e8877b;
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-body); font-size: 16px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 80px;
+}
+main { max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; gap: 56px; }
+.col { max-width: 68ch; }
+header { display: flex; flex-direction: column; gap: 14px; }
+.eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+h1, h2, h3 { font-family: var(--font-head); text-wrap: balance; line-height: 1.15; margin: 0; }
+h1 { font-size: clamp(34px, 6vw, 52px); font-weight: 700; letter-spacing: -0.01em; }
+h2 { font-size: 30px; font-weight: 600; }
+h3 { font-size: 20px; font-weight: 600; margin-top: 8px; }
+.lede { font-size: 19px; color: var(--fg); margin: 0; }
+.meta { font-family: var(--font-mono); font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px; }
+p { margin: 0; }
+section { display: flex; flex-direction: column; gap: 16px; scroll-margin-top: 16px; }
+.sec-num { font-family: var(--font-mono); font-size: 13px; color: var(--muted); letter-spacing: 0.06em; }
+ul, ol { margin: 0; padding-left: 1.3em; display: flex; flex-direction: column; gap: 8px; }
+li::marker { color: var(--muted); }
+a { color: var(--accent); text-underline-offset: 3px; }
+a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+code, .mono { font-family: var(--font-mono); font-size: 0.88em; }
+.tri { font-family: var(--font-mono); font-size: 0.88em; white-space: nowrap; font-variant-numeric: tabular-nums; }
+nav.toc { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding-block: 16px; }
+nav.toc ol { columns: 2 260px; column-gap: 32px; display: block; padding-left: 0; list-style: none; counter-reset: toc; }
+nav.toc li { break-inside: avoid; padding-block: 3px; counter-increment: toc; }
+nav.toc li::before { content: counter(toc) "  "; font-family: var(--font-mono); font-size: 12px; color: var(--muted); }
+.findings { display: flex; flex-direction: column; gap: 0; padding: 0; list-style: none; counter-reset: f; }
+.findings li { display: grid; grid-template-columns: 2.2em 1fr; gap: 4px 10px; padding-block: 14px; border-top: 1px solid var(--rule); counter-increment: f; }
+.findings li::before { content: counter(f); font-family: var(--font-head); font-weight: 700; font-size: 22px; color: var(--accent); line-height: 1.2; }
+.findings li > div { min-width: 0; }
+.findings strong { font-weight: 600; }
+.verdict { background: var(--accent-soft); border-radius: 6px; padding: 14px 18px; display: flex; flex-direction: column; gap: 6px; }
+.verdict .label, .note .label { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.note { background: var(--amber-soft); border-radius: 6px; padding: 14px 18px; display: flex; flex-direction: column; gap: 6px; }
+.note .label { color: var(--amber); }
+.table-wrap { overflow-x: auto; max-width: 100%; }
+table { border-collapse: collapse; font-size: 14px; width: 100%; font-variant-numeric: tabular-nums; }
+caption { text-align: left; font-size: 13px; color: var(--muted); padding-bottom: 8px; caption-side: top; }
+th, td { text-align: left; padding: 7px 12px 7px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 600; font-size: 12.5px; color: var(--muted); border-bottom: 1px solid var(--fg); white-space: nowrap; }
+td.num, th.num { text-align: right; padding-left: 12px; padding-right: 0; }
+td .tri { font-size: 13px; }
+tr.ref td { color: var(--muted); }
+tr.best td { font-weight: 600; }
+.up { color: var(--pos); }
+.down { color: var(--neg); }
+figure { margin: 0; display: flex; flex-direction: column; gap: 10px; }
+figcaption { font-size: 13.5px; color: var(--muted); max-width: 68ch; }
+.figure-box { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 16px; overflow-x: auto; }
+svg text { font-family: var(--font-body); }
+.diagram .box { fill: var(--surface); stroke: var(--fg); stroke-width: 1.2; }
+.diagram .box.target { stroke-dasharray: 5 3; }
+.diagram .box.head { stroke: var(--amber); }
+.diagram .t { fill: var(--fg); font-size: 13px; font-weight: 600; }
+.diagram .s { fill: var(--muted); font-size: 11.5px; }
+.diagram .wire { stroke: var(--muted); stroke-width: 1.4; fill: none; }
+.diagram .wire.jepa { stroke: var(--accent); stroke-width: 2; }
+.diagram .wire.headw { stroke: var(--amber); stroke-width: 2; }
+.diagram .loss-j { fill: var(--accent); font-size: 12.5px; font-weight: 600; }
+.diagram .loss-h { fill: var(--amber); font-size: 12.5px; font-weight: 600; }
+.diagram .dot-j { fill: var(--accent); }
+.diagram .dot-h { fill: var(--amber); }
+.chart .grid { stroke: var(--rule); stroke-width: 1; }
+.chart .axis-t { fill: var(--muted); font-size: 11.5px; font-family: var(--font-mono); }
+.chart .ref { stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 4 4; }
+.chart .ref-t { fill: var(--muted); font-size: 11.5px; }
+.chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .end-t { fill: var(--fg); font-size: 12.5px; }
+.chart .end-v { fill: var(--muted); font-size: 12px; font-family: var(--font-mono); }
+.chart .cross { stroke: var(--muted); stroke-width: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 18px; height: 2px; display: inline-block; border-radius: 1px; }
+.chart-wrap { position: relative; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; font-size: 12.5px; box-shadow: 0 2px 8px rgba(0,0,0,0.12); min-width: 160px; }
+.tip .tt { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+.tip .row { display: flex; justify-content: space-between; gap: 14px; align-items: center; }
+.tip .row span:first-child { display: inline-flex; align-items: center; gap: 6px; }
+.tip i { width: 10px; height: 2px; display: inline-block; }
+details { font-size: 14px; }
+summary { cursor: pointer; color: var(--accent); }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px 28px; }
+.two > div { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.two h4 { font-family: var(--font-head); font-size: 16px; margin: 0; font-weight: 600; }
+.kicker { font-size: 14px; color: var(--muted); }
+dl.gloss { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin: 0; font-size: 14.5px; }
+dl.gloss dt { font-family: var(--font-mono); font-size: 13px; color: var(--accent); }
+dl.gloss dd { margin: 0; min-width: 0; }
+@media (max-width: 560px) {
+  dl.gloss { grid-template-columns: 1fr; }
+  dl.gloss dd { margin-bottom: 8px; }
+  h2 { font-size: 26px; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+
+<main>
+<header>
+  <div class="eyebrow">Minotaur · Labyrinth encoder · research log</div>
+  <h1>Labyrinth JEPA Findings</h1>
+  <p class="lede col">What 131 training runs taught us about building a chess position encoder with joint-embedding predictive objectives: which architectures, predictors and objectives mattered, which did not, and why the only clear gains so far came from heads that check z against the board itself.</p>
+  <div class="meta">
+    <span>Steps 3 to 17</span><span>24 Oct to 14 Nov 2026</span><span>131 runs</span>
+    <span>Data: reports/minotaur_jepa_experiments.xlsx</span>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Contents">
+  <ol>
+    <li><a href="#short">The short version</a></li>
+    <li><a href="#setup">The encoder and how we judge it</a></li>
+    <li><a href="#problem">The problem that framed everything</a></li>
+    <li><a href="#arch">Encoder architectures</a></li>
+    <li><a href="#pred">Predictors and objective settings</a></li>
+    <li><a href="#lr">Left and right</a></li>
+    <li><a href="#heads">Heads graded by the board</a></li>
+    <li><a href="#jepa">Are the heads still JEPA?</a></li>
+    <li><a href="#score">What is ruled out, what holds</a></li>
+    <li><a href="#next">Open questions and next steps</a></li>
+    <li><a href="#appendix">Run names and the spreadsheet</a></li>
+  </ol>
+</nav>
+
+<section id="short">
+  <div class="sec-num">1</div>
+  <h2>The short version</h2>
+  <ol class="findings col">
+    <li><div><strong>The JEPA objectives on their own have never produced a z that beats an untrained encoder.</strong> Across every architecture, predictor and regularizer setting, training drained material and value information from z. The one exception, raw nearest-neighbour scores, turned out to be features getting louder, not richer. The design choices changed how much z drained, not whether.</div></li>
+    <li><div><strong>C is the most reliable encoder:</strong> three GAT layers on the chess graph, a mean over the 64 square tokens, no transformer. The encoder transformer and attention readout did most of the early damage. Concat GATs, MLP stacks, a mixer, unpooling and a sum branch never beat C on z.</div></li>
+    <li><div><strong>Predictor design barely matters.</strong> How moves are described, masked squares versus masked z, predictor size, residual or not, and 2-ply versus 20-ply rollouts each moved z by 0.04 or less, which is within noise.</div></li>
+    <li><div><strong>Per-square information never drains; summaries do.</strong> Every square token still knows its piece in every trained run. What disappears is board-level information such as who is ahead. The objective rewards a slow, easily predicted summary of the board, mostly game phase.</div></li>
+    <li><div><strong>The only things that moved z upward are heads graded against the board.</strong> The legal-move head was the first change that was positive on every probe at every seed. Its z-level form was the first setup to beat its untrained start on all three eval readings, and with 16,000 steps both it and the decoder clearly beat the untrained encoder on best move. Training longer without a head changes nothing.</div></li>
+    <li><div><strong>The decoder is a trade.</strong> It pushes z toward holding the literal board: left/right aware, better on best move, worse on nearest-neighbour material and eval.</div></li>
+    <li><div><strong>The encoder is mirror-blind by construction.</strong> Edge marks give it a cheap left/right signal, but z only keeps that signal when a head pays for it. G1r's blindness was a stuck point in early training, not a missing capability.</div></li>
+    <li><div><strong>The heads are not JEPA in the strict sense.</strong> They compare z with ground truth, not with the target encoder's vector. In chess that may be fine, since the board has no irrelevant detail, but it means the progress so far came from outside the JEPA framework.</div></li>
+  </ol>
+</section>
+
+<section id="setup">
+  <div class="sec-num">2</div>
+  <h2>The encoder and how we judge it</h2>
+  <p class="col">The input is a chess position as a graph. The 64 squares are nodes with piece features in the side to move's frame. Each pair of squares that a queen line, knight jump, pawn move or castling path connects shares one edge with multi-hot relation types. There are no square IDs, by design, so the encoder cannot tell a position from its file-mirror image unless something breaks the symmetry.</p>
+  <p class="col">In C, each GAT layer updates a square's token with an attention-weighted mean of its neighbours (edge types shift the attention, they do not enter the message) inside a residual, layer-normed block. After three layers the tokens are projected to width 256, averaged, and mapped to z, a 1,024-number position vector. Because z is a linear map of a 256-wide mean, at most 256 of its directions are independent.</p>
+  <p class="col">Training follows the JEPA pattern. The online encoder is trained by gradients. A target encoder is a slowly moving average of the online one and supplies the answers. Three predictors turn online outputs into guesses about target outputs: the hidden squares' tokens from a masked board, the z after a sequence of random legal moves (a latent rollout), and the whole board's z from the masked board's z. SIGReg keeps z spread out so the encoder cannot collapse to a constant. Later steps added heads that read z and are graded against facts of the board (legal moves, pieces), shown in amber below.</p>
+
+  <figure>
+    <div class="figure-box">
+      <svg class="diagram" viewBox="0 0 760 330" width="100%" role="img" aria-labelledby="dg-t dg-d" style="min-width:620px">
+        <title id="dg-t">Training setup</title>
+        <desc id="dg-d">The online encoder reads the context board and produces z and tokens; predictors guess the target encoder's outputs for the hidden or next board, and a JEPA loss compares the two vectors. Heads read z and are compared with board facts.</desc>
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker>
+        </defs>
+        <!-- heads row -->
+        <rect class="box head" x="400" y="16" width="160" height="50" rx="5"/>
+        <text class="t" x="480" y="37" text-anchor="middle">Heads on z</text>
+        <text class="s" x="480" y="54" text-anchor="middle">legal moves · decoder</text>
+        <rect class="box head" x="600" y="16" width="148" height="50" rx="5"/>
+        <text class="t" x="674" y="37" text-anchor="middle">Board facts</text>
+        <text class="s" x="674" y="54" text-anchor="middle">from the rules</text>
+        <line class="wire headw" x1="560" y1="41" x2="596" y2="41" marker-end="url(#arr)"/>
+        <text class="loss-h" x="580" y="88" text-anchor="middle">head loss: z vs ground truth</text>
+        <!-- online row -->
+        <rect class="box" x="10" y="120" width="128" height="50" rx="5"/>
+        <text class="t" x="74" y="141" text-anchor="middle">Context board</text>
+        <text class="s" x="74" y="158" text-anchor="middle">masked or current</text>
+        <rect class="box" x="166" y="120" width="150" height="50" rx="5"/>
+        <text class="t" x="241" y="141" text-anchor="middle">Online encoder</text>
+        <text class="s" x="241" y="158" text-anchor="middle">3 GAT layers → mean</text>
+        <rect class="box" x="344" y="120" width="70" height="50" rx="5"/>
+        <text class="t" x="379" y="141" text-anchor="middle">z</text>
+        <text class="s" x="379" y="158" text-anchor="middle">+ tokens</text>
+        <rect class="box" x="442" y="120" width="196" height="50" rx="5"/>
+        <text class="t" x="540" y="141" text-anchor="middle">Predictors</text>
+        <text class="s" x="540" y="158" text-anchor="middle">masked · next (+ move) · whole</text>
+        <line class="wire" x1="138" y1="145" x2="162" y2="145" marker-end="url(#arr)"/>
+        <line class="wire" x1="316" y1="145" x2="340" y2="145" marker-end="url(#arr)"/>
+        <line class="wire" x1="414" y1="145" x2="438" y2="145" marker-end="url(#arr)"/>
+        <path class="wire headw" d="M379 120 V92 H452 V70" marker-end="url(#arr)"/>
+        <!-- target row -->
+        <rect class="box target" x="10" y="258" width="128" height="50" rx="5"/>
+        <text class="t" x="74" y="279" text-anchor="middle">Hidden or next</text>
+        <text class="s" x="74" y="296" text-anchor="middle">board</text>
+        <rect class="box target" x="166" y="258" width="150" height="50" rx="5"/>
+        <text class="t" x="241" y="279" text-anchor="middle">Target encoder</text>
+        <text class="s" x="241" y="296" text-anchor="middle">moving average</text>
+        <rect class="box target" x="344" y="258" width="70" height="50" rx="5"/>
+        <text class="t" x="379" y="279" text-anchor="middle">target</text>
+        <text class="s" x="379" y="296" text-anchor="middle">z, tokens</text>
+        <line class="wire" x1="138" y1="283" x2="162" y2="283" marker-end="url(#arr)"/>
+        <line class="wire" x1="316" y1="283" x2="340" y2="283" marker-end="url(#arr)"/>
+        <path class="wire" d="M241 170 V254" stroke-dasharray="3 4" marker-end="url(#arr)"/>
+        <text class="s" x="250" y="216">weights copied slowly</text>
+        <!-- JEPA comparison -->
+        <path class="wire jepa" d="M638 145 H690 V205"/>
+        <path class="wire jepa" d="M414 283 H690 V227"/>
+        <circle class="dot-j" cx="690" cy="216" r="9"/>
+        <text class="loss-j" x="676" y="248" text-anchor="end">JEPA loss: vector vs vector</text>
+      </svg>
+    </div>
+    <figcaption>Training setup. Green: the JEPA losses compare a prediction with the target encoder's vector. Amber: the heads added in steps 9 to 17 compare z with facts computed from the rules. Section 8 comes back to this difference.</figcaption>
+  </figure>
+
+  <h3>How we judge an encoder</h3>
+  <p class="col">The training losses cannot rank encoders, because the encoder makes its own targets. We freeze the target encoder and probe its z on positions it never trained on:</p>
+  <ul class="col">
+    <li><strong>Material</strong>: material balance (R², 8,000 validation positions).</li>
+    <li><strong>Eval</strong>: the engine's win probability for the side to move (R², 8,000 analysed positions).</li>
+    <li><strong>Themes</strong>: puzzle themes (AUC).</li>
+    <li><strong>Best move</strong>: the engine's best move (AUC). Labels are in the side to move's frame but still tell the files apart, so this is the one headline probe where left and right matter.</li>
+  </ul>
+  <p class="col">Each probe is read three ways, always written in this order: a linear probe, k nearest neighbours by cosine (kNN), and kNN after whitening z's top 64 directions. Raw kNN mixes how loud a feature is with whether it is there at all; whitening separates the two. Two baselines anchor every number: the same encoder untrained (its random initial weights) and a one-hot encoding of the board. Square tokens get their own probes (attacked, defended, en prise, pinned, legal destination, local balance, mobility), and a left/right check reads which half of the board the king is on.</p>
+  <div class="note col">
+    <div class="label">Noise</div>
+    <p>A seed study in step 4 found single-seed differences under about 0.1 untrustworthy between unpaired runs (C's material linear ranged 0.71 to 0.82 over three seeds). Paired arms share the seed, initial weights and data order, so their differences are good to about 0.02. Most arms ran on one seed; the ones that matter most got three.</p>
+  </div>
+  <p class="col">We also tracked RankMe and LiDAR, two label-free measures of how spread out z is. They turned out to rank encoders roughly opposite to the probes: the MLP-Mixer had the highest LiDAR and the worst neighbours, and the legal-move head halved RankMe while every probe rose. That is why the planned hyperparameter search (DEHB, scored by LiDAR) is still on hold.</p>
+</section>
+
+<section id="problem">
+  <div class="sec-num">3</div>
+  <h2>The problem that framed everything</h2>
+  <p class="col">The first probes, on 26 October, found every trained encoder below its own untrained version on nearly every probe: material R² 0.41 to 0.55 against 0.96 untrained, eval 0.36 to 0.49 against 0.56. A one-hot board beat everything on best move. Training was making z worse at describing chess.</p>
+  <p class="col">Every step after that was an attempt to find where the information goes and why. Along the way we learned five things about the mechanism that hold across almost every run:</p>
+  <ol class="col">
+    <li><strong>Per-square information does not drain.</strong> The piece on each square is linearly readable at about 1.00 from every layer of every run, including the collapsed ones.</li>
+    <li><strong>Summable information does drain.</strong> Material read from the mean of the tokens falls layer by layer in training (C: 0.98, 0.91, 0.79 after the three layers), even though each token still knows its piece.</li>
+    <li><strong>z is mostly game phase.</strong> At initialization about 97% of z's variance follows the total piece counts and about 2% follows who is ahead, in every architecture. Training keeps phase and lets "who is ahead" fade. Phase changes slowly over random moves, so it is the easiest thing for a latent rollout to predict.</li>
+    <li><strong>Raw kNN mixes loudness with content.</strong> After whitening, G1r's material kNN goes from 0.02 to 0.39, C's from 0.43 to 0.59, and the untrained encoder's to 0.69. Several "collapses" were features that became quiet rather than absent.</li>
+    <li><strong>Losses fall while probes fall.</strong> Because the encoder makes its own targets, the predictors' tasks get easier as z gets simpler. Lower loss was never evidence of a better encoder.</li>
+  </ol>
+</section>
+
+<section id="arch">
+  <div class="sec-num">4</div>
+  <h2>Encoder architectures</h2>
+  <p class="col">Steps 3 to 7 and 13 tested the encoder's shape. The table gathers each family's seed-0 run on one fixed probe set.</p>
+  <div class="table-wrap">
+    <table>
+      <caption>z probes, seed 0, 4,000 steps. Material and eval as linear / kNN / whitened kNN. Dashes: whitened kNN did not exist when the run was probed.</caption>
+      <thead><tr><th>Encoder</th><th>What it is</th><th class="num">Material</th><th class="num">Eval</th></tr></thead>
+      <tbody>
+        <tr class="ref"><td>Untrained</td><td>C's random initial weights</td><td class="num"><span class="tri">0.97 / 0.35 / 0.72</span></td><td class="num"><span class="tri">0.53 / 0.32 / 0.47</span></td></tr>
+        <tr><td>A</td><td>GATs + 4-layer transformer + attention readout</td><td class="num"><span class="tri">0.59 / 0.00 / 0.51</span></td><td class="num"><span class="tri">0.42 / 0.00 / 0.39</span></td></tr>
+        <tr><td>B</td><td>GATs + transformer + mean readout</td><td class="num"><span class="tri">0.80 / 0.36 / 0.56</span></td><td class="num"><span class="tri">0.51 / 0.28 / 0.41</span></td></tr>
+        <tr><td>B_mlp</td><td>B with per-token MLPs instead of attention</td><td class="num"><span class="tri">0.84 / 0.43 / 0.63</span></td><td class="num"><span class="tri">0.53 / 0.33 / 0.46</span></td></tr>
+        <tr><td>B_mixer</td><td>B with an MLP-Mixer instead of attention</td><td class="num"><span class="tri">0.67 / −0.04 / 0.19</span></td><td class="num"><span class="tri">0.44 / −0.02 / 0.22</span></td></tr>
+        <tr class="best"><td>C</td><td>GATs + mean readout, no transformer</td><td class="num"><span class="tri">0.82 / 0.49 / 0.62</span></td><td class="num"><span class="tri">0.53 / 0.42 / 0.49</span></td></tr>
+        <tr><td>G2</td><td>C + mean/max readout with an MLP</td><td class="num"><span class="tri">0.87 / 0.38 / 0.62</span></td><td class="num"><span class="tri">0.54 / 0.31 / 0.45</span></td></tr>
+        <tr><td>G1</td><td>Concat GAT (full-width heads + MLP)</td><td class="num"><span class="tri">0.61 / 0.08 / –</span></td><td class="num"><span class="tri">0.39 / 0.01 / –</span></td></tr>
+        <tr><td>G1r</td><td>G1 + residual connection</td><td class="num"><span class="tri">0.70 / 0.06 / 0.43</span></td><td class="num"><span class="tri">0.44 / 0.00 / 0.28</span></td></tr>
+        <tr><td>F2</td><td>C + unpooled concept nodes (batch 48)</td><td class="num"><span class="tri">0.59 / 0.10 / –</span></td><td class="num"><span class="tri">0.45 / 0.12 / –</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="kicker col">Seed 0 is C's lucky seed: seeds 1 and 2 reached 0.71 / 0.37 and 0.78 / 0.47 on material. The three-seed differences below are the reliable ones.</p>
+
+  <h3>The transformer and the readout</h3>
+  <p class="col">The original design put a transformer over the square tokens and read z out with learned attention queries (A). Replacing the attention readout with a plain mean (B) recovered most of the neighbour structure; removing the transformer as well (C) recovered more. Over three seeds, B trails C by 0.20 on material kNN and 0.16 on eval kNN. The transformer made the tokens about 95% identical within a position, so the masked-square task turned into predicting one board-wide code from a partial board. Adding a transformer to the masked-square predictor instead (D, E) changed nothing.</p>
+  <p class="col">Swapping attention for per-token MLPs of the same depth (B_mlp) gained 0.13 to 0.16 kNN over B at every seed but stayed slightly below C: attention's mixing, not depth, did most of the harm. An MLP-Mixer, which mixes across fixed square slots, sent kNN to about zero on all three seeds while giving the lowest training losses and the highest LiDAR.</p>
+
+  <h3>Unpooling</h3>
+  <p class="col">F added learned "concept" nodes by splitting squares (the Guo unpool) and averaged them into z beside the squares. The square tokens collapsed to one shared vector (93% of their energy), which made the masked-square loss trivially low, because SIGReg only watched z and the unpooled nodes carried z's spread. F2 added SIGReg on the mean square token and fixed the collapse, but the unpooled nodes still carried essentially no board information (material R² 0.09) and diluted z. F2 also ran at batch 48 against C's 256, so the comparison is confounded. Unpooling is parked until it can get a content task of its own on a sound layout.</p>
+
+  <h3>Jason's concat GAT and the readout question</h3>
+  <p class="col">The suspicion was that averaging (in the GAT messages and in the mean readout) destroys information. G1 gives each layer four full-width heads, concatenates them with the input, and reduces through an MLP to a wider layer. Its z collapsed to a few loud directions (kNN 0.08, RankMe 10.8 against C's 29.7). A residual connection (G1r) kept the layers healthy, with higher effective rank than C, but the collapse moved to the token projection and readout. G1r loses "who is ahead" in the first 250 to 500 steps (balance kNN 0.21 to about 0) and never gets it back.</p>
+  <p class="col">Readout capacity was then ruled out twice. G2 put an MLP after a mean-and-max readout: linear material rose but kNN fell. B_mlp already applies per-token MLPs before the mean, the textbook fix for making material summable, and did not beat C. The network can make material summable; training does not ask it to.</p>
+
+  <h3>The sum branch</h3>
+  <p class="col">Step 13 added a GINE-style branch beside each GAT layer that sums edge-aware messages, so a token could count attackers instead of averaging them. Over three seeds on C it changed nothing measurable (material whitened −0.04 on average, signs disagreeing between seeds), and local balance in the tokens did not improve. The branch was used and training losses were lower: easier objectives, not better probes.</p>
+
+  <div class="verdict col">
+    <div class="label">Verdict</div>
+    <p>C stays the baseline. No architecture beat it on z, and under the JEPA objectives the architecture only changed how fast training eroded z. The more flexible encoders delivered the simple, predictable summary the objective rewards faster.</p>
+  </div>
+</section>
+
+<section id="pred">
+  <div class="sec-num">5</div>
+  <h2>Predictors and objective settings</h2>
+  <p class="col">If the encoder is not the lever, perhaps the objective's details are. Steps 3 and 5 to 8 varied the predictors, the targets and the regularizer.</p>
+  <div class="table-wrap">
+    <table>
+      <caption>Changes to the JEPA objective and predictors. Effects on z, paired with their baseline.</caption>
+      <thead><tr><th>Change</th><th>Step</th><th>Effect on z</th></tr></thead>
+      <tbody>
+        <tr><td>SIGReg weight 0.05 → 0.01</td><td>3</td><td>Linear material 0.53 → 0.72, eval 0.31 → 0.48 (A layout). At 0.05 SIGReg was about 95% of the loss and swamped the gradient. Gains stop by 0.01.</td></tr>
+        <tr><td>SIGReg weight 0.01 → 0.1</td><td>7</td><td>RankMe 30 → 44, but material linear −0.15 on C; worse everywhere on G1r.</td></tr>
+        <tr><td>Projector head under SIGReg</td><td>3</td><td>Linear +0.10 on the A layout; not carried forward once the layout changed.</td></tr>
+        <tr><td>Masked squares → whole-board z from masked z</td><td>5</td><td>Within 0.02 everywhere, 3 seeds. The masked-square task gives z and tokens nothing that masked-z prediction does not.</td></tr>
+        <tr><td>Dropping the masked-square loss entirely</td><td>5</td><td>Material linear −0.06 at every seed; the rest within 0.02.</td></tr>
+        <tr><td>Moves as square names or files/ranks instead of square tokens (P3, P4, P7)</td><td>6</td><td>0.00 to −0.02, 3 seeds. Naming squares costs z nothing.</td></tr>
+        <tr><td>Masked z + named moves (P5, P6)</td><td>6</td><td>About −0.04 on material at every seed.</td></tr>
+        <tr><td>Move-guessing head from z before and after (P8)</td><td>6, 8</td><td>Within noise. The head itself never learned (about 1% right, near guessing from square frequencies).</td></tr>
+        <tr><td>Rollouts fixed at 2 plies instead of growing to 20</td><td>7</td><td>Identical within 0.02, 3 seeds. Short rollouts became the default for architecture tests.</td></tr>
+        <tr><td>Non-residual next-position predictor</td><td>7</td><td>"Who is ahead" gets louder (raw kNN +0.02 to +0.03, share of z 8% → 14%) with no gain after whitening, 3 seeds.</td></tr>
+        <tr><td>"Everything in z" bundle on G1r, and the same with small predictors (Z, Z_weak)</td><td>8</td><td>Worst trained encoder so far: material 0.61 / −0.01 / 0.33 against G1r's 0.70 / 0.06 / 0.43. Shrinking the predictors changed nothing.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">Step 6 ran nine predictor designs (P1 to P9) at three seeds each. None beat P1, the original C, and the biggest effect was 0.04. Step 7's rollout test refuted an earlier theory that long random rollouts teach z to forget who is ahead (because material balance changes a lot over 20 random plies). Fixed 2-ply rollouts gave the same z.</p>
+  <p class="col">One mechanism did show up. The next-position predictor adds its output to the input z, a "nothing changes" prior. Features that flip sign every ply, like "the side to move is ahead", are exactly what that prior gets wrong, and the residual predictor suppresses them. Removing the residual made them louder but did not add content.</p>
+  <div class="verdict col">
+    <div class="label">Verdict</div>
+    <p>Nothing in the predictor or objective-setting space moved z by more than noise, apart from turning SIGReg down to 0.01. As set up, the JEPA objective does not ask the encoder for chess facts, and no predictor design changes what it asks for.</p>
+  </div>
+</section>
+
+<section id="lr">
+  <div class="sec-num">6</div>
+  <h2>Left and right</h2>
+  <p class="col">Without square IDs, a position and its file-mirror image (a and h files swapped) get the same z to float precision when neither side can castle. That is correct for material and value, which do not change under the mirror, but it means z cannot name squares, and Jason suspected the ambiguity was adding noise that drives the decline. We measure awareness with two numbers: whether a probe can read which half of the board the side to move's king is on (exactly 0.50 for a blind encoder, because every position is tested beside its mirror), and the mirror gap, the distance from a position's z to its mirror's over the typical distance between positions.</p>
+  <div class="table-wrap">
+    <table>
+      <caption>Ways of giving the encoder a left/right signal, C encoder, step 4,000.</caption>
+      <thead><tr><th>Signal</th><th class="num">King side from z (linear)</th><th class="num">Mirror gap</th><th>Cost to z</th></tr></thead>
+      <tbody>
+        <tr class="ref"><td>None (mirror-blind)</td><td class="num">0.50</td><td class="num">0.00</td><td>–</td></tr>
+        <tr><td>Extra feature on a1's self-loop edge</td><td class="num">0.51</td><td class="num">0.00</td><td>Within noise</td></tr>
+        <tr><td>Learned flag on the a1 node (P9)</td><td class="num">0.55–0.57</td><td class="num">0.02–0.04</td><td>None</td></tr>
+        <tr><td>Learned file marks on every node</td><td class="num">0.87</td><td class="num">0.72</td><td class="down">Material linear −0.23, eval −0.13</td></tr>
+        <tr><td>Left/right marks on edges that cross files</td><td class="num">0.74–0.80</td><td class="num">0.14–0.21</td><td class="down">About −0.03 (3 seeds)</td></tr>
+        <tr><td>Edge marks + legal-move head</td><td class="num">0.54–0.70</td><td class="num">0.04–0.11</td><td>None beyond the head alone</td></tr>
+        <tr><td>Edge marks + decoder on own z</td><td class="num">0.99</td><td class="num">0.82</td><td>See section 7</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">Across these signals, the more z knows of left and right, the lower its material and eval. Mirror-blindness was not causing the decline. Edge marks became the tentative standard because they are cheap and leave room for later heads that need to name squares.</p>
+  <p class="col">The marks only matter when something pays for them. With the legal-move head, z used them less than without it. With the decoder, which must say what stands on each square, C became fully aware. G1r stayed exactly blind in every run until step 16 asked why. G1r loses its starting signal in the first 250 steps and learns to read the two marks symmetrically ("this edge crosses files"), which is identical in a mirror image. Starting the mark weights 16 times larger kept the signal alive through step 500. With the decoder on, G1r then became fully aware (king side 0.99, kNN 0.95). Without the decoder, or at 4 times, it went blind again. The capability was there; it needed a head that rewards it and a strong enough start to latch onto.</p>
+  <p class="col">The long runs added two corrections. The legal-move head also makes C aware given time (kNN 0.94 at 16,000 steps). And without any head, z drifts away from its mirror (gap 0.63) without organizing that drift around which side is which (king side kNN 0.65), so the mirror gap alone is not awareness.</p>
+  <div class="note col">
+    <div class="label">Probe caveat</div>
+    <p>Material and eval are the same for a position and its mirror, so they cannot reward awareness, and a z that separates mirror pairs can only hurt kNN on them. Best move is the probe that rewards it. Several "costs" of awareness in this report may be this effect rather than lost content.</p>
+  </div>
+</section>
+
+<section id="heads">
+  <div class="sec-num">7</div>
+  <h2>Heads graded by the board</h2>
+  <p class="col">By step 8 every lever inside the JEPA framework had been tried. Every loss was graded against a target the encoder itself makes, so nothing stopped z from simplifying. Step 9 added the first outside targets: small heads that read the encoder and are graded against facts computed from the rules.</p>
+
+  <h3>Token-level heads (steps 9, 11, 12)</h3>
+  <p class="col">A piece-count decoder on z learned its task (98.5% of positions with all twelve counts exact) and improved material by 0.06, which it trains directly, and nothing else. The legal-move head, which reads two square tokens and the edge between them and says whether a legal move runs along it, was different. Over three seeds it raised material (linear +0.06, whitened +0.05), eval (+0.02 on each reading) and every token label it does not train (pinned +0.04, defended +0.02, en prise kNN +0.07), with no negative number at any seed. Pinned pieces became readable above the untrained level for the first time. On the edge-mark baseline it added +0.08 material linear and +0.03 to +0.05 on eval, again at every seed. On G1r it lifted the raw-kNN collapse (material kNN 0.06 → 0.35).</p>
+
+  <h3>A direct board decoder (step 14)</h3>
+  <p class="col">An MLP decoding all 64 squares from the online z got 55% of occupied squares right on C (31% on G1r; 11% with no z). On C it hurt the neighbour probes (material kNN −0.10, whitened −0.08) and cancelled the legal head's gain when combined with it. On G1r it helped a little.</p>
+
+  <h3>Heads as latent objectives (step 15)</h3>
+  <p class="col">Jason wanted the heads to work in latent space and on z only, as the eventual Minotaur player will. Each head was tried in three forms: on the position's own z, on the predicted next z, and on the whole-board z predicted from a masked board. For the predicted forms the head learns from the target encoder's z and is held fixed while it grades a prediction, so the board reaches the encoder only through a prediction made in latent space.</p>
+  <div class="table-wrap">
+    <table>
+      <caption>Step 15, paired differences from the same encoder without the head (masked-board forms against the whole-board predictor alone). Material and eval as linear / kNN / whitened kNN; one seed.</caption>
+      <thead><tr><th>Head and form</th><th class="num">C material</th><th class="num">C eval</th><th class="num">G1r material</th><th class="num">G1r eval</th></tr></thead>
+      <tbody>
+        <tr class="best"><td>Legal moves, own z</td><td class="num"><span class="tri up">+0.03 / +0.05 / +0.04</span></td><td class="num"><span class="tri up">+0.03 / +0.07 / +0.04</span></td><td class="num"><span class="tri up">+0.15 / +0.26 / +0.19</span></td><td class="num"><span class="tri up">+0.09 / +0.32 / +0.16</span></td></tr>
+        <tr><td>Legal moves, predicted next z</td><td class="num"><span class="tri">+0.04 / +0.02 / +0.02</span></td><td class="num"><span class="tri">0.00 / +0.04 / +0.02</span></td><td class="num"><span class="tri">+0.10 / −0.09 / +0.06</span></td><td class="num"><span class="tri">+0.05 / −0.01 / +0.04</span></td></tr>
+        <tr><td>Legal moves, predicted whole z</td><td class="num"><span class="tri">0.00 / +0.03 / +0.02</span></td><td class="num"><span class="tri">−0.01 / +0.03 / 0.00</span></td><td class="num"><span class="tri up">+0.13 / +0.03 / +0.17</span></td><td class="num"><span class="tri up">+0.07 / +0.07 / +0.15</span></td></tr>
+        <tr><td>Decoder, own z</td><td class="num"><span class="tri down">+0.01 / −0.12 / −0.09</span></td><td class="num"><span class="tri down">−0.01 / −0.05 / −0.08</span></td><td class="num"><span class="tri">+0.06 / +0.17 / +0.02</span></td><td class="num"><span class="tri">+0.06 / +0.24 / +0.06</span></td></tr>
+        <tr><td>Decoder, predicted next z</td><td class="num"><span class="tri down">0.00 / −0.09 / −0.10</span></td><td class="num"><span class="tri down">−0.03 / −0.08 / −0.09</span></td><td class="num"><span class="tri down">−0.04 / −0.08 / −0.07</span></td><td class="num"><span class="tri">0.00 / −0.04 / −0.06</span></td></tr>
+        <tr><td>Decoder, predicted whole z</td><td class="num"><span class="tri">−0.01 / −0.04 / −0.03</span></td><td class="num"><span class="tri">−0.02 / −0.04 / −0.05</span></td><td class="num"><span class="tri">+0.01 / −0.01 / 0.00</span></td><td class="num"><span class="tri">0.00 / +0.01 / 0.00</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">The legal-move head helped in every form, most on the position's own z. The decoder hurt C in every form. One result reframed the predictors: the heads read predicted z as well as real target z (C's decoder: 41% of occupied squares on real positions, 41% on predicted next positions; the legal head 87/81 against 88/80). The predictors carry whatever z holds; the limit is what z holds.</p>
+
+  <h3>Training longer (step 16)</h3>
+  <p class="col">Three C runs went to 16,000 steps with rollouts growing from 2 to 20 plies: no head, the legal-move head on own z, and the decoder on own z.</p>
+  <figure>
+    <div class="figure-box">
+      <div class="legend" aria-hidden="true">
+        <span><i style="background:var(--series-1)"></i>No head</span>
+        <span><i style="background:var(--series-2)"></i>Legal moves, own z</span>
+        <span><i style="background:var(--series-3)"></i>Decoder, own z</span>
+      </div>
+      <div class="chart-wrap" id="bm-wrap">
+        <svg class="chart" id="bm-chart" viewBox="0 0 680 300" width="100%" role="img" aria-labelledby="bm-t bm-d" style="min-width:520px"></svg>
+        <div class="tip" id="bm-tip" hidden></div>
+      </div>
+      <details>
+        <summary>Show as a table</summary>
+        <div class="table-wrap">
+          <table id="bm-table">
+            <thead><tr><th>Training step</th><th class="num">No head</th><th class="num">Legal moves</th><th class="num">Decoder</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+    <figcaption>Best-move probe (linear AUC) on z over 16,000 steps. Dashed lines: the untrained encoder (0.68) and a one-hot board (0.83). Without a head the probe never recovers to its starting level; with either head it climbs past it and levels off as the learning rate decays.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table>
+      <caption>z probes at 16,000 steps, linear / kNN / whitened kNN.</caption>
+      <thead><tr><th>Run</th><th class="num">Material</th><th class="num">Eval</th><th class="num">Themes</th><th class="num">Best move</th><th class="num">King side kNN</th></tr></thead>
+      <tbody>
+        <tr class="ref"><td>Untrained</td><td class="num"><span class="tri">0.96 / 0.34 / 0.70</span></td><td class="num"><span class="tri">0.53 / 0.31 / 0.44</span></td><td class="num"><span class="tri">0.78 / 0.68 / 0.73</span></td><td class="num"><span class="tri">0.68 / 0.57 / 0.60</span></td><td class="num">0.53</td></tr>
+        <tr class="ref"><td>Board one-hot</td><td class="num"><span class="tri">0.70 / 0.04 / 0.05</span></td><td class="num"><span class="tri">0.43 / 0.09 / 0.08</span></td><td class="num"><span class="tri">0.76 / 0.68 / 0.66</span></td><td class="num"><span class="tri">0.83 / 0.62 / 0.63</span></td><td class="num">–</td></tr>
+        <tr><td>No head</td><td class="num"><span class="tri">0.78 / 0.46 / 0.51</span></td><td class="num"><span class="tri">0.50 / 0.37 / 0.38</span></td><td class="num"><span class="tri">0.78 / 0.70 / 0.70</span></td><td class="num"><span class="tri">0.65 / 0.58 / 0.59</span></td><td class="num">0.65</td></tr>
+        <tr class="best"><td>Legal moves, own z</td><td class="num"><span class="tri">0.90 / 0.40 / 0.57</span></td><td class="num"><span class="tri">0.55 / 0.41 / 0.43</span></td><td class="num"><span class="tri">0.81 / 0.72 / 0.74</span></td><td class="num"><span class="tri">0.72 / 0.60 / 0.61</span></td><td class="num">0.94</td></tr>
+        <tr><td>Decoder, own z</td><td class="num"><span class="tri">0.79 / 0.25 / 0.42</span></td><td class="num"><span class="tri">0.52 / 0.35 / 0.33</span></td><td class="num"><span class="tri">0.80 / 0.73 / 0.72</span></td><td class="num"><span class="tri">0.77 / 0.62 / 0.62</span></td><td class="num">0.985</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">Four times the training without a head barely moved any probe from its 4,000-step values, and the whitened numbers slipped. The legal-move head beat the no-head run on every linear and whitened number. The decoder made z decode 87% of occupied squares on random positions and pushed best move to 0.77, the largest win over the untrained encoder on any z probe so far, at a steep cost in kNN material. Material linear still sits below the untrained encoder in every run.</p>
+
+  <h3>The online decoder (step 17)</h3>
+  <p class="col">The predicted-z decoders learn from the target encoder's z, so the board never reaches the encoder directly. Step 17 let the decoder learn from the online encoder's z instead, with the gradient on, while still grading predictions with the decoder held fixed. Every online arm then looked like "decode own z": fully left/right aware (king side kNN 0.92 to 0.95, G1r included at the 16× mark start), about 55% of squares decoded on real positions and 50% on predicted ones (against 41% for the target-trained decoder on C), best move up 0.02 to 0.05, and kNN material and eval down. On C, adding the prediction-grading part on top of decoding its own z made no visible difference.</p>
+  <div class="verdict col">
+    <div class="label">Verdict</div>
+    <p>Heads graded against the board are the only change that has moved z up. The legal-move head is a clean gain (three seeds at token level, one seed at z level). The decoder makes z more board-like, which helps best move and hurts nearest-neighbour material and eval. Predicted z carries what real z carries.</p>
+  </div>
+</section>
+
+<section id="jepa">
+  <div class="sec-num">8</div>
+  <h2>Are the heads still JEPA?</h2>
+  <p class="col">In the well-known JEPA systems (I-JEPA for images, V-JEPA for video, and relatives like BYOL and data2vec) the loss is a distance between two vectors: the predictor's output from the online encoder, and the target encoder's vector for the hidden part. There are no labels and nothing is decoded back into the input. What counts as right is the model's own representation, and it moves as training goes.</p>
+  <div class="table-wrap">
+    <table>
+      <caption>What each objective compares.</caption>
+      <thead><tr><th>Objective</th><th>What gets compared</th><th>JEPA?</th></tr></thead>
+      <tbody>
+        <tr><td>Masked squares, next position, whole-board predictor</td><td>The online encoder and predictor's vector against the target encoder's vector</td><td>Yes, the standard form</td></tr>
+        <tr><td>Decoder or legal moves on own z</td><td>Online z, through the head, against the real board or legal moves</td><td>No: reconstruction (decoder) or a supervised side task with rule-made labels (legal moves)</td></tr>
+        <tr><td>Decoder or legal moves on predicted z, target-trained (step 15)</td><td>Predicted z, through the held-fixed head, against the real board or moves</td><td>Partly: the encoder learns only through a latent prediction, but the yardstick is the real board</td></tr>
+        <tr><td>The same with an online head (step 17)</td><td>Both of the rows above</td><td>Mostly reconstruction</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="col">So none of the heads compare the online and target vectors. A strict JEPA version would compare decode(predicted z) with decode(target z), the held-fixed head acting as a lens on the two vectors, instead of comparing with the real board. The same applies to the legal-move head. Every run still contains the JEPA core; the heads sit on top of it.</p>
+  <h3>Why JEPA avoids reconstruction, and how much that applies to chess</h3>
+  <div class="two">
+    <div>
+      <h4>The argument that does not transfer</h4>
+      <p>JEPA predicts in latent space because images and video are full of detail that cannot or need not be predicted: texture, noise, individual leaves. Reconstructing it spends capacity on it; a latent target lets the encoder drop it. In vision, I-JEPA gets better linear-probe features than MAE, which reconstructs pixels. A chess board has none of that detail. It is 64 squares with 13 possible contents each, all of it relevant, and given the move, the next position is fully determined.</p>
+    </div>
+    <div>
+      <h4>The argument that does</h4>
+      <p>A latent target also lets the encoder choose its own level of abstraction, while reconstruction pulls z toward a copy of the input. Our numbers fit that. Decoding raises the probes a literal board answers well (a one-hot board scores 0.83 on best move) and lowers nearest-neighbour material and eval, where the one-hot board is almost useless (0.04 and 0.09). The decoder runs move toward the one-hot board.</p>
+    </div>
+  </div>
+  <p class="col">The uncomfortable part is empirical. Across 131 runs, the JEPA core alone has never beaten an untrained encoder on these probes, except on raw kNN, which whitening traced to loudness. Our working explanation is that self-made targets let the encoder simplify (fewer directions, slower features, game phase over balance), and an outside target is the only thing that has anchored it. That may be a property of these objectives on chess, or of this particular setup. The strict-JEPA head test in section 10 is designed to tell the difference: if heads that compare against the target's decoded vector still help, the benefit comes from where the head looks; if they stop helping, it comes from the ground truth.</p>
+</section>
+
+<section id="score">
+  <div class="sec-num">9</div>
+  <h2>What is ruled out, what holds</h2>
+  <div class="two">
+    <div>
+      <h4>Ruled out as the main lever</h4>
+      <ul>
+        <li>A transformer in the encoder, and the attention readout</li>
+        <li>Readout capacity (mean/max MLP readout, per-token MLPs before the mean)</li>
+        <li>GAT averaging as the bottleneck (concat GATs, sum branch)</li>
+        <li>Predictor design: move descriptions, size, residual, masked squares versus masked z</li>
+        <li>Rollout length (2 plies equals 20)</li>
+        <li>SIGReg strength beyond 0.01</li>
+        <li>Mirror-blindness as the cause of the decline</li>
+        <li>Piece-count decoder and move-guessing head</li>
+        <li>RankMe and LiDAR as quality signals</li>
+      </ul>
+    </div>
+    <div>
+      <h4>Holds</h4>
+      <ul>
+        <li>C as the baseline encoder</li>
+        <li>The legal-move head as a real, small gain (token head, three seeds)</li>
+        <li>z-level legal head helps in every form, most on own z (one seed per arm)</li>
+        <li>Predicted z carries what real z carries</li>
+        <li>Trained material linear stays below untrained in every run</li>
+        <li>Best move beats untrained only with heads plus long training</li>
+        <li>The decoder's trade: board content up, neighbour structure down</li>
+        <li>G1r can be left/right aware with a strong mark start and a decoder</li>
+      </ul>
+    </div>
+  </div>
+  <div class="two">
+    <div>
+      <h4>Still open</h4>
+      <ul>
+        <li>The z-level legal head at more seeds, and its forms combined</li>
+        <li>Whether a strict-JEPA head comparison keeps the gains</li>
+        <li>Unpooling on a sound layout with its own content task</li>
+        <li>Whether G1r with heads overtakes C given long training</li>
+      </ul>
+    </div>
+    <div>
+      <h4>Known measurement issues</h4>
+      <ul>
+        <li>Material and eval are mirror-symmetric, so they cannot reward left/right awareness</li>
+        <li>The trainer's validation subset (val losses, RankMe, LiDAR) is the first 2,048 positions of an alphabetically sorted split: endgame-heavy</li>
+        <li>Most arms have one seed</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="next">
+  <div class="sec-num">10</div>
+  <h2>Open questions and next steps</h2>
+  <ol class="col">
+    <li><strong>Strict-JEPA heads.</strong> Grade the predicted z by decode(predicted z) against decode(target z), and the same for legal moves, with the head still trained as now. The encoder would then learn only from agreeing with the target, seen through the head. This tests whether the ground truth is what makes the heads work.</li>
+    <li><strong>Seeds for the z-level legal head</strong> on both encoders, then the three forms combined (own z, next z, whole z).</li>
+    <li><strong>More side-dependent probes.</strong> Best move is the only headline probe that can reward left/right awareness. Square-level facts read from z would make the probe suite fair to aware encoders.</li>
+    <li><strong>Fix the trainer's validation subset</strong> with seeded random positions. This breaks comparability of RankMe, LiDAR and val losses with every earlier run, so it is a deliberate break.</li>
+    <li><strong>Revisit unpooling</strong> on the C layout once the unpooled nodes have a task of their own (pool-back or masked-node prediction).</li>
+    <li><strong>Decide the DEHB objective.</strong> LiDAR ranks encoders against the probes. A probe-based or head-based score is the alternative.</li>
+    <li><strong>Review two local commits</strong>: the larger starting mark weights (753631d) and the online head fit option (961314d). Neither is pushed.</li>
+  </ol>
+</section>
+
+<section id="appendix">
+  <div class="sec-num">Appendix</div>
+  <h2>Run names and the spreadsheet</h2>
+  <dl class="gloss">
+    <dt>A, B, C, D, E</dt><dd>Step 4 layouts: A transformer + attention readout; B transformer + mean; C no transformer + mean; D and E add a transformer to the masked-square predictor of C and B.</dd>
+    <dt>F, F2</dt><dd>C + unpooled concept nodes; F2 adds anti-collapse on the mean square token.</dd>
+    <dt>_mlp, _mixer</dt><dd>Step 5: the encoder transformer replaced by per-token MLPs or an MLP-Mixer.</dd>
+    <dt>P1–P9</dt><dd>Step 6 predictors. P1 = C; P2 masked z; P3/P4 square names / files and ranks with the a1 anchor; P5/P6 the same with masked z; P7 square names without the anchor; P8 move guessing; P9 = P7 + a1 node flag.</dd>
+    <dt>G1, G1r, G2</dt><dd>Step 7: concat GAT, concat GAT with residual, C with a mean/max MLP readout.</dd>
+    <dt>C_short</dt><dd>C with rollouts fixed at 2 plies; the base for steps 9 to 14.</dd>
+    <dt>Z, Z_weak</dt><dd>Step 8: G1r with every objective in z (non-residual predictor, named moves, masked z, move guessing, 20 plies, sibling moves); Z_weak with small predictors.</dd>
+    <dt>_edges, _files</dt><dd>Left/right marks on edges that cross files, or learned file marks on nodes.</dd>
+    <dt>_legal, _count, _decode</dt><dd>Steps 9 to 14 heads: legal moves from square tokens, piece counts from z, the board decoded from own z.</dd>
+    <dt>_sum</dt><dd>Step 13: GINE-style sum branch beside each GAT layer.</dd>
+    <dt>leg_*, dec_*</dt><dd>Step 15: the z-level legal head or decoder on own z (now), predicted next z (next), or predicted whole z (mask). zpred is the whole-board predictor alone.</dd>
+    <dt>_marks4, _m16</dt><dd>Steps 16 and 17: encoder mark weights started 4 or 16 times larger.</dd>
+    <dt>_long, _online</dt><dd>Step 16: 16,000 steps with 2 to 20 plies. Step 17: the head learns from the online encoder's z.</dd>
+  </dl>
+  <p class="col">The spreadsheet <span class="mono">reports/minotaur_jepa_experiments.xlsx</span> holds every run. <strong>Runs</strong> has one row per run with its settings, final z probes, the same encoder untrained, trained-minus-untrained differences (as formulas), evaluation metrics, head scores, left/right checks and token probes. <strong>Comparisons</strong> has 123 paired arm-minus-baseline differences, looked up by formula. <strong>Trajectories</strong>, <strong>Orientation</strong> and <strong>Tokens</strong> hold every probe evaluation, left/right check and token probe on disk, and <strong>Steps</strong> summarizes each round. The trainer draws probe positions from each run's seed, so compare seed-1 and seed-2 rows within their seed. The script that builds it is <span class="mono">reports/build_workbook.py</span>; it reads the local run folders, which are not in git.</p>
+</section>
+</main>
+
+<script>
+(function () {
+  var steps = [0, 2000, 4000, 6000, 8000, 10000, 12000, 14000, 16000];
+  var series = [
+    { name: "No head", color: "var(--series-1)", v: [0.680, 0.647, 0.649, 0.647, 0.646, 0.648, 0.650, 0.652, 0.652] },
+    { name: "Legal moves", color: "var(--series-2)", v: [0.680, 0.670, 0.688, 0.700, 0.709, 0.715, 0.717, 0.718, 0.718] },
+    { name: "Decoder", color: "var(--series-3)", v: [0.680, 0.696, 0.729, 0.746, 0.758, 0.766, 0.771, 0.772, 0.773] }
+  ];
+  var L = 48, R = 560, T = 14, B = 262, y0 = 0.62, y1 = 0.86;
+  function x(s) { return L + s / 16000 * (R - L); }
+  function y(v) { return B - (v - y0) / (y1 - y0) * (B - T); }
+  var ns = "http://www.w3.org/2000/svg";
+  var svg = document.getElementById("bm-chart");
+  function el(tag, attrs, text) {
+    var e = document.createElementNS(ns, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    svg.appendChild(e);
+    return e;
+  }
+  var t = document.createElementNS(ns, "title"); t.id = "bm-t"; t.textContent = "Best-move probe over training"; svg.appendChild(t);
+  var d = document.createElementNS(ns, "desc"); d.id = "bm-d";
+  d.textContent = "Linear AUC at steps 0 to 16000. No head ends at 0.65, legal moves at 0.72, decoder at 0.77; untrained 0.68, one-hot board 0.83.";
+  svg.appendChild(d);
+  [0.65, 0.70, 0.75, 0.80, 0.85].forEach(function (v) {
+    el("line", { "class": "grid", x1: L, x2: R, y1: y(v), y2: y(v) });
+    el("text", { "class": "axis-t", x: L - 8, y: y(v) + 4, "text-anchor": "end" }, v.toFixed(2));
+  });
+  [0, 4000, 8000, 12000, 16000].forEach(function (s) {
+    el("text", { "class": "axis-t", x: x(s), y: B + 20, "text-anchor": "middle" }, s === 0 ? "0" : (s / 1000) + "k");
+  });
+  el("text", { "class": "axis-t", x: R, y: B + 36, "text-anchor": "end" }, "training steps");
+  el("line", { "class": "ref", x1: L, x2: R, y1: y(0.680), y2: y(0.680) });
+  el("text", { "class": "ref-t", x: L + 160, y: y(0.680) + 15 }, "untrained 0.68");
+  el("line", { "class": "ref", x1: L, x2: R, y1: y(0.827), y2: y(0.827) });
+  el("text", { "class": "ref-t", x: L + 6, y: y(0.827) - 6 }, "board one-hot 0.83");
+  series.forEach(function (s) {
+    var pts = steps.map(function (st, i) { return x(st) + "," + y(s.v[i]); }).join(" ");
+    el("polyline", { "class": "line", points: pts, stroke: s.color });
+    var last = s.v[s.v.length - 1];
+    el("circle", { cx: x(16000), cy: y(last), r: 4, fill: s.color, stroke: "var(--surface)", "stroke-width": 2 });
+    el("text", { "class": "end-t", x: R + 12, y: y(last) + 4 }, s.name);
+    el("text", { "class": "end-v", x: R + 12, y: y(last) + 19 }, last.toFixed(2));
+  });
+  var cross = el("line", { "class": "cross", x1: 0, x2: 0, y1: T, y2: B, visibility: "hidden" });
+  var dots = series.map(function (s) {
+    return el("circle", { r: 4.5, fill: s.color, stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+  });
+  var hit = el("rect", { x: L - 10, y: T, width: R - L + 20, height: B - T, fill: "transparent" });
+  var tip = document.getElementById("bm-tip");
+  var wrap = document.getElementById("bm-wrap");
+  function show(evt) {
+    var r = svg.getBoundingClientRect();
+    var px = (evt.clientX - r.left) / r.width * 680;
+    var i = Math.max(0, Math.min(steps.length - 1, Math.round((px - L) / (R - L) * 8)));
+    var cx = x(steps[i]);
+    cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("visibility", "visible");
+    dots.forEach(function (dt, k) { dt.setAttribute("cx", cx); dt.setAttribute("cy", y(series[k].v[i])); dt.setAttribute("visibility", "visible"); });
+    var html = '<div class="tt">step ' + steps[i].toLocaleString("en-US") + '</div>';
+    series.slice().sort(function (a, b) { return b.v[i] - a.v[i]; }).forEach(function (s) {
+      html += '<div class="row"><span><i style="background:' + s.color + '"></i>' + s.name + '</span><span class="mono">' + s.v[i].toFixed(3) + '</span></div>';
+    });
+    tip.innerHTML = html;
+    tip.hidden = false;
+    var wr = wrap.getBoundingClientRect();
+    var left = (cx / 680) * r.width + (r.left - wr.left) + 12;
+    if (left + 180 > wr.width) left -= 196;
+    tip.style.left = left + "px";
+    tip.style.top = "12px";
+  }
+  function hide() {
+    tip.hidden = true; cross.setAttribute("visibility", "hidden");
+    dots.forEach(function (dt) { dt.setAttribute("visibility", "hidden"); });
+  }
+  hit.addEventListener("pointermove", show);
+  hit.addEventListener("pointerdown", show);
+  hit.addEventListener("pointerleave", hide);
+  var tb = document.querySelector("#bm-table tbody");
+  steps.forEach(function (st, i) {
+    var tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + st.toLocaleString("en-US") + "</td>" + series.map(function (s) { return '<td class="num">' + s.v[i].toFixed(3) + "</td>"; }).join("");
+    tb.appendChild(tr);
+  });
+})();
+</script>
