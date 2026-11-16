@@ -26,7 +26,8 @@ answers the predictors are graded against. Two predictors give the training sign
                      rollout_target_steps), so a long rollout needs few target encodings.
                      rollout_siblings > 1 adds other first moves from the same position (one ply each).
     whole board      (zpred_weight > 0) From z of the masked board, predict the target encoder's z of
-                     the whole board: the masked-square task at the level of the position vector.
+                     the whole board: the masked-square task at the level of the position vector. (The
+                     predictor is also built, without this loss, when a head judges its output.)
     the move         (inverse_weight > 0) From z of a position and the target encoder's z of the position
                      after the rollout's first move, name the move's from and to squares (inverse
                      dynamics: a classification, nothing is reconstructed).
@@ -54,12 +55,16 @@ its squares' files and ranks: is the move legal?). Each can be asked about three
     the predicted next z      decode_next_weight, zlegal_next_weight: the next-position predictor's output,
                               judged against the position the move leads to.
     the predicted whole z     decode_masked_weight, zlegal_masked_weight: the whole-board predictor's output
-                              from the masked board's z (zpred_weight > 0), judged against the whole board.
+                              from the masked board's z, judged against the whole board (with zpred_weight 0
+                              the predictor learns from these heads alone).
 
 For the two predicted z the head learns only from the target encoder's z of real positions (no gradient
 reaches the encoder that way) and is held fixed while it judges a prediction, so that loss moves the
 predictor and the encoder, never the head: the board reaches the encoder only through a prediction made
 in latent space. The heads read z layer-normalized, the form the predictors are trained to produce.
+Heads alone: with mask_weight, next_weight and zpred_weight at 0 and zhead_fit "online", every loss that
+reaches the encoder is graded by the board (plus the anti-collapse term). The target encoder then plays no
+part in training; it still follows the online encoder by moving average, and evaluations read it.
 zhead_fit = "online" has a head that judges predictions learn instead from the online encoder's z of the
 whole board, with the gradient on (the own-z term, weight 1), so the board also reaches the encoder
 directly; it is still held fixed while it judges a prediction.
@@ -486,9 +491,6 @@ class JEPAConfig:
                                            or (self.zlegal_judges_predictions and self.zlegal_weight > 0)):
             raise ValueError("with zhead_fit 'online' a head judging predictions already learns from the online z "
                              "of the whole board: leave decode_weight / zlegal_weight at 0")
-        if (self.decode_masked_weight > 0 or self.zlegal_masked_weight > 0) and self.zpred_weight <= 0:
-            raise ValueError("decode_masked_weight and zlegal_masked_weight judge the whole-board predictor's "
-                             "output: they need zpred_weight > 0")
         if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
             raise ValueError("need 0 < rollout_ramp_fraction <= 1 and rollout_step_decay > 0")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
@@ -1306,7 +1308,8 @@ class LabyrinthJEPA(nn.Module):
             p.requires_grad_(False)
         self.mask_predictor = MaskPredictor(config)
         self.next_predictor = NextPredictor(config)
-        self.full_predictor = FullPredictor(config) if config.zpred_weight > 0 else None
+        self.full_predictor = FullPredictor(config) \
+            if config.zpred_weight > 0 or config.decode_masked_weight > 0 or config.zlegal_masked_weight > 0 else None
         self.move_predictor = MovePredictor(config) if config.inverse_weight > 0 else None
         # The head the anti-collapse terms act on (none: they act on z itself); never part of the encoder
         self.projector = _mlp([config.z_dim] + [config.projector_hidden] * (config.projector_layers - 1)

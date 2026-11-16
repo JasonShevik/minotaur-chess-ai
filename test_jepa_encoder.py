@@ -763,8 +763,7 @@ def test_z_heads_judge_predictions_with_the_head_held_fixed():
         raise AssertionError("judging next positions' legal moves needs them")
     except ValueError:
         pass
-    for bad in (dict(decode_masked_weight=1.0), dict(zlegal_masked_weight=1.0), dict(zlegal_weight=-1.0),
-                dict(decode_next_weight=-1.0)):
+    for bad in (dict(zlegal_weight=-1.0), dict(decode_next_weight=-1.0)):   # (masked heads without zpred: allowed)
         try:
             small_config("squares", **bad).validate()
             raise AssertionError(f"{bad} should be rejected")
@@ -1303,6 +1302,38 @@ def test_dehb_search_space_samples_build():
                                         "d_model": 32, "readout_queries": 4})
         model = lje.LabyrinthJEPA(cfg)
         assert torch.isfinite(model.losses(make_batch(cfg, FENS[:2]), rng=torch.Generator().manual_seed(0)).total)
+
+
+def test_heads_alone_train_without_the_latent_losses():
+    """
+    With the latent losses at 0 and the heads fitting the online z, nothing the target encoder makes reaches the
+    loss; the heads judging the whole-board predictor's output no longer need its latent loss (same weights).
+    """
+    heads = dict(zhead_fit="online", zlegal_next_weight=1.0, zlegal_masked_weight=1.0, decode_next_weight=1.0,
+                 decode_masked_weight=1.0)
+    cfg = small_config("squares", mask_weight=0.0, next_weight=0.0, zpred_weight=0.0, **heads)
+    cfg.validate()
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+    torch.manual_seed(0)
+    with_latent = lje.LabyrinthJEPA(small_config("squares", zpred_weight=1.0, **heads))
+    assert model.full_predictor is not None
+    assert all(torch.equal(v, with_latent.state_dict()[k]) for k, v in model.state_dict().items())
+    batch = make_batch(cfg)
+    out = model.losses(batch, rng=torch.Generator().manual_seed(0))
+    assert all(float(out.terms[k]) == 0.0 for k in ("mask", "next", "zpred"))
+    for name in ("decode_fit", "decode_next", "decode_masked", "zlegal_fit", "zlegal_next", "zlegal_masked"):
+        assert float(out.terms[name]) > 0, name
+    out.total.backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder.parameters())
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.full_predictor.parameters())
+    assert all(p.grad is None or float(p.grad.abs().sum()) == 0 for p in model.mask_predictor.parameters())
+    # the target encoder can be anything: the loss does not change
+    with torch.no_grad():
+        for p in model.target.parameters():
+            p.add_(torch.randn_like(p))
+    again = model.losses(batch, rng=torch.Generator().manual_seed(0))
+    assert float(again.total) == float(out.total)
 
 
 def test_predictors_can_read_z_layer_normalized():
