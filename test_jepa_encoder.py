@@ -1162,6 +1162,54 @@ def test_sum_branch_keeps_the_other_weights_and_counts_neighbours():
     assert torch.isfinite(lje.LabyrinthJEPA(cfg).losses(make_batch(cfg), rng=torch.Generator().manual_seed(0)).total)
 
 
+def test_concat_readout_gives_every_square_its_own_slot():
+    """
+    readout "concat": the 64 square tokens side by side through an MLP (or one linear layer) to z. Every weight
+    but the readout's own is that of the mean-readout model; z tells a position from its mirror image with no
+    marks at all (the mean cannot); a change on one square moves z through that square's slot alone.
+    """
+    fen = FENS[3]                                                                   # no castling rights
+    mirror = ld.normalize_fen(chess.Board(fen).transform(chess.flip_horizontal).fen(en_passant="xfen"))
+    graphs = ld.pack_views([ld.build_views(f, torch.zeros(64, dtype=torch.bool))[0] for f in (fen, mirror)])
+    models = {}
+    for readout, hidden in (("mean", 0), ("concat", 0), ("concat", 48)):
+        cfg = small_config("squares", transformer_layers=0, readout=readout, readout_hidden=hidden,
+                           zpred_weight=1.0, zlegal_weight=1.0)
+        cfg.validate()
+        torch.manual_seed(0)
+        models[readout, hidden] = model = lje.LabyrinthJEPA(cfg)
+        with torch.no_grad():
+            out = model.encoder.eval()(graphs)
+        assert out.z.shape == (2, cfg.z_dim)
+        gap = float((out.z[0] - out.z[1]).norm() / out.z[0].norm())
+        assert (gap < 1e-5) if readout == "mean" else (gap > 1e-2), (readout, gap)
+        losses = model.train().losses(make_batch(cfg), rng=torch.Generator().manual_seed(0))
+        assert torch.isfinite(losses.total)
+        losses.total.backward()
+        assert all(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder.readout_proj.parameters())
+    mean_state = models["mean", 0].state_dict()
+    for key in (("concat", 0), ("concat", 48)):
+        state = models[key].state_dict()
+        assert set(state) - set(mean_state) <= {k for k in state if ".readout_proj." in k}
+        assert all(torch.equal(v, mean_state[k]) for k, v in state.items() if ".readout_proj." not in k), key
+    first = models["concat", 0].encoder.readout_proj[0]
+    assert first.weight.shape == (models["concat", 0].config.z_dim, 64 * 32)
+    assert models["concat", 48].encoder.readout_proj[0].weight.shape == (48, 64 * 32)
+    # one square's token reaches z through its own 32 columns
+    encoder = models["concat", 0].encoder.eval()
+    with torch.no_grad():
+        tokens = torch.randn(1, 64, 32)
+        moved = tokens.clone()
+        moved[0, 10] += 1.0
+        dz = first(moved.reshape(1, -1)) - first(tokens.reshape(1, -1))
+        assert torch.allclose(dz[0], first.weight[:, 10 * 32:11 * 32].sum(1), atol=1e-5)
+    try:
+        small_config("registers", readout="concat").validate()
+        raise AssertionError("readout 'concat' with register tokens should be rejected")
+    except ValueError:
+        pass
+
+
 def test_concatenated_gat_layers_and_the_mean_max_readout():
     """
     gat_style "concat": full-width heads side by side with the square's own features, reduced by a per-square

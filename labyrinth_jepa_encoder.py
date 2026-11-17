@@ -94,7 +94,11 @@ The encoder:
                concatenated and projected to z (z_dim). readout = "mean": the tokens' mean, projected.
                "mean_max": their mean and per-dimension maximum side by side, projected (a mean
                dilutes what a single square holds, such as a king in check). readout_hidden > 0
-               makes the projection an MLP.
+               makes the projection an MLP. "concat": the 64 square tokens side by side, in board
+               order (a1 first, the side to move at the bottom), through that MLP or one linear
+               layer: every square keeps a slot of its own in what z is made from, so nothing is
+               averaged away, and z can tell a position from its mirror image by construction.
+               (Square tokens only: registers and unpooled nodes have no fixed slots.)
     transformer_layers = 0 leaves the transformer out (the square tokens are then only as global as the
     GAT layers make them); pred_transformer_layers puts attention in the masked-square predictor instead.
     token_mixer swaps the transformer's attention for MLPs: "mlp" keeps only the per-token MLPs (depth
@@ -178,7 +182,7 @@ import labyrinth_data as ld
 TOKEN_VARIANTS = ("squares", "registers", "unpool")
 ANTICOLLAPSE = ("sigreg", "vicreg", "none")
 ANTICOLLAPSE_VIEWS = ("both", "full", "masked")
-READOUTS = ("attention", "mean", "mean_max")
+READOUTS = ("attention", "mean", "mean_max", "concat")
 GAT_STYLES = ("split", "concat")
 TOKEN_MIXERS = ("attention", "mlp", "mixer")
 ZHEAD_FITS = ("target", "online")
@@ -245,7 +249,8 @@ class JEPAConfig:
 
     # ----- Readout -----
     readout: str = "attention"       # "attention": learned queries attend over the tokens; "mean": their mean;
-                                     # "mean_max": their mean and per-dimension maximum side by side
+                                     # "mean_max": their mean and per-dimension maximum side by side; "concat":
+                                     # the 64 square tokens side by side, each in its own slot
     readout_queries: int = 8
     readout_hidden: int = 0          # > 0: an MLP with this hidden width turns the pooled tokens into z (0: one linear layer)
     z_dim: int = 1024                # keep fixed during a DEHB search, so LiDAR scores are comparable
@@ -461,6 +466,8 @@ class JEPAConfig:
             raise ValueError(f"readout must be one of {READOUTS}")
         if self.readout_hidden < 0:
             raise ValueError("readout_hidden must be at least 0")
+        if self.readout == "concat" and self.token_variant != "squares":
+            raise ValueError("readout 'concat' gives each of the 64 squares a slot: it needs token_variant 'squares'")
         if self.token_mixer not in TOKEN_MIXERS:
             raise ValueError(f"token_mixer must be one of {TOKEN_MIXERS}")
         if self.token_mixer == "mixer" and self.uses_unpool:
@@ -588,6 +595,15 @@ def _add_inputs(linear: nn.Module, extra: int, generator: Optional[torch.Generat
     linear.weight = nn.Parameter(torch.cat([weight, new.to(weight)], dim=1))
     # The layer's recorded input size is left alone: PyG's Linear re-draws a weight of that size from the global
     # stream whenever it is deep-copied (as the target encoder is), so changing it would shift every later weight
+
+
+def _mlp_from(generator: Optional[torch.Generator], sizes: Sequence[int]) -> nn.Sequential:
+    """_mlp(sizes) with its linear layers drawn from `generator` (None: the global stream)."""
+    layers: List[nn.Module] = []
+    for i in range(len(sizes) - 2):
+        layers += [_linear_from(generator, sizes[i], sizes[i + 1]), nn.LayerNorm(sizes[i + 1]), nn.GELU()]
+    layers.append(_linear_from(generator, sizes[-2], sizes[-1]))
+    return nn.Sequential(*layers)
 
 
 def _linear_from(generator: Optional[torch.Generator], in_dim: int, out_dim: int, bias: bool = True) -> nn.Linear:
@@ -806,9 +822,17 @@ class LabyrinthEncoder(nn.Module):
             self.queries = nn.Parameter(torch.randn(c.readout_queries, c.d_model) * 0.02)
             self.readout_attn = nn.MultiheadAttention(c.d_model, c.transformer_heads, batch_first=True)
             self.readout_norm = nn.LayerNorm(c.d_model)
-        pooled = {"attention": c.readout_queries, "mean": 1, "mean_max": 2}[c.readout] * c.d_model
-        self.readout_proj = nn.Linear(pooled, c.z_dim) if c.readout_hidden == 0 else \
-            _mlp([pooled, c.readout_hidden, c.z_dim])
+        if c.readout == "concat":
+            # The slots' weights come from a stream of their own, and the global stream advances as it does
+            # for a mean readout with one linear layer: everything built after the readout (the predictors,
+            # the heads) then starts exactly as in that model
+            nn.Linear(c.d_model, c.z_dim)
+            sizes = [64 * c.d_model] + ([c.readout_hidden] if c.readout_hidden else []) + [c.z_dim]
+            self.readout_proj = _mlp_from(_own_generator(7), sizes)
+        else:
+            pooled = {"attention": c.readout_queries, "mean": 1, "mean_max": 2}[c.readout] * c.d_model
+            self.readout_proj = nn.Linear(pooled, c.z_dim) if c.readout_hidden == 0 else \
+                _mlp([pooled, c.readout_hidden, c.z_dim])
 
     def forward(
         self,
@@ -876,6 +900,8 @@ class LabyrinthEncoder(nn.Module):
             queries = self.queries.unsqueeze(0).expand(B, -1, -1)
             read, _ = self.readout_attn(queries, tokens, tokens, key_padding_mask=pad, need_weights=False)
             z = self.readout_proj(self.readout_norm(read).reshape(B, -1))
+        elif c.readout == "concat":
+            z = self.readout_proj(tokens[:, :64].reshape(B, -1))
         else:
             keep = (~pad).unsqueeze(-1).to(tokens.dtype)
             pooled = (tokens * keep).sum(1) / keep.sum(1)

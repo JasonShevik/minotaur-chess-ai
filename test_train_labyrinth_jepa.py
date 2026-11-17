@@ -189,6 +189,8 @@ def test_schedules_and_weight_decay_groups():
     assert abs(tj.lr_factor(99, 1000, 100, 0.01) - 1.0) < 1e-9
     assert abs(tj.lr_factor(1000, 1000, 100, 0.01) - 0.01) < 1e-9
     assert tj.lr_factor(550, 1000, 100, 0.01) < tj.lr_factor(300, 1000, 100, 0.01)
+    # min_fraction 1: the rate stays at its peak after the warm-up
+    assert all(abs(tj.lr_factor(s, 1000, 100, 1.0) - 1.0) < 1e-9 for s in (99, 400, 1000))
     # warm-up is capped at a tenth of a short run
     assert abs(tj.lr_factor(9, 100, 1000, 0.0) - 1.0) < 1e-9
     model = lje.LabyrinthJEPA(tiny_config("registers"))

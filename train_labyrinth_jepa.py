@@ -86,7 +86,8 @@ class RunConfig:
     total_steps: int = 20_000
     batch_size: Optional[int] = None                 # None: DEFAULT_BATCH_SIZE for the token variant
     warmup_steps: int = 1_000                        # capped at a tenth of the run
-    min_lr_fraction: float = 0.01                    # the cosine decays to this fraction of the peak lr
+    min_lr_fraction: float = 0.01                    # the cosine decays to this fraction of the peak lr (1: the
+                                                     # rate stays at its peak after the warm-up)
     grad_clip: float = 1.0
     num_workers: int = 8
     max_train_positions: Optional[int] = None        # train on a subset (for short runs)
@@ -756,6 +757,8 @@ def main() -> None:
         p.add_argument("--workers", type=int, default=8)
         p.add_argument("--max-train-positions", type=int, default=None)
         p.add_argument("--seed", type=int, default=0)
+        p.add_argument("--min-lr-fraction", type=float, default=RunConfig.min_lr_fraction,
+                       help="the cosine decays to this fraction of the peak learning rate; 1 keeps it constant after the warm-up")
     t = sub.choices["train"]
     t.add_argument("--steps", type=int, default=20_000)
     t.add_argument("--out", default="runs/labyrinth_jepa")
@@ -780,7 +783,8 @@ def main() -> None:
     if args.variant:
         values["token_variant"] = args.variant
     run = RunConfig(cache_dir=args.cache, batch_size=args.batch_size, num_workers=args.workers,
-                    max_train_positions=args.max_train_positions, seed=args.seed)
+                    max_train_positions=args.max_train_positions, seed=args.seed,
+                    min_lr_fraction=args.min_lr_fraction)
 
     if args.command == "train":
         config = lje.JEPAConfig.from_dict(values)
