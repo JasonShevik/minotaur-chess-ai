@@ -4,8 +4,11 @@ Trained-head probes: what can a small MLP read from a frozen encoder's z?
 probe_labyrinth.py asks how z is organized: a linear probe fitted on a few thousand positions, and nearest
 neighbours. A z that holds the whole board, square by square, scores badly there however much it holds (a
 one-hot board does too). The final encoder is meant to stay frozen under trained heads, so this file measures
-it the way it will be used: the SAME MLP, trained the same way, on each encoder's z and on the raw board (the
-64 squares' node features, flattened). A head on z that beats the same head on the raw board means the
+it the way it will be used: the SAME MLP, trained the same way, on each encoder's z and on the board itself,
+written two ways: "one-hot board" (for each of the 64 squares, which of the 14 things the position decoder
+tells apart stands on it: nothing, one of the mover's six pieces, one of the other side's, the en passant
+square) and "raw board" (the 64 squares' node features as the encoder is given them, where a piece's type
+and its side are separate numbers). A head on z that beats the same head on the one-hot board means the
 encoder has made something explicit that the board leaves implicit; a tie means z is a copy of the board.
 
 The probes (every position is seen from the side to move, as the encoder sees it):
@@ -30,13 +33,15 @@ The probes (every position is seen from the side to move, as the encoder sees it
   material      Material balance from the side to move's view. Score: R2 (a head should simply get this right).
 
 Each probe: positions split 80 / 10 / 10 by a hash of the position; inputs standardized on the training rows;
-an MLP (input -> 1024 -> 1024 -> output) trained with AdamW, the epoch chosen on the validation rows, scored
-on the test rows; the mean of `seeds` trainings.
+an MLP (input -> 1024 -> 1024 -> output) trained with AdamW for a fixed number of epochs, the best epoch
+chosen on the validation rows, scored on the test rows; the mean of `seeds` trainings. (Stopping early when
+the validation score stalled made the regression heads swing by 0.1 to 0.2 R2 between seeds; training every
+epoch and keeping the best one brings that under 0.01.)
 
     python probe_heads.py "raw board" C_mean=runs/step21/C_all6_mean:4000 C_concat=runs/step21/C_all6_concat:4000
         [--size 100000 --seeds 2 --online --out results.json]
 
-("raw board" is always included; name=run_folder:snapshot_step for each encoder.)
+(The two boards are always included; name=run_folder:snapshot_step for each encoder.)
 """
 from __future__ import annotations
 
@@ -67,6 +72,7 @@ MAIN = os.path.dirname(os.path.dirname(os.path.dirname(ROOT))) if ".claude" in R
 DEFAULT_PUZZLES = os.path.join(MAIN, "lichess_db_puzzle.csv.zst")
 DEFAULT_DB = os.path.join(MAIN, "minotaur_data.db")
 RAW = "raw board"
+ONEHOT = "one-hot board"
 
 
 # ##### ##### ##### ##### #####
@@ -336,13 +342,20 @@ def load_sets(puzzles: str, db: str, size: int, seed: int, cache_dir: Optional[s
     path = os.path.join(cache_dir, f"probe_heads_sets_{size}_{seed}.pkl") if cache_dir else None
     if path and os.path.exists(path):
         with open(path, "rb") as f:
-            return pickle.load(f)
+            return _SetUnpickler(f).load()
     sets = {**build_puzzle_sets(puzzles, size, seed, log), **build_engine_sets(db, size, seed, log)}
     if path:
         os.makedirs(cache_dir, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(sets, f)
     return sets
+
+
+class _SetUnpickler(pickle.Unpickler):
+    """Reads a cache whichever module wrote it (run as a script, this file is "__main__")."""
+
+    def find_class(self, module: str, name: str):
+        return ProbeSet if name == "ProbeSet" else super().find_class(module, name)
 
 
 # ##### ##### ##### ##### #####
@@ -352,12 +365,16 @@ def load_sets(puzzles: str, db: str, size: int, seed: int, cache_dir: Optional[s
 @torch.no_grad()
 def encode_inputs(encoders: Dict[str, torch.nn.Module], fens: Sequence[str], device,
                   batch_size: int = 250) -> Dict[str, torch.Tensor]:
-    """{name: [N, dim] float16 on the CPU} for every encoder's z, and RAW: the 64 squares' node features, flattened."""
-    out: Dict[str, List[torch.Tensor]] = {name: [] for name in [RAW, *encoders]}
+    """
+    {name: [N, dim] float16 on the CPU} for every encoder's z, and the board itself: ONEHOT (64 squares x the
+    position decoder's 14 classes) and RAW (the 64 squares' node features, flattened).
+    """
+    out: Dict[str, List[torch.Tensor]] = {name: [] for name in [ONEHOT, RAW, *encoders]}
     none = torch.zeros(64, dtype=torch.bool)
     for lo in range(0, len(fens), batch_size):
         graphs = ld.pack_views([ld.build_views(f, none)[0] for f in fens[lo:lo + batch_size]]).to(device)
         out[RAW].append(graphs.x.view(graphs.num_graphs, -1).half().cpu())
+        out[ONEHOT].append(F.one_hot(lje.square_classes(graphs), lje.SQUARE_CLASSES).flatten(1).half().cpu())
         for name, encoder in encoders.items():
             out[name].append(encoder(graphs).z.half().cpu())
     return {name: torch.cat(parts) for name, parts in out.items()}
@@ -396,12 +413,13 @@ HEADLINE = {"binary": "auc", "regression": "r2", "move": "top1"}
 
 def fit_head(x: torch.Tensor, y: np.ndarray, split: np.ndarray, kind: str, legal: Optional[torch.Tensor] = None,
              seed: int = 0, device="cuda", hidden: int = 1024, epochs: int = 30, batch_size: int = 512,
-             lr: float = 1e-3, weight_decay: float = 0.01, patience: int = 4) -> Dict[str, float]:
+             lr: float = 1e-3, weight_decay: float = 0.01, patience: Optional[int] = None) -> Dict[str, float]:
     """
     Train one head (input -> hidden -> hidden -> output) on the training rows and score it on the test rows at
     the epoch that did best on the validation rows. x [N, dim] (any float type; standardized here on the
     training rows); kind "binary" (y 0 / 1), "regression" (y standardized on the training rows inside, scored as
     R2 of the original values) or "move" (y the pair index; legal [N, NUM_PAIRS] masks the other pairs out).
+    patience: stop after this many epochs without a better validation score (None: train every epoch).
     """
     torch.manual_seed(seed)
     x = x.to(device).float()
@@ -457,7 +475,7 @@ def fit_head(x: torch.Tensor, y: np.ndarray, split: np.ndarray, kind: str, legal
             best_state = {k: v.clone() for k, v in head.state_dict().items()}
         else:
             stale += 1
-            if stale >= patience:
+            if patience is not None and stale >= patience:
                 break
     head.load_state_dict(best_state)
     return evaluate(parts[2])
@@ -531,7 +549,7 @@ def main() -> None:
         sets = {name: sets[name] for name in args.only.split(",")}
     encoders = {}
     for spec in args.encoders:
-        if spec == RAW:
+        if spec in (RAW, ONEHOT):
             continue
         name, _, where = spec.partition("=")
         run, _, snap = where.rpartition(":")

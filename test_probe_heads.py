@@ -142,6 +142,9 @@ def test_inputs_are_z_and_the_raw_board():
     fens = [ld.normalize_fen(chess.Board().fen()), ld.normalize_fen("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1")]
     out = ph.encode_inputs({"tiny": encoder}, fens, "cpu", batch_size=1)
     assert out["tiny"].shape == (2, 48) and out[ph.RAW].shape[0] == 2 and out[ph.RAW].shape[1] % 64 == 0
+    onehot = out[ph.ONEHOT].float().view(2, 64, -1)
+    assert onehot.shape[2] == lje.SQUARE_CLASSES and bool((onehot.sum(2) == 1).all())      # one class a square
+    assert float(onehot[0, :, 0].sum()) == 32 and float(onehot[1, :, 0].sum()) == 64 - 9    # empty squares
     assert out["tiny"].dtype == torch.float16
 
 
