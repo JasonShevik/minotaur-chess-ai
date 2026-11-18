@@ -10,6 +10,9 @@ lc0-v*/
 # minotaur_data.db is the full ~3M position table (>500 MB; GitHub caps files at 100 MB).
 # The small exported minotaur_analyzed.db IS tracked on purpose.
 minotaur_data*.db
+# The reach labels database reach_labeler.py fills (many GB).
+minotaur_reach*.db
+*.db.stop
 *.db-journal
 *.db-wal
 *.db-shm
