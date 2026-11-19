@@ -25,7 +25,9 @@ import torch
 import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import labyrinth_data as ld
 import labyrinth_jepa_encoder as lje
+import piece_reach as pr
 import probe_labyrinth as pl
+import reach_labeler as rl
 import train_labyrinth_jepa as tj
 
 
@@ -310,6 +312,63 @@ def test_config_loading_accepts_dehb_and_run_files():
                 json.dump(payload, f)
             assert tj._load_config(path) == {"gat_dim": 64}
     assert tj._load_config(None) == {}
+
+
+def test_a_run_with_the_legal_threat_head_reads_the_labellers_database():
+    """
+    The labeller walks the positions a run will see, in its order, with its rollout moves. So a run on a
+    labelled split finds every training position's label in the database, and every rollout position's.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        db = os.path.join(tmp, "labels.db")
+        labelled = rl.label(db_path=db, cache_dir=cache, split="train", depth=2, workers=0, order_seed=0,
+                            rollout_plies=2, kind="threats", log=quiet)
+        cfg = tiny_config("squares", transformer_layers=0, move_encoding="rank_file", rollout_start_steps=3,
+                          rollout_max_steps=3, zhead_fit="online", zthreat_next_weight=1.0, zthreat_masked_weight=1.0,
+                          zthreat_plies=2, zthreat_mode="count", zthreat_head="bilinear", zthreat_dim=8,
+                          zthreat_start_plies=0, zthreat_stage_positions=16, rollout_ramp_fraction=0.5)
+        messages = []
+        run = tiny_run(cache, os.path.join(tmp, "run"), total_steps=6, eval_every=0, probe_positions=0, threat_db=db,
+                       threat_compute=False, grad_terms_every=3)
+        result = tj.train(cfg, run, log=messages.append)
+        steps = [h for h in result["history"] if "loss" in h]
+        assert len(steps) == 6 and labelled["done"] >= 6 * 8
+        assert any(f"the database holds the first {labelled['done']:,} samples" in m for m in messages)
+        for h in steps:
+            assert h["threats_stored"] == 1.0 and h["threats_searched"] == 0.0, "every position's label was in the database"
+            assert h["zthreat_fit_labelled"] == 1.0 and h["zthreat_next_labelled"] == 1.0, "and every rollout position's"
+            assert {"loss_zthreat_fit", "loss_zthreat_next", "loss_zthreat_masked", "zthreat_fit_found"} <= set(h)
+            assert "zthreat_next_found_step2" in h and "zthreat_next_found_step3" not in h, "two rollout positions have labels"
+        # 8 positions a step, 16 a stage: ply 0 alone for two steps, ply 1 joins at half weight, then ply 2
+        assert [[round(w, 6) for w in h["threat_weights"]] for h in steps] == \
+            [[1, 0, 0], [1, 0, 0], [1, 0, 0], [1, 1, 0], [1, 1, 0], [1, 1, 1]], [h["threat_weights"] for h in steps]
+        assert "zthreat_fit_found_1" not in steps[0] and "zthreat_fit_found_1" in steps[3] and "zthreat_fit_close_2" in steps[5]
+        assert sum("threat curriculum" in m for m in messages) == 2
+        assert any("threats real z=" in m and "counts" in m and "cells wrong" in m for m in messages), "the log shows the head"
+        norms = [h for h in result["history"] if "grad_terms" in h][-1]["grad_terms"]["norms"]
+        assert {"zthreat_fit", "zthreat_next", "zthreat_masked"} <= set(norms) and norms["zthreat_fit"]["encoder"] > 0
+        # validation positions are not in the database and nothing may be searched: they go ungraded
+        final = result["final"]
+        assert final["val_zthreat_fit_labelled"] == 0.0 and final["val_loss_zthreat_fit"] == 0.0
+
+        # with nothing to take labels from, the run says so at once
+        was = pr.USING_C
+        try:
+            pr.use_compiled(False)
+            tj.train(cfg, tiny_run(cache, None, total_steps=1, eval_every=0, probe_positions=0,
+                                   threat_db=os.path.join(tmp, "absent.db")), log=quiet)
+            raise AssertionError("no labels database and no search: the run should refuse")
+        except ValueError as error:
+            assert "labels" in str(error)
+        finally:
+            pr.use_compiled(was)
+        if pr.USING_C:                                  # the search fills in for the database, validation included
+            result = tj.train(cfg, tiny_run(cache, None, total_steps=2, eval_every=0, probe_positions=0, threat_db=None),
+                              log=quiet)
+            last = [h for h in result["history"] if "loss" in h][-1]
+            assert last["threats_stored"] == 0.0 and last["threats_searched"] == 1.0
+            assert result["final"]["val_zthreat_fit_labelled"] == 1.0 and result["final"]["val_loss_zthreat_fit"] > 0
 
 
 # ##### ##### ##### ##### #####

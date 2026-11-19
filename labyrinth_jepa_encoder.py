@@ -46,17 +46,18 @@ board instead, with answers the rules of chess give (no engine, no game results)
                      a decoder of the whole position. Its outputs are in board order, so z has to say
                      where every piece is, left and right included (a mirror-blind z cannot).
 
-Two heads read nothing but z, as whatever uses the trained encoder will, and can judge a PREDICTED z by the
-board it should stand for: the position decoder above, and a legal-move head (given z and a move named by
-its squares' files and ranks: is the move legal?). Each can be asked about three z:
+Three heads read nothing but z, as whatever uses the trained encoder will, and can judge a PREDICTED z by the
+board it should stand for: the position decoder above, a legal-move head (given z and a move named by
+its squares' files and ranks: is the move legal?), and the legal-threat head described further down. Each
+can be asked about three z:
 
-    the position's own z      decode_weight, zlegal_weight: the online encoder's z of the whole board. The
-                              loss trains the head and the encoder together (not a prediction).
-    the predicted next z      decode_next_weight, zlegal_next_weight: the next-position predictor's output,
-                              judged against the position the move leads to.
-    the predicted whole z     decode_masked_weight, zlegal_masked_weight: the whole-board predictor's output
-                              from the masked board's z, judged against the whole board (with zpred_weight 0
-                              the predictor learns from these heads alone).
+    the position's own z      decode_weight, zlegal_weight, zthreat_weight: the online encoder's z of the whole
+                              board. The loss trains the head and the encoder together (not a prediction).
+    the predicted next z      decode_next_weight, zlegal_next_weight, zthreat_next_weight: the next-position
+                              predictor's output, judged against the position the move leads to.
+    the predicted whole z     decode_masked_weight, zlegal_masked_weight, zthreat_masked_weight: the whole-board
+                              predictor's output from the masked board's z, judged against the whole board
+                              (with zpred_weight 0 the predictor learns from these heads alone).
 
 For the two predicted z the head learns only from the target encoder's z of real positions (no gradient
 reaches the encoder that way) and is held fixed while it judges a prediction, so that loss moves the
@@ -68,6 +69,35 @@ part in training; it still follows the online encoder by moving average, and eva
 zhead_fit = "online" has a head that judges predictions learn instead from the online encoder's z of the
 whole board, with the gradient on (the own-z term, weight 1), so the board also reaches the encoder
 directly; it is still held fixed while it judges a prediction.
+
+The legal-threat head (zthreat_*) is graded against labels worked out ahead of training
+(piece_reach.threat_counts, handed over by labyrinth_data.ThreatLabels). For every piece on the board, of
+either side, and every square: after k plies of legal play (k = 0: as the position stands), could the piece
+legally move to the square, were it its side's turn, and after how many of the k-ply sequences? A pinned
+piece threatens nothing off the line of its pin, and a piece another piece's move frees threatens its new
+squares from that ply on, so these are relations between pieces, not facts about single squares, and every
+ply adds some for both sides.
+
+    zthreat_plies   the head answers for 0, 1, ..., this many plies. zthreat_start_plies and
+                    zthreat_stage_positions make that a curriculum, shallow plies first (threat_schedule).
+    zthreat_mode    "binary": can the threat arise? A logit per ply, piece square and target square. A few
+                    cells in a hundred are threats, so threats and non-threats weigh the same in the loss.
+                    "count": also in how many sequences, as log(1 + count), graded where there is a threat
+                    (the counts span five orders of magnitude; most sequences change nothing for a given
+                    piece, so raw counts would mostly measure how many sequences there are).
+    zthreat_head    how much the head may work out for itself. The encoder is to be frozen and read by
+                    trained heads, so the question is what z makes easy to read; a head strong enough to work
+                    threats out from a plain copy of the board asks nothing of z. Weakest first:
+                      "linear"     every answer is a linear function of z
+                      "bilinear"   z gives every piece square a vector and every target square a vector,
+                                   each linear in z; an answer is a product of the two
+                      "piece_mlp"  every piece square has a hidden layer of its own on z
+                    (One hidden layer shared by all 64 piece squares would be no stronger than its width
+                    allows a single vector per position to be: the pieces need their own.)
+                    threat_head_fit.py fits each form alone on the board itself, to show what it does unaided.
+
+Only pieces' rows are graded (an empty square has nothing to threaten with), and only positions that have a
+label; squares are in the graph's frame, the side to move at the bottom.
 
 The encoder:
 
@@ -186,6 +216,8 @@ READOUTS = ("attention", "mean", "mean_max", "concat")
 GAT_STYLES = ("split", "concat")
 TOKEN_MIXERS = ("attention", "mlp", "mixer")
 ZHEAD_FITS = ("target", "online")
+THREAT_HEADS = ("linear", "bilinear", "piece_mlp")     # the legal-threat head, weakest first
+THREAT_MODES = ("binary", "count")
 MOVE_ENCODINGS = ("tokens", "squares", "rank_file")
 MOVE_FRAMES = ("start", "mover")
 ROLLOUT_TARGETS = ("all", "log")
@@ -316,6 +348,20 @@ class JEPAConfig:
                                         # encoder's z of real positions, no gradient into the encoder) or
                                         # "online" (the online encoder's z of the whole board, gradient on)
 
+    # ----- The legal-threat head (reads only z too; see the module docstring) -----
+    zthreat_weight: float = 0.0         # on the position's own (online) z; with all three at 0 there is no head
+    zthreat_next_weight: float = 0.0    # ... on the predicted next z, against the next position's threats
+    zthreat_masked_weight: float = 0.0  # ... on the whole-board z predicted from the masked board's z
+    zthreat_plies: int = 2              # the head answers for 0, 1, ..., this many plies of play (the labels
+                                        # must be at least this deep)
+    zthreat_head: str = "linear"        # "linear" | "bilinear" | "piece_mlp": how much the head works out itself
+    zthreat_mode: str = "binary"        # "binary": can the threat arise; "count": also in how many sequences
+    zthreat_count_weight: float = 1.0   # ("count") the count term's weight beside the yes/no term
+    zthreat_dim: int = 128              # ("bilinear") the size of the piece and target-square vectors
+    zthreat_hidden: int = 256           # ("piece_mlp") the width of each piece square's hidden layer
+    zthreat_start_plies: int = 1        # the curriculum: plies 0 to this are graded from the start, and one
+    zthreat_stage_positions: int = 0    # more every this many training positions (0: all of them from the start)
+
     # ----- Objectives -----
     mask_weight: float = 1.0
     next_weight: float = 1.0
@@ -402,6 +448,15 @@ class JEPAConfig:
     @property
     def zlegal_judges_predictions(self) -> bool:
         return self.zlegal_next_weight > 0 or self.zlegal_masked_weight > 0
+
+    @property
+    def zthreat_judges_predictions(self) -> bool:
+        return self.zthreat_next_weight > 0 or self.zthreat_masked_weight > 0
+
+    @property
+    def uses_threats(self) -> bool:
+        """Whether the model has the legal-threat head (and its batches must carry threat labels)."""
+        return self.zthreat_weight > 0 or self.zthreat_judges_predictions
 
     @property
     def mark_dim(self) -> int:
@@ -495,9 +550,20 @@ class JEPAConfig:
         if self.zhead_fit not in ZHEAD_FITS:
             raise ValueError(f"zhead_fit must be one of {ZHEAD_FITS}")
         if self.zhead_fit == "online" and ((self.decodes_predictions and self.decode_weight > 0)
-                                           or (self.zlegal_judges_predictions and self.zlegal_weight > 0)):
+                                           or (self.zlegal_judges_predictions and self.zlegal_weight > 0)
+                                           or (self.zthreat_judges_predictions and self.zthreat_weight > 0)):
             raise ValueError("with zhead_fit 'online' a head judging predictions already learns from the online z "
-                             "of the whole board: leave decode_weight / zlegal_weight at 0")
+                             "of the whole board: leave decode_weight / zlegal_weight / zthreat_weight at 0")
+        if min(self.zthreat_weight, self.zthreat_next_weight, self.zthreat_masked_weight, self.zthreat_count_weight) < 0:
+            raise ValueError("the legal-threat head's weights must be at least 0")
+        if self.zthreat_head not in THREAT_HEADS:
+            raise ValueError(f"zthreat_head must be one of {THREAT_HEADS}")
+        if self.zthreat_mode not in THREAT_MODES:
+            raise ValueError(f"zthreat_mode must be one of {THREAT_MODES}")
+        if not 0 <= self.zthreat_start_plies <= self.zthreat_plies or self.zthreat_stage_positions < 0:
+            raise ValueError("need 0 <= zthreat_start_plies <= zthreat_plies and zthreat_stage_positions >= 0")
+        if self.zthreat_dim < 1 or self.zthreat_hidden < 1:
+            raise ValueError("zthreat_dim and zthreat_hidden must be at least 1")
         if not 0 < self.rollout_ramp_fraction <= 1 or self.rollout_step_decay <= 0:
             raise ValueError("need 0 < rollout_ramp_fraction <= 1 and rollout_step_decay > 0")
         if not 0 <= self.mask_min_ratio <= self.mask_max_ratio <= 1:
@@ -1212,6 +1278,157 @@ def held_fixed(head: nn.Module, *inputs: torch.Tensor) -> torch.Tensor:
     return torch.func.functional_call(head, {name: p.detach() for name, p in head.named_parameters()}, inputs)
 
 
+class ZThreatHead(nn.Module):
+    """
+    Legal threats, from z alone (layer-normalized): for each of 0 to zthreat_plies plies of play, each of the 64
+    squares a piece may stand on and each of the 64 squares it may threaten, a logit (can the piece now on the
+    first square legally move to the second after that many plies, were it its side's turn?) and, with
+    zthreat_mode "count", log(1 + the number of sequences after which it can). Squares are in the position's
+    frame, the side to move at the bottom; rows of empty squares mean nothing and are never graded.
+
+    zthreat_head says what stands between z and the answers (the module docstring says why it matters):
+      "linear"     one linear map from z to all of them
+      "bilinear"   two linear maps make a vector per piece square and a vector per target square
+                   (zthreat_dim each); an answer is the piece's vector, through a matrix of its ply and
+                   output, times the target's vector: products of pairs of z's coordinates, nothing more
+      "piece_mlp"  a hidden layer (zthreat_hidden wide, layer norm, GELU) for every piece square, then a
+                   linear map of its own to that piece's answers
+    """
+
+    def __init__(self, config: JEPAConfig):
+        super().__init__()
+        c = config
+        self.kind = c.zthreat_head
+        self.layers = c.zthreat_plies + 1
+        self.outputs = 2 if c.zthreat_mode == "count" else 1        # the yes/no logit, then the log count
+        groups = self.layers * self.outputs
+        if self.kind == "linear":
+            self.readout = nn.Linear(c.z_dim, groups * 4096)
+        elif self.kind == "bilinear":
+            d = c.zthreat_dim
+            self.piece = nn.Linear(c.z_dim, 64 * d)
+            self.square = nn.Linear(c.z_dim, 64 * d)
+            self.mix = nn.Parameter(torch.eye(d).repeat(groups, 1, 1) * d ** -0.5)
+            self.bias = nn.Parameter(torch.zeros(groups))
+        else:
+            h = c.zthreat_hidden
+            self.hidden = nn.Linear(c.z_dim, 64 * h)
+            self.norm = nn.LayerNorm(h)
+            self.out_weight = nn.Parameter(torch.empty(64, h, groups * 64).uniform_(-h ** -0.5, h ** -0.5))
+            self.out_bias = nn.Parameter(torch.zeros(64, groups * 64))
+
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """z [R, z_dim] -> (logits, log counts or None), each [R, layers, 64, 64]: [row, ply, piece square, target square]."""
+        R = z.size(0)
+        z = F.layer_norm(z, z.shape[-1:])
+        if self.kind == "linear":
+            out = self.readout(z).view(R, self.layers, self.outputs, 64, 64)
+        elif self.kind == "bilinear":
+            piece = self.piece(z).view(R, 64, -1)
+            square = self.square(z).view(R, 64, -1)
+            mixed = torch.einsum("rpi,gij->rgpj", piece, self.mix)                      # [R, groups, 64, d]
+            out = mixed @ square.transpose(1, 2).unsqueeze(1) + self.bias.view(1, -1, 1, 1)
+            out = out.view(R, self.layers, self.outputs, 64, 64)
+        else:
+            hidden = F.gelu(self.norm(self.hidden(z).view(R, 64, -1)))
+            out = torch.einsum("rph,pho->rpo", hidden, self.out_weight) + self.out_bias  # [R, 64, groups * 64]
+            out = out.view(R, 64, self.layers, self.outputs, 64).permute(0, 2, 3, 1, 4)
+        return out[:, :, 0], (out[:, :, 1] if self.outputs == 2 else None)
+
+    def targets(self, threats: ld.ThreatBatch, graphs: ld.GraphBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        What the head is graded against for the positions of `graphs` (whole boards, never a masked view):
+        (log(1 + count) [R, layers, 64, 64], 0 where there is no threat; graded [R, 64], True on the squares
+        whose row counts: a piece stands there and the position has a label).
+        """
+        if threats.layers < self.layers:
+            raise ValueError(f"the head answers for {self.layers - 1} plies but the labels reach {threats.layers - 1}")
+        pieces = graphs.x.view(graphs.num_graphs, 64, -1)[..., 1:7].sum(-1) > 0
+        return threats.dense()[:, :self.layers], pieces & (threats.origin != ld.THREATS_NONE)[:, None]
+
+
+THREAT_CLOSE = math.log(1.1)        # a count is "close" when 1 + count is within 10% of the truth
+
+
+def threat_scores(outputs: Tuple[torch.Tensor, Optional[torch.Tensor]], target: torch.Tensor, graded: torch.Tensor,
+                  weights: Optional[Sequence[float]] = None, count_weight: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    The legal-threat head's loss against ZThreatHead.targets' (target, graded), and its scores. weights: one per
+    ply's layer (threat_schedule's); a layer at 0 is not graded. Per layer:
+      * the yes/no logits: binary cross-entropy with threats and non-threats weighing the same;
+      * the log counts (count mode, from 1 ply on; after 0 plies every count is 1): smooth L1 where there is a
+        threat, times count_weight.
+    The loss is the layers' weighted mean. Scores, each as the same mean and per ply ("_k"):
+      "found"     threats said yes to; "rejected": non-threats said no to. (Some nine cells in ten are
+                  non-threats, so a few in a hundred of them wrong outnumber the threats missed.)
+      "new"       found, among the threats that were not there a ply earlier: what play brings about, as
+                  against what merely stays
+      "wrong"     cells answered wrongly, per position and ply (of the 64 answers of each of its pieces)
+      "exact"     positions with every cell right
+      "close"     counts within 10% of the truth; "count_error": the mean error of the log count (a factor of
+                  e ** count_error)
+    and "labelled", the share of the positions that have a label.
+    """
+    logits, counts = outputs
+    weights = list(weights) if weights is not None else [1.0] * logits.size(1)
+    cells = graded[:, :, None]
+    loss, scale = logits.new_zeros(()), 0.0
+    scores: Dict[str, float] = {}
+    means: Dict[str, List[Tuple[float, float]]] = {key: [] for key in ("found", "rejected", "new", "wrong", "exact",
+                                                                       "close", "count_error")}
+    rows = graded.any(1)
+    n_rows = rows.sum().clamp_min(1)
+    for k, w in enumerate(weights[:logits.size(1)]):
+        if w <= 0:
+            continue
+        yes = target[:, k] > 0
+        pos, neg = yes & cells, ~yes & cells
+        n_pos, n_neg = pos.sum().clamp_min(1), neg.sum().clamp_min(1)
+        per = F.binary_cross_entropy_with_logits(logits[:, k], yes.to(logits.dtype), reduction="none")
+        layer = 0.5 * ((per * pos).sum() / n_pos + (per * neg).sum() / n_neg)
+        with torch.no_grad():
+            said = logits[:, k] > 0
+            mistakes = ((said != yes) & cells).sum((1, 2))
+            results = {"found": float((said & pos).sum() / n_pos), "rejected": float((~said & neg).sum() / n_neg),
+                       "wrong": float(mistakes.sum() / n_rows), "exact": float(((mistakes == 0) & rows).sum() / n_rows)}
+            if k > 0:
+                new = pos & ~(target[:, k - 1] > 0)
+                results["new"] = float((said & new).sum() / new.sum().clamp_min(1))
+        if counts is not None and k > 0:
+            layer = layer + count_weight * (F.smooth_l1_loss(counts[:, k], target[:, k], reduction="none") * pos).sum() / n_pos
+            with torch.no_grad():
+                off = (counts[:, k] - target[:, k]).abs()
+                results["close"] = float(((off < THREAT_CLOSE) & pos).sum() / n_pos)
+                results["count_error"] = float((off * pos).sum() / n_pos)
+        loss, scale = loss + w * layer, scale + w
+        for key, value in results.items():
+            scores[f"{key}_{k}"] = value
+            means[key].append((w, value))
+    for key, parts in means.items():
+        if parts:
+            scores[key] = sum(w * v for w, v in parts) / sum(w for w, _ in parts)
+    scores["labelled"] = float(rows.float().mean())
+    return loss / max(scale, 1e-12), scores
+
+
+def threat_schedule(config: JEPAConfig, positions_seen: int) -> List[float]:
+    """
+    The loss weight of each ply's layer of the legal-threat head (plies 0 to zthreat_plies) after positions_seen
+    training positions. Plies 0 to zthreat_start_plies count from the start; one more joins every
+    zthreat_stage_positions positions, its weight rising from 0 to 1 over the first rollout_ramp_fraction of its
+    stage; the plies not reached yet are at 0 (not graded). zthreat_stage_positions = 0: all of them from the start.
+    """
+    c = config
+    if c.zthreat_stage_positions <= 0 or c.zthreat_start_plies >= c.zthreat_plies:
+        return [1.0] * (c.zthreat_plies + 1)
+    deepest = min(c.zthreat_plies, c.zthreat_start_plies + positions_seen // c.zthreat_stage_positions)
+    weights = [1.0] * (deepest + 1) + [0.0] * (c.zthreat_plies - deepest)
+    if deepest > c.zthreat_start_plies:
+        progress = positions_seen / c.zthreat_stage_positions - (deepest - c.zthreat_start_plies)
+        weights[deepest] = min(1.0, progress / c.rollout_ramp_fraction)
+    return weights
+
+
 class LegalMoveHead(nn.Module):
     """
     For an edge of the chess graph: does a legal move go from its first square to its second? It reads
@@ -1316,8 +1533,8 @@ class JEPALosses:
     stats: Dict[str, float]     # diagnostics for logging
     # Each term's weighted share of total, which they add up to: "mask", "next", "zpred", "inverse", "count",
     # "legal", "decode", "decode_fit", "decode_next", "decode_masked", "zlegal", "zlegal_fit", "zlegal_next",
-    # "zlegal_masked", "anticollapse_<embedding>" (masked, full, squares), "decorrelation", "rl". For measuring what each
-    # term alone does to the gradient.
+    # "zlegal_masked", "zthreat", "zthreat_fit", "zthreat_next", "zthreat_masked", "anticollapse_<embedding>" (masked,
+    # full, squares), "decorrelation", "rl". For measuring what each term alone does to the gradient.
     terms: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
 
 
@@ -1335,7 +1552,8 @@ class LabyrinthJEPA(nn.Module):
         self.mask_predictor = MaskPredictor(config)
         self.next_predictor = NextPredictor(config)
         self.full_predictor = FullPredictor(config) \
-            if config.zpred_weight > 0 or config.decode_masked_weight > 0 or config.zlegal_masked_weight > 0 else None
+            if (config.zpred_weight > 0 or config.decode_masked_weight > 0 or config.zlegal_masked_weight > 0
+                or config.zthreat_masked_weight > 0) else None
         self.move_predictor = MovePredictor(config) if config.inverse_weight > 0 else None
         # The head the anti-collapse terms act on (none: they act on z itself); never part of the encoder
         self.projector = _mlp([config.z_dim] + [config.projector_hidden] * (config.projector_layers - 1)
@@ -1350,6 +1568,7 @@ class LabyrinthJEPA(nn.Module):
             if config.decode_weight > 0 or config.decodes_predictions else None              # (after the two above)
         self.zlegal_head = ZLegalHead(config) \
             if config.zlegal_weight > 0 or config.zlegal_judges_predictions else None        # (and after that)
+        self.zthreat_head = ZThreatHead(config) if config.uses_threats else None             # (last of all)
 
     def trainable_parameters(self) -> List[nn.Parameter]:
         return [p for n, p in self.named_parameters() if not n.startswith("target.")]
@@ -1393,12 +1612,15 @@ class LabyrinthJEPA(nn.Module):
         return F.smooth_l1_loss(pred, target, reduction="none").mean(-1)
 
     def losses(self, batch: ld.JEPABatch, rng: Optional[torch.Generator] = None,
-               rollout_weights: Optional[Sequence[float]] = None) -> JEPALosses:
+               rollout_weights: Optional[Sequence[float]] = None,
+               threat_weights: Optional[Sequence[float]] = None) -> JEPALosses:
         """
         All training losses for one batch (already on the model's device). rollout_weights: the loss
         weight of each rollout step (rollout_schedule gives them); its length is how many moves ahead to
         predict, and the batch must reach at least that far where games allow. Default: one move. Steps
         the batch has no target graphs for (rollout_targets = "log") are predicted but not graded.
+        threat_weights: the legal-threat head's weight for each ply (threat_schedule gives them; default:
+        every ply at 1).
         """
         c = self.config
         B = batch.num_graphs
@@ -1470,9 +1692,10 @@ class LabyrinthJEPA(nn.Module):
                                                & (to_logits.argmax(-1) == to_square)).float().mean())
 
         # ---- the board's own facts, from the online encoder's reading of the whole board ----
-        online_fit = c.zhead_fit == "online" and (c.decodes_predictions or c.zlegal_judges_predictions)
+        online_fit = c.zhead_fit == "online" and (c.decodes_predictions or c.zlegal_judges_predictions
+                                                  or c.zthreat_judges_predictions)
         if (self.count_decoder is not None or self.legal_head is not None or c.decode_weight > 0 or c.zlegal_weight > 0
-                or online_fit):
+                or c.zthreat_weight > 0 or online_fit):
             whole = ctx_full if ctx_full is not None else self.encoder(batch.full, rng=rng)
         if self.count_decoder is not None:
             counts = piece_counts(batch.full)
@@ -1530,15 +1753,17 @@ class LabyrinthJEPA(nn.Module):
             stats[f"loss_{name}"] = float(loss.detach())
             stats.update({f"{name}_{key}": value for key, value in scores.items()})
 
-        def over_steps(judge) -> Tuple[torch.Tensor, Dict[str, float]]:
-            """judge(step, prediction) -> (loss, scores), averaged over the graded steps by the rollout weights."""
-            results = [judge(step, pred) for _, step, pred, _ in graded]
-            ws = [w for _, _, _, w in graded]
+        def over_steps(judge, among=None) -> Tuple[torch.Tensor, Dict[str, float]]:
+            """judge(step, prediction) -> (loss, scores), averaged over the graded steps (or those `among`
+            them) by the rollout weights. A step's own scores are kept as "<score>_step<k>"."""
+            among = graded if among is None else among
+            results = [judge(step, pred) for _, step, pred, _ in among]
+            ws = [w for _, _, _, w in among]
             scale = max(sum(ws), 1e-12)
             loss = sum(w * r[0] for w, r in zip(ws, results)) / scale
             scores = {key: sum(w * r[1][key] for w, r in zip(ws, results)) / scale for key in results[0][1]}
-            for (k, _, _, _), r in zip(graded, results):
-                scores.update({f"{key}_{k}": value for key, value in r[1].items()})
+            for (k, _, _, _), r in zip(among, results):
+                scores.update({f"{key}_{k}" if among is graded else f"{key}_step{k}": value for key, value in r[1].items()})
             return loss, scores
 
         if c.decodes_predictions:
@@ -1568,6 +1793,33 @@ class LabyrinthJEPA(nn.Module):
                         lambda step, pred: legal_scores(held_fixed(head, pred), by_step[id(step)])))
                 if c.zlegal_masked_weight > 0:
                     add("zlegal_masked", c.zlegal_masked_weight, *legal_scores(held_fixed(head, whole_pred), now))
+
+        if self.zthreat_head is not None:
+            head = self.zthreat_head
+            if batch.threats is None:
+                raise ValueError("the legal-threat head needs the batch's threat labels (give the loader a ThreatLabels)")
+
+            def judge(outputs, wanted) -> Tuple[torch.Tensor, Dict[str, float]]:
+                return threat_scores(outputs, *wanted, threat_weights, c.zthreat_count_weight)
+
+            now = head.targets(batch.threats, batch.full)
+            if c.zthreat_weight > 0:
+                add("zthreat", c.zthreat_weight, *judge(head(whole.z), now))
+            if c.zthreat_judges_predictions:
+                # Among the graded rollout steps, those whose positions have labels (the first few)
+                labelled = [entry for entry in graded if entry[1].threats is not None]
+                after = {id(step): head.targets(step.threats, step.graphs) for _, step, _, _ in labelled}
+                if online_fit:
+                    add("zthreat_fit", 1.0, *judge(head(whole.z), now))
+                else:
+                    real = torch.cat([target_full.z] + [target_steps[k - 1] for k, _, _, _ in labelled])
+                    wanted = [now] + [after[id(step)] for _, step, _, _ in labelled]
+                    add("zthreat_fit", 1.0, *judge(head(real), tuple(torch.cat(parts) for parts in zip(*wanted))))
+                if c.zthreat_next_weight > 0 and labelled:
+                    add("zthreat_next", c.zthreat_next_weight, *over_steps(
+                        lambda step, pred: judge(held_fixed(head, pred), after[id(step)]), labelled))
+                if c.zthreat_masked_weight > 0:
+                    add("zthreat_masked", c.zthreat_masked_weight, *judge(held_fixed(head, whole_pred), now))
 
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
@@ -1671,6 +1923,7 @@ def describe(config: JEPAConfig) -> Dict[str, Any]:
         "legal_head_params": count_parameters(model.legal_head) if model.legal_head is not None else 0,
         "board_decoder_params": count_parameters(model.board_decoder) if model.board_decoder is not None else 0,
         "zlegal_head_params": count_parameters(model.zlegal_head) if model.zlegal_head is not None else 0,
+        "zthreat_head_params": count_parameters(model.zthreat_head) if model.zthreat_head is not None else 0,
         "projector_params": count_parameters(model.projector) if model.projector is not None else 0,
         "max_tokens": config.max_tokens,
         "z_dim": config.z_dim,

@@ -22,10 +22,19 @@ from typing import Callable, List
 
 import chess
 import torch
+import torch.nn.functional as F
 
 import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import labyrinth_data as ld
 import labyrinth_jepa_encoder as lje
+import piece_reach as pr
+
+
+class SearchedThreats(ld.ThreatLabels):
+    """Legal-threat labels straight from the search, whichever one is installed (a few positions: the Python one will do)."""
+
+    def counts(self, fen):
+        return pr.threat_counts(fen, self.plies), ld.THREATS_COMPUTED
 
 FENS = [
     "1q1rkr2/pp3pnp/2pn2pQ/3p4/3Pb3/2P2NP1/PP2P2P/3RKRNB b - - 1 15",
@@ -1472,6 +1481,251 @@ def test_next_predictor_can_predict_the_next_z_outright():
     assert all(torch.equal(v, outputs[False][k]) for k, v in outputs[True].items())
     parent = batch.rollout[0].parent
     assert float((outputs[True, "pred"] - outputs[False, "pred"] - outputs[True, "z"][parent]).abs().max()) < 1e-5
+
+
+def test_threat_head_forms_targets_scores_and_curriculum():
+    sizes = dict(zthreat_weight=1.0, zthreat_plies=2, zthreat_dim=8, zthreat_hidden=12)
+    z = torch.randn(3, 64)
+    heads = {}
+    for kind in lje.THREAT_HEADS:
+        for mode in lje.THREAT_MODES:
+            torch.manual_seed(0)
+            head = lje.ZThreatHead(small_config("squares", zthreat_head=kind, zthreat_mode=mode, **sizes))
+            logits, counts = head(z)
+            assert logits.shape == (3, 3, 64, 64), "a logit per ply (0, 1, 2), piece square and target square"
+            assert (counts is None) == (mode == "binary") and (counts is None or counts.shape == logits.shape)
+            assert torch.allclose(logits, head(2.5 * z + 1.0)[0], atol=1e-4), "it reads z normalized"
+            assert torch.equal(lje.held_fixed(head, z)[0], logits)
+            heads[kind, mode] = head
+
+    # "linear": nothing but one linear map of the normalized z
+    head = heads["linear", "count"]
+    flat = head.readout(F.layer_norm(z, z.shape[-1:])).view(3, 3, 2, 64, 64)
+    assert torch.equal(head(z)[0], flat[:, :, 0]) and torch.equal(head(z)[1], flat[:, :, 1])
+    assert {n for n, _ in head.named_parameters()} == {"readout.weight", "readout.bias"}
+    # "bilinear": a vector per piece square, a vector per target square, each a linear map of z; an answer is
+    # their product, so it is linear in either vector with the other held
+    head = heads["bilinear", "count"]
+    logits, counts = head(z)
+    with torch.no_grad():
+        saved, saved_bias = head.piece.weight.clone(), head.piece.bias.clone()
+        head.piece.weight[5 * 8:6 * 8] *= 3.0                           # piece square 5's vector (zthreat_dim = 8)
+        head.piece.bias[5 * 8:6 * 8] *= 3.0
+        changed = head(z)[0]
+        assert torch.allclose(changed[:, :, 5] - head.bias.view(3, 2)[None, :, 0, None], 3.0 * (logits[:, :, 5] - head.bias.view(3, 2)[None, :, 0, None]), atol=1e-4)
+        others = [p for p in range(64) if p != 5]
+        assert torch.equal(changed[:, :, others], logits[:, :, others]), "only that piece's row moves"
+        head.piece.weight.copy_(saved)
+        head.piece.bias.copy_(saved_bias)
+        head.square.weight[9 * 8:10 * 8] = 0.0                          # target square 9's vector
+        head.square.bias[9 * 8:10 * 8] = 0.0
+        blank = head(z)[0]
+        assert torch.allclose(blank[:, :, :, 9], head.bias.view(3, 2)[None, :, 0, None].expand(3, 3, 64), atol=1e-6)
+        assert torch.equal(blank[:, :, :, others[:8]], logits[:, :, :, others[:8]])
+    # "piece_mlp": a hidden layer of its own for every piece square
+    head = heads["piece_mlp", "count"]
+    logits, _ = head(z)
+    with torch.no_grad():
+        head.hidden.weight[5 * 12:6 * 12] = 0.0                         # piece square 5's hidden layer (zthreat_hidden = 12)
+        changed = head(z)[0]
+    assert torch.equal(changed[:, :, others], logits[:, :, others]) and not torch.equal(changed[:, :, 5], logits[:, :, 5])
+
+    # what it is graded against: the labels of the pieces' rows, for the positions that have a label
+    source = SearchedThreats(2, rollout_steps=0)
+
+    class Half(SearchedThreats):
+        def counts(self, fen):
+            return (None, ld.THREATS_NONE) if fen == FENS[1] else super().counts(fen)
+
+    batch = ld.collate_jepa([ld.build_sample(f, random.Random(i), threats=Half(2, rollout_steps=0)) for i, f in enumerate(FENS)])
+    head = heads["linear", "count"]
+    target, graded = head.targets(batch.threats, batch.full)
+    assert target.shape == (len(FENS), 3, 64, 64) and graded.shape == (len(FENS), 64)
+    for b, fen in enumerate(FENS):
+        board = chess.Board(fen, chess960=True)
+        turn = 0 if board.turn == chess.WHITE else 56
+        pieces = sorted(sq ^ turn for sq in board.piece_map())
+        assert graded[b].nonzero().flatten().tolist() == ([] if b == 1 else pieces), "the squares with a piece, the side to move at the bottom"
+        if b != 1:
+            counts = pr.threat_counts(fen, 2)
+            flip = torch.arange(64) ^ turn
+            assert torch.allclose(target[b], torch.log1p(torch.as_tensor(counts.astype("float32")))[:, flip][:, :, flip])
+            assert not target[b][:, ~graded[b]].any(), "an empty square threatens nothing"
+    one_ply = lje.ZThreatHead(small_config("squares", zthreat_weight=1.0, zthreat_plies=1))
+    assert torch.equal(one_ply.targets(batch.threats, batch.full)[0], target[:, :2]), "deeper labels serve a shallower head"
+    try:
+        lje.ZThreatHead(small_config("squares", zthreat_weight=1.0, zthreat_plies=3)).targets(batch.threats, batch.full)
+        raise AssertionError("labels shallower than the head should be rejected")
+    except ValueError:
+        pass
+
+    # the loss and the scores
+    yes = target > 0
+    right = torch.where(yes, 8.0, -8.0)
+    loss, scores = lje.threat_scores((right, target.clone()), target, graded)
+    assert float(loss) < 1e-3 and all(scores[k] == 1.0 for k in ("found", "rejected", "new", "close", "found_0", "rejected_2", "new_1", "close_2"))
+    assert scores["exact"] == 1.0 and scores["wrong"] == 0.0 and scores["count_error"] == 0.0 and scores["exact_2"] == 1.0
+    assert "new_0" not in scores and "close_0" not in scores, "after 0 plies nothing is new and every count is 1"
+    assert abs(scores["labelled"] - (len(FENS) - 1) / len(FENS)) < 1e-6
+    loss, scores = lje.threat_scores((torch.zeros_like(right), None), target, graded)
+    assert abs(float(loss) - math.log(2)) < 1e-5, "threats and non-threats weigh the same, in every layer"
+    assert "close" not in scores and scores["found"] == 0.0 and scores["rejected"] == 1.0
+    threats_each = [float((yes[:, k] & graded[:, :, None]).sum()) / (len(FENS) - 1) for k in range(3)]
+    assert all(abs(scores[f"wrong_{k}"] - threats_each[k]) < 1e-4 for k in range(3)), "every threat missed, nothing else wrong"
+    assert scores["exact"] == 0.0 and abs(scores["wrong"] - sum(threats_each) / 3) < 1e-4
+    one_off = right.clone()
+    one_off[0, 2, graded[0].nonzero()[0, 0], 0] *= -1.0                 # one cell of one position, after 2 plies
+    scores = lje.threat_scores((one_off, None), target, graded)[1]
+    assert abs(scores["exact_2"] - (len(FENS) - 2) / (len(FENS) - 1)) < 1e-6 and scores["exact_1"] == 1.0
+    assert abs(scores["wrong_2"] - 1 / (len(FENS) - 1)) < 1e-6
+    noisy = right.clone()
+    noisy[:, :, ~graded.any(0)] = 5.0                                   # squares that are empty in every position
+    noisy[1] = -3.0                                                     # the position without a label
+    assert torch.equal(lje.threat_scores((noisy, None), target, graded)[0], lje.threat_scores((right, None), target, graded)[0]), \
+        "rows without a piece, and positions without a label, are not graded"
+    stale = torch.where(yes & (torch.cat([yes[:, :1], yes[:, :-1]], 1)), 8.0, -8.0)    # yes only to what was there a ply before
+    scores = lje.threat_scores((stale, None), target, graded)[1]
+    assert scores["new_1"] == 0.0 and scores["new_2"] == 0.0 and 0 < scores["found_1"] < 1 and scores["found_0"] == 1.0
+    off = target + math.log(1.5) * yes                                  # every count half as large again
+    loss, scores = lje.threat_scores((right, off), target, graded, count_weight=2.0)
+    assert scores["close"] == 0.0 and abs(float(loss) - 2.0 * (2 / 3) * 0.5 * math.log(1.5) ** 2) < 1e-3, \
+        "the count term: smooth L1 on the threats of plies 1 and 2, times its weight"
+    assert abs(scores["count_error"] - math.log(1.5)) < 1e-5
+    only_first = lje.threat_scores((torch.zeros_like(right), None), target, graded, weights=[1.0, 0.0, 0.0])[1]
+    assert "found_0" in only_first and "found_1" not in only_first and "new" not in only_first
+    a = lje.threat_scores((noisy * 0.1, None), target, graded, weights=[1.0, 0.0, 0.0])[0]
+    b = lje.threat_scores((noisy * 0.1, None), target, graded, weights=[1.0, 1.0, 0.0])[0]
+    c = lje.threat_scores((noisy * 0.1, None), target, graded, weights=[0.0, 1.0, 0.0])[0]
+    assert abs(float(b) - (float(a) + float(c)) / 2) < 1e-6, "the layers' weighted mean"
+
+    # the curriculum: plies 0 and 1 at first, one more per stage, ramping in
+    cfg = small_config("squares", zthreat_plies=3, zthreat_start_plies=1, zthreat_stage_positions=1000, rollout_ramp_fraction=0.25)
+    assert lje.threat_schedule(cfg, 0) == [1.0, 1.0, 0.0, 0.0] and lje.threat_schedule(cfg, 999) == [1.0, 1.0, 0.0, 0.0]
+    assert lje.threat_schedule(cfg, 1000) == [1.0, 1.0, 0.0, 0.0]
+    assert [round(w, 6) for w in lje.threat_schedule(cfg, 1100)] == [1.0, 1.0, 0.4, 0.0]
+    assert lje.threat_schedule(cfg, 1250) == [1.0, 1.0, 1.0, 0.0] and lje.threat_schedule(cfg, 1999) == [1.0, 1.0, 1.0, 0.0]
+    assert [round(w, 6) for w in lje.threat_schedule(cfg, 2125)] == [1.0, 1.0, 1.0, 0.5]
+    assert lje.threat_schedule(cfg, 10 ** 9) == [1.0] * 4
+    assert lje.threat_schedule(small_config("squares", zthreat_plies=3), 0) == [1.0] * 4, "no stages: every ply from the start"
+    assert lje.threat_schedule(small_config("squares", zthreat_plies=2, zthreat_start_plies=2, zthreat_stage_positions=5), 0) == [1.0] * 3
+    for bad in (dict(zthreat_head="deep"), dict(zthreat_mode="both"), dict(zthreat_weight=-1.0), dict(zthreat_count_weight=-1.0),
+                dict(zthreat_plies=1, zthreat_start_plies=2), dict(zthreat_stage_positions=-1), dict(zthreat_dim=0),
+                dict(zhead_fit="online", zthreat_next_weight=1.0, zthreat_weight=1.0)):
+        try:
+            small_config("squares", **bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+
+
+def test_threat_head_learns_from_real_z_and_judges_predictions_held_fixed():
+    """
+    The legal-threat head on the three z, as the other heads that read only z: asked about the position's own z
+    it learns with the encoder; judging a prediction it is held fixed and learns from real positions' z instead.
+    Rollout positions beyond those that have labels are simply not judged.
+    """
+    kw = dict(transformer_layers=0, readout="mean", move_encoding="rank_file", zpred_hidden=64, zthreat_plies=1,
+              zthreat_dim=8, zthreat_hidden=12, zthreat_mode="count")
+    rnd = random.Random(2)
+    cfg = small_config("squares", **kw)
+    source = SearchedThreats(1, rollout_steps=2)
+    samples = [ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=3, threats=source) for f in FENS]
+    batch = ld.collate_jepa(samples)
+    weights = [1.0, 0.5, 0.25]                          # three moves ahead; the first two positions have labels
+
+    def build(seed=0, **weights_kw):
+        torch.manual_seed(seed)
+        return lje.LabyrinthJEPA(small_config("squares", **kw, **weights_kw))
+
+    def reached(term, *parts):
+        out = []
+        for part in parts:
+            params = [p for p in part.parameters() if p.requires_grad]
+            grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+            out.append(any(g is not None and float(g.abs().sum()) > 0 for g in grads))
+        return out
+
+    def losses(model, b=batch, **more):
+        return model.losses(b, rng=torch.Generator().manual_seed(0), rollout_weights=weights, **more)
+
+    base, control = build(), build(zpred_weight=1.0)
+    assert base.zthreat_head is None and not base.config.uses_threats
+    for kind in lje.THREAT_HEADS:
+        arms = {"zthreat_next": (dict(zthreat_next_weight=1.0), base, "next_predictor"),
+                "zthreat_masked": (dict(zthreat_masked_weight=1.0, zpred_weight=1.0), control, "full_predictor")}
+        for name, (weights_kw, without, predictor_name) in arms.items():
+            model = build(zthreat_head=kind, **weights_kw)
+            theirs, ours = without.state_dict(), model.state_dict()
+            assert all(torch.equal(v, ours[k]) for k, v in theirs.items()), f"{name}: the other weights start as without it"
+            assert {k.split(".")[0] for k in set(ours) - set(theirs)} == {"zthreat_head"}
+            head, predictor = model.zthreat_head, getattr(model, predictor_name)
+            out = losses(model)
+            assert {name, "zthreat_fit"} <= set(out.terms) and abs(float(sum(out.terms.values()) - out.total)) < 1e-4, name
+            assert reached(out.terms["zthreat_fit"], head, model.encoder, predictor) == [True, False, False], \
+                f"{kind} {name}: the head learns from the target encoder's z alone"
+            assert reached(out.terms[name], head, model.encoder, predictor) == [False, True, True], \
+                f"{kind} {name}: a prediction is judged with the head held fixed"
+            for key in ("loss_zthreat_fit", f"loss_{name}"):
+                assert math.isfinite(out.stats[key]) and out.stats[key] > 0, key
+            for key in ("found", "rejected", "new", "close", "found_0", "rejected_1", "labelled"):
+                assert 0 <= out.stats[f"{name}_{key}"] <= 1 and 0 <= out.stats[f"zthreat_fit_{key}"] <= 1, key
+            if name == "zthreat_next":                  # the two labelled steps, and their weighted mean; not the third
+                each = [out.stats[f"{name}_found_step{k}"] for k in (1, 2)]
+                assert abs(out.stats[f"{name}_found"] - (each[0] + 0.5 * each[1]) / 1.5) < 1e-6
+                assert f"{name}_found_step3" not in out.stats and "loss_next_3" in out.stats
+
+    # asked about the position's own z, the head and the encoder learn together
+    model = build(zthreat_weight=1.0)
+    assert all(torch.equal(v, model.state_dict()[k]) for k, v in base.state_dict().items())
+    out = losses(model)
+    assert "zthreat" in out.terms and "zthreat_fit" not in out.terms
+    assert reached(out.terms["zthreat"], model.zthreat_head, model.encoder, model.next_predictor) == [True, True, False]
+    whole = model.encoder(batch.full, rng=torch.Generator().manual_seed(0))
+    expected, _ = lje.threat_scores(model.zthreat_head(whole.z), *model.zthreat_head.targets(batch.threats, batch.full))
+    assert abs(float(out.terms["zthreat"]) - float(expected)) < 1e-5
+
+    # the plies' weights reach the loss: with the second ply off, only the first is scored
+    shallow = losses(model, threat_weights=[1.0, 0.0])
+    assert "zthreat_found_0" in shallow.stats and "zthreat_found_1" not in shallow.stats
+    assert float(shallow.terms["zthreat"]) != float(out.terms["zthreat"])
+
+    # zhead_fit "online": the fit is the own-z term, so it reaches the encoder; predictions are still judged held fixed
+    model = build(zhead_fit="online", zthreat_next_weight=1.0, zthreat_masked_weight=1.0)
+    out = losses(model)
+    assert {"zthreat_fit", "zthreat_next", "zthreat_masked"} <= set(out.terms) and model.full_predictor is not None
+    assert reached(out.terms["zthreat_fit"], model.zthreat_head, model.encoder, model.next_predictor) == [True, True, False]
+    assert reached(out.terms["zthreat_next"], model.zthreat_head, model.encoder, model.next_predictor) == [False, True, True]
+    assert reached(out.terms["zthreat_masked"], model.zthreat_head, model.encoder, model.full_predictor) == [False, True, True]
+    assert abs(float(sum(out.terms.values()) - out.total)) < 1e-4
+
+    # beside the other heads that read z
+    everything = build(zhead_fit="online", zthreat_next_weight=1.0, zlegal_next_weight=1.0, decode_masked_weight=1.0)
+    out = losses(everything)
+    assert {"zthreat_fit", "zthreat_next", "zlegal_fit", "zlegal_next", "decode_fit", "decode_masked"} <= set(out.terms)
+    assert abs(float(sum(out.terms.values()) - out.total)) < 1e-4
+
+    # batches the head cannot use, or can use only in part
+    plain = ld.collate_jepa([ld.build_sample(f, random.Random(i), cfg.mask_config(), rollout_steps=3) for i, f in enumerate(FENS)])
+    try:
+        losses(build(zthreat_weight=1.0), plain)
+        raise AssertionError("the head needs the batch's threat labels")
+    except ValueError:
+        pass
+    own_only = ld.collate_jepa([ld.build_sample(f, random.Random(i), cfg.mask_config(), rollout_steps=3,
+                                                threats=SearchedThreats(1, rollout_steps=0)) for i, f in enumerate(FENS)])
+    out = losses(build(zthreat_next_weight=1.0), own_only)
+    assert "zthreat_fit" in out.terms and "zthreat_next" not in out.terms, "no labelled rollout positions: nothing to judge"
+
+    class Half(SearchedThreats):
+        def counts(self, fen):
+            return (None, ld.THREATS_NONE) if fen == FENS[1] else super().counts(fen)
+
+    partly = ld.collate_jepa([ld.build_sample(f, random.Random(i), cfg.mask_config(), threats=Half(1, rollout_steps=0))
+                              for i, f in enumerate(FENS)])
+    out = losses(build(zthreat_weight=1.0), partly)
+    assert torch.isfinite(out.total) and abs(out.stats["zthreat_labelled"] - (len(FENS) - 1) / len(FENS)) < 1e-6
+    described = lje.describe(small_config("squares", zthreat_weight=1.0, zthreat_plies=1))
+    assert described["zthreat_head_params"] == 64 * (2 * 4096) + 2 * 4096
 
 
 # ##### ##### ##### ##### #####

@@ -15,6 +15,10 @@ train(model_config, run_config) is one training run:
     predicts grows with the number of training positions seen; when it grows, the loader continues the
     current epoch with longer rollouts, without repeating positions, building graphs only for the steps
     that are graded (rollout_target_steps);
+  * with the legal-threat head (JEPAConfig.zthreat_*), batches carry threat labels from the labels database
+    reach_labeler.py fills (threat_db). Positions it does not hold, the validation positions among them, are
+    searched on the spot when the compiled search is built and go ungraded when it is not. The head's own
+    curriculum (labyrinth_jepa_encoder.threat_schedule) adds a ply of play at a time;
   * non-finite losses or gradients skip the step (too many in a row stop the run);
   * a memory guard: on Windows a GPU that runs out of memory does not fail, it silently spills into
     system memory and slows down a hundredfold, so a run whose peak memory exceeds memory_budget of the
@@ -117,6 +121,9 @@ class RunConfig:
     probe_puzzles: Optional[str] = None              # lichess_db_puzzle.csv.zst: puzzle themes (loading takes ~1 min)
     grad_terms_every: int = 200                      # per-term gradient norms every this many steps (0: never)
     snapshot_first: int = 250                        # snapshots at step 0, this, twice this, ... (0: none)
+    threat_db: Optional[str] = "minotaur_reach.db"   # the labels database (reach_labeler.py), for the legal-threat head
+    threat_compute: bool = True                      # search the positions it does not hold on the spot (needs the
+                                                     # compiled search, build_fast_reach.py); False: leave them ungraded
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -162,7 +169,7 @@ def check_memory_budget(peak_bytes: int, total_bytes: int, budget: float) -> Non
 @torch.no_grad()
 def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optional[ld.JEPALoader],
              run: RunConfig, device: torch.device, rollout_weights: Optional[List[float]] = None,
-             encode_batch: int = 256) -> Dict[str, float]:
+             encode_batch: int = 256, threat_weights: Optional[List[float]] = None) -> Dict[str, float]:
     """
     Label-free metrics on fixed validation positions, of the target encoder (the plain keys: the encoder
     that is kept) and of the online encoder ("online_" keys: over short runs the moving-average target
@@ -184,12 +191,12 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
         sums: Dict[str, float] = {"val_loss_mask": 0.0, "val_loss_next": 0.0}
         n = 0
         for batch in val_loader:
-            out = model.losses(batch.to(device), rng=gen, rollout_weights=rollout_weights)
+            out = model.losses(batch.to(device), rng=gen, rollout_weights=rollout_weights, threat_weights=threat_weights)
             sums["val_loss_mask"] += float(out.mask)
             sums["val_loss_next"] += float(out.next)
             for key, value in out.stats.items():       # the optional predictors' and heads' losses and scores
                 if key.startswith(("loss_zpred", "loss_inverse", "inverse_accuracy", "loss_count", "count_", "loss_legal",
-                                   "legal_", "loss_decode", "decode_", "loss_zlegal", "zlegal_")):
+                                   "legal_", "loss_decode", "decode_", "loss_zlegal", "zlegal_", "loss_zthreat", "zthreat_")):
                     sums[f"val_{key}"] = sums.get(f"val_{key}", 0.0) + value
             n += 1
         metrics.update({k: v / max(1, n) for k, v in sums.items()})
@@ -238,6 +245,31 @@ def build_probes(run: RunConfig, val_dataset: ld.PositionDataset, log: Callable[
     log(f"probe sets ({time.perf_counter() - t0:.0f}s): " + ", ".join(
         f"{s.name} {len(s.fens):,} positions, {len(s.binary) + len(s.numeric)} labels" for s in sets))
     return pl.TrainingProbes(sets, views=run.probe_views, seed=run.seed, batch_size=encode_batch)
+
+
+def threat_labels(config: lje.JEPAConfig, run: RunConfig, batch_size: int,
+                  log: Callable[[str], None] = print) -> Optional[ld.ThreatLabels]:
+    """
+    Where the run's batches get legal-threat labels (None: the model has no legal-threat head), and a line in
+    the log on how much of the run the labels database covers. The positions after rollout moves are labelled
+    only when something is graded on them.
+    """
+    if not config.uses_threats:
+        return None
+    on_steps = config.zthreat_next_weight > 0 or (config.zthreat_judges_predictions and config.zhead_fit == "target")
+    source = ld.ThreatLabels(config.zthreat_plies, run.threat_db, compute=run.threat_compute,
+                             rollout_steps=2 if on_steps else 0)
+    if source.connection is None and not source.searches:
+        raise ValueError(f"the legal-threat head needs labels: there is no labels database at {run.threat_db!r} "
+                         f"(reach_labeler.py makes one; --threat-db says where it is) and the compiled search "
+                         f"that could work them out on the spot is {ld.pr.C_UNAVAILABLE or 'switched off'}")
+    # The database follows the order of a run on the whole training split with default masks
+    stored = source.stored_samples("train", run.seed) if run.max_train_positions is None else 0
+    others = ("searched on the spot" if source.searches
+              else f"left ungraded (the compiled search is {ld.pr.C_UNAVAILABLE or 'switched off'})")
+    log(f"legal-threat labels to {config.zthreat_plies} plies: the database holds the first {stored:,} samples of this "
+        f"run's order (the run takes {run.total_steps * batch_size:,}); positions it does not hold are {others}")
+    return source
 
 
 # What the log shows of each probed view: (summary key, name), as linear / nearest-neighbour / whitened
@@ -421,9 +453,11 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     indices = None
     if run.max_train_positions is not None and run.max_train_positions < train_size:
         indices = random.Random(run.seed).sample(range(train_size), run.max_train_positions)
+    threats = threat_labels(config, run, batch_size, log)
     loader = ld.JEPALoader(run.cache_dir, "train", batch_size, num_workers=run.num_workers,
                            mask_config=config.mask_config(), seed=run.seed, indices=indices,
-                           pin_memory=device.type == "cuda", drop_last=True, siblings=config.rollout_siblings)
+                           pin_memory=device.type == "cuda", drop_last=True, siblings=config.rollout_siblings,
+                           threats=threats)
     if len(loader) == 0:
         raise ValueError(f"the training set ({len(loader.dataset)} positions) is smaller than one batch ({batch_size})")
     val_dataset = ld.PositionDataset(run.cache_dir, "val")
@@ -432,7 +466,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     n_val = len(val_rows)
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
                                seed=run.seed + 1, shuffle=False, indices=val_rows,
-                               siblings=config.rollout_siblings) if n_val else None
+                               siblings=config.rollout_siblings, threats=threats) if n_val else None
 
     # Evaluation and probes encode no more positions at once than a training step does: the unpool
     # variant's enlarged graphs make a few hundred positions at once far heavier than its training batch
@@ -465,6 +499,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     epoch_start_step = epoch * len(loader)
     rollout_weights = lje.rollout_schedule(config, step * batch_size)
     loader.set_rollout_steps(len(rollout_weights), lje.rollout_target_steps(config, len(rollout_weights)))
+    threat_weights = lje.threat_schedule(config, step * batch_size) if threats is not None else None
     batches = iter(loader)
     skips = 0
     cache_releases = 0
@@ -487,7 +522,8 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             for view, s in last_probe.items():
                 log(f"[{step:>7}] probe {view}: {_probe_line(s)}")
             log(f"[{step:>7}] probes took {time.perf_counter() - t0:.0f}s")
-        metrics = evaluate(model, eval_fens, val_loader, run, device, rollout_weights, encode_batch=batch_size)
+        metrics = evaluate(model, eval_fens, val_loader, run, device, rollout_weights, encode_batch=batch_size,
+                           threat_weights=threat_weights)
         if device.type == "cuda":
             torch.cuda.empty_cache()           # hand evaluation's odd-sized blocks back before training resumes
         record({"step": step, "eval": metrics})
@@ -512,6 +548,11 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             batches = iter(loader)
             log(f"[{step:>7}] rollout curriculum: now predicting {len(new_weights)} move(s) ahead")
         rollout_weights = new_weights
+        if threats is not None:
+            new_weights = lje.threat_schedule(config, step * batch_size)
+            if sum(w > 0 for w in new_weights) != sum(w > 0 for w in threat_weights):
+                log(f"[{step:>7}] threat curriculum: now grading plies 0 to {sum(w > 0 for w in new_weights) - 1}")
+            threat_weights = new_weights
         try:
             batch = next(batches)
         except StopIteration:
@@ -522,7 +563,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             continue
         batch = batch.to(device, non_blocking=True)
         model.train()
-        out = model.losses(batch, rng=gen, rollout_weights=rollout_weights)
+        out = model.losses(batch, rng=gen, rollout_weights=rollout_weights, threat_weights=threat_weights)
         opt.zero_grad(set_to_none=True)
         if not torch.isfinite(out.total):
             skips += 1
@@ -572,6 +613,10 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                 entry["gpu_peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
                 entry["gpu_reserved_gb"] = torch.cuda.max_memory_reserved(device) / 2**30
                 entry["cache_releases"] = cache_releases
+            if batch.threats is not None:              # where this batch's own positions' threat labels came from
+                entry["threat_weights"] = list(threat_weights)
+                entry["threats_stored"] = float((batch.threats.origin == ld.THREATS_STORED).float().mean())
+                entry["threats_searched"] = float((batch.threats.origin == ld.THREATS_COMPUTED).float().mean())
             record(entry)
             zpred = f"zpred={entry['loss_zpred']:.4f} " if "loss_zpred" in entry else ""
             if "loss_inverse" in entry:
@@ -592,6 +637,14 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
                 if f"loss_{name}" in entry:
                     zpred += (f"legal {label}={entry[f'loss_{name}']:.3f} (found {entry[f'{name}_found']:.0%}, "
                               f"rejected {entry[f'{name}_rejected']:.0%}) ")
+            for name, label in (("zthreat", "z"), ("zthreat_fit", "real z"), ("zthreat_next", "next z"),
+                                ("zthreat_masked", "masked z")):
+                if f"loss_{name}" in entry:
+                    more = "".join(f", {word} {entry[f'{name}_{key}']:.0%}" for key, word in (("new", "new"), ("close", "counts"))
+                                   if f"{name}_{key}" in entry)
+                    zpred += (f"threats {label}={entry[f'loss_{name}']:.3f} (found {entry[f'{name}_found']:.0%}, "
+                              f"rejected {entry[f'{name}_rejected']:.0%}{more}; {entry[f'{name}_wrong']:.0f} cells wrong "
+                              f"a position per ply) ")
             log(f"[{step:>7}] loss={entry['loss']:.4f} mask={entry['loss_mask']:.4f} next={entry['loss_next']:.4f} "
                 f"{zpred}K={len(rollout_weights)} "
                 f"reg={entry['anticollapse']:.3f} z_std={entry['z_std']:.3f} z_cos={entry['z_mean_cosine']:.3f} "
@@ -772,6 +825,8 @@ def main() -> None:
     t.add_argument("--grad-terms-every", type=int, default=200, help="per-term gradient norms (0: never)")
     t.add_argument("--snapshot-first", type=int, default=250,
                    help="snapshots at step 0, this, twice this, ... and at the end (0: none)")
+    t.add_argument("--threat-db", default=RunConfig.threat_db,
+                   help="the labels database reach_labeler.py fills, for the legal-threat head")
     d = sub.choices["tune"]
     d.add_argument("--out", default="dehb_jepa_out")
     d.add_argument("--fevals", type=int, default=40)
@@ -792,7 +847,8 @@ def main() -> None:
                       resume=not args.no_resume, probe_db=args.probe_db, probe_puzzles=args.probe_puzzles,
                       probe_positions=args.probe_positions,
                       probe_views=tuple(v.strip() for v in args.probe_views.split(",") if v.strip()),
-                      grad_terms_every=args.grad_terms_every, snapshot_first=args.snapshot_first)
+                      grad_terms_every=args.grad_terms_every, snapshot_first=args.snapshot_first,
+                      threat_db=args.threat_db)
         result = train(config, run)
         _plot(_read_history(args.out) or result["history"], args.out)
         print(json.dumps({"final": result["final"], "best_lidar": result["best_lidar"]}, indent=2))

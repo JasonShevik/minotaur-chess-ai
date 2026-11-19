@@ -27,7 +27,13 @@ DataLoader worker processes so the GPU never waits.
           * optionally (siblings > 1) other legal first moves from the same position and the positions
             they lead to: several different moves to predict from one board,
           * the position's legal moves, as from/to square pairs of its graph: labels the rules give, for
-            heads graded against the board itself instead of against the target encoder.
+            heads graded against the board itself instead of against the target encoder,
+          * optionally (threats: a ThreatLabels) the position's legal-threat labels, and those of the positions
+            after its first rollout moves: what every piece could legally move to after 0, 1, 2, ... plies of
+            play, and after how many of the sequences (piece_reach.threat_counts). They come from the labels
+            database reach_labeler.py fills, or are searched on the spot, and are turned into the graph's
+            frame here: the labels are kept by the board's real squares, a graph shows the side to move at
+            the bottom.
         Every random choice comes from a generator seeded by (seed, epoch, index), so a run is
         reproducible whatever the number of workers.
 
@@ -58,6 +64,7 @@ import hashlib
 import itertools
 import json
 import os
+import pathlib
 import random
 import sqlite3
 import time
@@ -70,6 +77,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 import chess_graph as cg
+import piece_reach as pr
 
 SPLITS = ("train", "val", "test")
 DEFAULT_DB = "minotaur_data.db"
@@ -507,6 +515,175 @@ class GraphView:
         return cls(*cg.to_single_graph(edges, x))
 
 
+# ##### ##### ##### ##### #####
+#       Legal-threat labels
+
+
+THREAT_TABLE = "threat_counts"          # the table reach_labeler.py keeps them in
+THREATS_NONE, THREATS_STORED, THREATS_COMPUTED = 0, 1, 2     # where a position's label came from
+
+
+@dataclass
+class PositionThreats:
+    """
+    One position's legal-threat labels (piece_reach.threat_counts) as a training step takes them: only the
+    cells with a count above 0.
+      codes    [M] int32, each cell as (ply * 64 + piece square) * 64 + target square: after `ply` plies of
+               play, the piece that stands on `piece square` now could legally move to `target square`.
+               Squares are in the position's own frame, its side to move at the bottom, like everything else
+               a model is given (the labels themselves go by the board's real squares: for black to move both
+               squares are turned over, square ^ 56)
+      logs     [M] float32, log(1 + the number of sequences after which it could)
+      origin   THREATS_NONE: the position has no label (codes and logs are empty; nothing of it is graded);
+               THREATS_STORED: from the labels database; THREATS_COMPUTED: searched on the spot
+      layers   plies + 1: the label covers 0, 1, ..., plies plies of play
+    """
+    codes: np.ndarray
+    logs: np.ndarray
+    origin: int
+    layers: int
+
+
+def threat_cells(counts: np.ndarray, white_to_move: bool) -> Tuple[np.ndarray, np.ndarray]:
+    """piece_reach.threat_counts' array [layers, 64, 64] -> PositionThreats' codes and logs."""
+    ply, piece, target = np.nonzero(counts)
+    logs = np.log1p(counts[ply, piece, target].astype(np.float64)).astype(np.float32)
+    if not white_to_move:
+        piece, target = piece ^ 56, target ^ 56
+    return ((ply * 64 + piece) * 64 + target).astype(np.int32), logs
+
+
+class ThreatLabels:
+    """
+    Where a loader gets positions' legal-threat labels, to `plies` plies of play:
+      * the labels database reach_labeler.py fills (db_path), for every position it holds at least that deep;
+      * for any other position, with compute set and the compiled search built (piece_reach.USING_C), the
+        search itself: about 0.1 ms a position at 2 plies, 3 ms at 3. The Python search is never run here: at
+        70 ms to seconds a position it would stall training;
+      * failing both, the position goes without a label and whatever is graded against threats leaves it out.
+    rollout_steps: the positions after this many of a sample's first rollout moves get labels too (the
+    labeller labels reach_labeler.ROLLOUT_PLIES of them); 0 when nothing judges those positions.
+    It can be pickled: each loader worker opens the database for itself.
+    """
+
+    def __init__(self, plies: int, db_path: Optional[str] = None, compute: bool = True, rollout_steps: int = 2):
+        if plies < 0 or rollout_steps < 0:
+            raise ValueError("need plies >= 0 and rollout_steps >= 0")
+        self.plies, self.db_path, self.compute, self.rollout_steps = int(plies), db_path, bool(compute), int(rollout_steps)
+        self._conn: Optional[sqlite3.Connection] = None
+        self._looked = False
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_conn"], state["_looked"] = None, False     # the connection is each process's own
+        return state
+
+    @property
+    def layers(self) -> int:
+        return self.plies + 1
+
+    @property
+    def connection(self) -> Optional[sqlite3.Connection]:
+        """The labels database, read-only, or None when there is none."""
+        if not self._looked:
+            self._looked = True
+            if self.db_path and os.path.exists(self.db_path):
+                self._conn = sqlite3.connect(pathlib.Path(self.db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        return self._conn
+
+    @property
+    def searches(self) -> bool:
+        """Whether a position without a stored label is searched on the spot."""
+        return self.compute and pr.USING_C
+
+    def close(self) -> None:
+        """Let go of the database (it is opened again when next needed)."""
+        if self._conn is not None:
+            self._conn.close()
+        self._conn, self._looked = None, False
+
+    def stored_samples(self, split: str, seed: int, epoch: int = 0) -> int:
+        """
+        How many samples at the start of a training run's order (this split, seed and epoch, default masks) the
+        database holds labels for, deep enough and with the rollout positions this source asks for: the
+        furthest any of the labeller's walks that fit has got.
+        """
+        conn, best = self.connection, 0
+        if conn is None:
+            return 0
+        try:
+            walks = conn.execute("SELECT walk, done FROM reach_progress").fetchall()
+        except sqlite3.OperationalError:
+            return 0
+        for walk, done in walks:        # reach_labeler.walk_name: "<split> seed <s> epoch <e> rollout <r> threats <d>"
+            words = walk.split()
+            if (len(words) == 9 and words[0] == split and words[1:8:2] == ["seed", "epoch", "rollout", "threats"]
+                    and int(words[2]) == seed and int(words[4]) == epoch and int(words[6]) >= self.rollout_steps
+                    and int(words[8]) >= self.plies):
+                best = max(best, int(done))
+        return best
+
+    def counts(self, fen: str) -> Tuple[Optional[np.ndarray], int]:
+        """([plies + 1, 64, 64] counts by the board's real squares, where they came from), or (None, THREATS_NONE)."""
+        conn = self.connection
+        if conn is not None:
+            try:
+                row = conn.execute(f"SELECT depth, counts FROM {THREAT_TABLE} WHERE position = ?", (position_key(fen),)).fetchone()
+            except sqlite3.OperationalError:        # a database from before the threat labels
+                row = None
+            if row is not None and row[0] >= self.plies:
+                return pr.unpack_counts(row[1])[:self.layers], THREATS_STORED
+        if self.searches:
+            return pr.threat_counts(fen, self.plies), THREATS_COMPUTED
+        return None, THREATS_NONE
+
+    def of(self, fen: str, white_to_move: bool) -> PositionThreats:
+        """The position's labels in its own frame (fen as fen_of writes it: what the labels are stored under)."""
+        counts, origin = self.counts(fen)
+        if counts is None:
+            return PositionThreats(np.zeros(0, np.int32), np.zeros(0, np.float32), THREATS_NONE, self.layers)
+        return PositionThreats(*threat_cells(counts, white_to_move), origin, self.layers)
+
+
+@dataclass
+class ThreatBatch:
+    """
+    The legal-threat labels of R positions, for the cells with a count above 0 (see PositionThreats):
+      index    [M] each cell as ((row * layers + ply) * 64 + piece square) * 64 + target square
+      value    [M] log(1 + count)
+      origin   [R] THREATS_NONE (the position has no label: none of its cells are here, and nothing of it is
+               to be graded), THREATS_STORED or THREATS_COMPUTED
+      layers   plies + 1
+    """
+    index: torch.Tensor
+    value: torch.Tensor
+    origin: torch.Tensor
+    layers: int
+
+    @classmethod
+    def pack(cls, items: Sequence[PositionThreats]) -> "ThreatBatch":
+        layers = items[0].layers
+        index = np.concatenate([row * layers * 4096 + item.codes.astype(np.int64) for row, item in enumerate(items)])
+        return cls(torch.from_numpy(index), torch.from_numpy(np.concatenate([item.logs for item in items])),
+                   torch.tensor([item.origin for item in items], dtype=torch.uint8), layers)
+
+    def dense(self) -> torch.Tensor:
+        """[R, layers, 64, 64] log(1 + count) at [row, ply, piece square, target square]; 0 where there is no threat."""
+        rows = self.origin.numel()
+        out = torch.zeros(rows * self.layers * 4096, dtype=self.value.dtype, device=self.value.device)
+        out[self.index] = self.value
+        return out.view(rows, self.layers, 64, 64)
+
+    def _map(self, fn) -> "ThreatBatch":
+        return ThreatBatch(fn(self.index), fn(self.value), fn(self.origin), self.layers)
+
+    def to(self, device, non_blocking: bool = False) -> "ThreatBatch":
+        return self._map(lambda t: t.to(device, non_blocking=non_blocking))
+
+    def pin_memory(self) -> "ThreatBatch":
+        return self._map(lambda t: t.pin_memory())
+
+
 @dataclass
 class NextPosition:
     """One move of a rollout and the position it leads to."""
@@ -521,6 +698,8 @@ class NextPosition:
     legal: List[int] = field(default_factory=list)   # the next position's legal moves, as JEPASample.legal lists
                                                      # the starting position's, in the NEXT position's own frame
                                                      # (its side to move at the bottom); only for target steps
+    threats: Optional[PositionThreats] = None        # the next position's legal-threat labels, in its own frame:
+                                                     # for the target steps a ThreatLabels covers, else None
 
 
 @dataclass
@@ -534,6 +713,7 @@ class JEPASample:
     legal: List[int] = field(default_factory=list)   # the position's legal moves, each as from * 64 + to in its
                                                      # graph's frame (the rook's square for castling; the
                                                      # promotions of one pawn move count once), sorted
+    threats: Optional[PositionThreats] = None        # its legal-threat labels (None: the loader has no ThreatLabels)
 
     @property
     def next(self) -> Optional[NextPosition]:
@@ -571,7 +751,8 @@ def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, che
 
 def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskConfig(),
                  mask: Optional[torch.Tensor] = None, rollout_steps: int = 1,
-                 target_steps: Optional[Sequence[int]] = None, siblings: int = 1) -> JEPASample:
+                 target_steps: Optional[Sequence[int]] = None, siblings: int = 1,
+                 threats: Optional[ThreatLabels] = None) -> JEPASample:
     """
     Everything one position contributes to a training step. fen should be normalized (normalize_fen);
     the cache already is. mask: use this mask instead of sampling one. rollout_steps: how many random
@@ -580,7 +761,8 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     siblings: how many different first moves the position gets in all: the rollout's own, and
     siblings - 1 other legal moves drawn without repeats (fewer when the position has fewer moves),
     each with its position as a target when step 1 is one. A target step also lists the legal moves of
-    the position it leads to.
+    the position it leads to. threats: where to get legal-threat labels: the position's own, and those of the
+    positions its first threats.rollout_steps target steps lead to.
 
     The random draws come in a fixed order (mask, then move 1, move 2, ..., then the sibling moves), so
     for a given rng the mask and the rollout's moves are the same whatever rollout_steps and siblings are.
@@ -601,14 +783,16 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
         t = cg.move_transition(current, move, rooks)
         after = current.copy(stack=False)
         after.push(move)
-        view, after_moves = None, None
+        view, after_moves, after_threats = None, None, None
         if targets is None or k in targets:
             view = GraphView.from_edge_lists(*cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares))
             after_moves = list(after.legal_moves)
+            if threats is not None and k <= threats.rollout_steps:
+                after_threats = threats.of(fen_of(after), after.turn == chess.WHITE)
         step = NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
                             current.piece_type_at(move.from_square), t.promotion,
                             (t.is_castling, t.is_capture, t.is_en_passant), view,
-                            legal_codes(after, after_moves) if after_moves is not None else [])
+                            legal_codes(after, after_moves) if after_moves is not None else [], after_threats)
         return step, after, t.next_castling_rook_squares, after_moves
 
     current, current_rooks = board, rook_squares
@@ -630,7 +814,8 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     if siblings > 1:
         extra = [play(board, move, rook_squares, 1)[0]
                  for move in rng.sample(other_first_moves, min(siblings - 1, len(other_first_moves)))]
-    return JEPASample(fen, full, context, mask, rollout, extra, legal)
+    own_threats = threats.of(fen, board.turn == chess.WHITE) if threats is not None else None
+    return JEPASample(fen, full, context, mask, rollout, extra, legal, own_threats)
 
 
 # ##### ##### ##### ##### #####
@@ -681,6 +866,8 @@ class RolloutStep:
       legal      [M] the legal moves of the positions after move k, each as row * 4096 + from * 64 + to (row:
                  which of the B_k rows; squares of that position's own graph); None when move k is not a
                  target step, or for a step put together without them
+      threats    the legal-threat labels of the positions after move k (a ThreatBatch over the B_k rows, each
+                 position in its own frame); None unless the loader has a ThreatLabels that covers this step
     """
     graphs: Optional[GraphBatch]
     index: torch.Tensor
@@ -691,12 +878,14 @@ class RolloutStep:
     flags: torch.Tensor
     piece: torch.Tensor
     legal: Optional[torch.Tensor] = None
+    threats: Optional[ThreatBatch] = None
 
     def _map(self, fn, graph_fn) -> "RolloutStep":
         graphs = graph_fn(self.graphs) if self.graphs is not None else None
         return RolloutStep(graphs, fn(self.index), fn(self.parent), fn(self.move_from),
                            fn(self.move_to), fn(self.promotion), fn(self.flags), fn(self.piece),
-                           fn(self.legal) if self.legal is not None else None)
+                           fn(self.legal) if self.legal is not None else None,
+                           self.threats._map(fn) if self.threats is not None else None)
 
     def to(self, device, non_blocking: bool = False) -> "RolloutStep":
         return self._map(lambda t: t.to(device, non_blocking=non_blocking), lambda g: g.to(device, non_blocking))
@@ -720,6 +909,8 @@ class JEPABatch:
       fens, moves       for inspection (moves: each position's rollout moves, in UCI)
       legal             [M] every position's legal moves, each as b * 4096 + from * 64 + to (squares of
                         full / context's graphs); None for a batch put together without them
+      threats           the B positions' legal-threat labels (a ThreatBatch); None unless the loader has a
+                        ThreatLabels
     next, next_index, move_from, move_to, promotion and move_flags are the first move's, as before rollouts.
     """
     full: GraphBatch
@@ -729,6 +920,7 @@ class JEPABatch:
     fens: List[str] = field(default_factory=list)
     moves: List[List[str]] = field(default_factory=list)
     legal: Optional[torch.Tensor] = None
+    threats: Optional[ThreatBatch] = None
 
     @property
     def num_graphs(self) -> int:
@@ -767,12 +959,14 @@ class JEPABatch:
         return JEPABatch(self.full.to(device, non_blocking), self.context.to(device, non_blocking),
                          self.mask.to(device, non_blocking=non_blocking),
                          [step.to(device, non_blocking) for step in self.rollout], self.fens, self.moves,
-                         self.legal.to(device, non_blocking=non_blocking) if self.legal is not None else None)
+                         self.legal.to(device, non_blocking=non_blocking) if self.legal is not None else None,
+                         self.threats.to(device, non_blocking) if self.threats is not None else None)
 
     def pin_memory(self) -> "JEPABatch":
         return JEPABatch(_pin_graphs(self.full), _pin_graphs(self.context), self.mask.pin_memory(),
                          [step.pin_memory() for step in self.rollout], self.fens, self.moves,
-                         self.legal.pin_memory() if self.legal is not None else None)
+                         self.legal.pin_memory() if self.legal is not None else None,
+                         self.threats.pin_memory() if self.threats is not None else None)
 
 
 def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
@@ -802,6 +996,7 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
             piece=torch.tensor([m.piece for m in moves], dtype=torch.long),
             legal=torch.tensor([row * 4096 + code for row, m in enumerate(moves) for code in m.legal],
                                dtype=torch.long) if moves[0].view is not None else None,
+            threats=ThreatBatch.pack([m.threats for m in moves]) if moves[0].threats is not None else None,
         ))
         previous = ids
     return JEPABatch(
@@ -812,6 +1007,7 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
         fens=[s.fen for s in samples],
         moves=[[m.move for m in s.rollout] for s in samples],
         legal=torch.tensor([b * 4096 + code for b, s in enumerate(samples) for code in s.legal], dtype=torch.long),
+        threats=ThreatBatch.pack([s.threats for s in samples]) if samples[0].threats is not None else None,
     )
 
 
@@ -837,6 +1033,7 @@ class PositionDataset(Dataset):
         self.rollout_steps = 1
         self.rollout_targets: Optional[List[int]] = None     # None: every step is a target
         self.siblings = 1                                     # different first moves per position (build_sample)
+        self.threats: Optional[ThreatLabels] = None           # where legal-threat labels come from (None: no labels)
         self._positions: Optional[np.ndarray] = None
         total = len(np.load(self.path, mmap_mode="r"))
         self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
@@ -865,7 +1062,7 @@ class PositionDataset(Dataset):
 
     def __getitem__(self, i: int) -> JEPASample:
         return build_sample(self.fen(i), self.rng_for(i), self.mask_config, rollout_steps=self.rollout_steps,
-                            target_steps=self.rollout_targets, siblings=self.siblings)
+                            target_steps=self.rollout_targets, siblings=self.siblings, threats=self.threats)
 
 
 class _EpochShuffle(Sampler):
@@ -893,15 +1090,17 @@ class _EpochShuffle(Sampler):
 class JEPALoader:
     """
     Batches of JEPASamples from one split, prepared by worker processes. Call set_epoch(e) before
-    each epoch: the order, masks and moves then depend only on (seed, epoch).
+    each epoch: the order, masks and moves then depend only on (seed, epoch). threats: a ThreatLabels, for
+    batches that carry legal-threat labels.
     """
 
     def __init__(self, cache_dir: str, split: str, batch_size: int, *, num_workers: int = 4,
                  mask_config: MaskConfig = MaskConfig(), seed: int = 0, shuffle: bool = True,
                  drop_last: bool = False, indices: Optional[Sequence[int]] = None, pin_memory: bool = False,
-                 prefetch_factor: int = 4, siblings: int = 1):
+                 prefetch_factor: int = 4, siblings: int = 1, threats: Optional[ThreatLabels] = None):
         self.dataset = PositionDataset(cache_dir, split, mask_config, seed, indices)
         self.dataset.siblings = int(siblings)
+        self.dataset.threats = threats
         self.sampler = _EpochShuffle(self.dataset, shuffle)
         self.loader_kwargs = dict(batch_size=batch_size, sampler=self.sampler, num_workers=num_workers,
                                   collate_fn=collate_jepa, drop_last=drop_last, pin_memory=pin_memory)

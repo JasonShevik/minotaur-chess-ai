@@ -13,7 +13,9 @@ so they do not need minotaur_data.db. They check that:
   * the masked view never leaks what stands on the masked squares, including through castling
     edges and the en passant flag: changing the masked squares leaves the masked view unchanged;
   * next positions, batches and move indices line up with chess_graph and the encoder's batching;
-  * the loader is reproducible for a given (seed, epoch), whatever the number of workers.
+  * the loader is reproducible for a given (seed, epoch), whatever the number of workers;
+  * legal-threat labels are turned into the graph's frame, come from the labels database or the search, and
+    ride along in samples and batches without disturbing anything else.
 """
 import os
 import pickle
@@ -25,11 +27,21 @@ import traceback
 from typing import Callable, List
 
 import chess
+import numpy as np
 import torch
 
 import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import chess_graph as cg
 import labyrinth_data as ld
+import piece_reach as pr
+import reach_labeler as rl
+
+
+class SearchedThreats(ld.ThreatLabels):
+    """Labels straight from the search, whichever one is installed (for a handful of positions the Python one will do)."""
+
+    def counts(self, fen):
+        return pr.threat_counts(fen, self.plies), ld.THREATS_COMPUTED
 
 
 # ##### ##### ##### ##### #####
@@ -512,6 +524,175 @@ def test_loader_rollout_length_and_mid_epoch_resume():
         loader.resume_at(40)
         rest = [f for b in loader for f in b.fens]
         assert first[:40] + rest == full, "resuming continues the epoch without repeats or gaps"
+
+
+def test_threat_labels_are_turned_into_the_graphs_frame():
+    """
+    The labels go by the board's real squares; a graph shows the side to move at the bottom. Checked against
+    what the pipeline already has in the graph's frame: after 0 plies the side to move's threats are its legal
+    moves (legal_codes), and every labelled piece square holds a piece of the graph.
+    """
+    none = torch.zeros(64, dtype=torch.bool)
+    for fen in ("r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2P1PN2/PP1N1PPP/R2QKB1R b - - 3 8",       # black to move
+                "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2P1PN2/PP1NBPPP/R2Q1RK1 w - - 4 9",       # white to move
+                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 b - - 0 1"):
+        fen = ld.normalize_fen(fen)
+        board = chess.Board(fen, chess960=True)
+        white = board.turn == chess.WHITE
+        counts = pr.threat_counts(fen, 1)
+        codes, logs = ld.threat_cells(counts, white)
+        ply, piece, target = codes // 4096, codes // 64 % 64, codes % 64
+        assert codes.dtype == np.int32 and logs.dtype == np.float32 and len(codes) == int((counts > 0).sum())
+        turn = 0 if white else 56
+        assert np.allclose(np.expm1(logs.astype(np.float64)), counts[ply, piece ^ turn, target ^ turn]), "each cell keeps its count"
+        x = ld.build_views(fen, none)[0].x
+        assert bool((x[torch.as_tensor(piece), 1:7].sum(1) > 0).all()), "every labelled row is a piece of the graph"
+        mine = (ply == 0) & (x[torch.as_tensor(piece), 0] == 0).numpy()        # (first feature: the piece is the other side's)
+        assert sorted((piece[mine] * 64 + target[mine]).tolist()) == ld.legal_codes(board), \
+            "the side to move's threats now are its legal moves, in the graph's squares"
+        assert int((ply == 0).sum()) > int(mine.sum()), "the other side's pieces are asked too"
+        # the two frames differ exactly by turning the board over, and only for black to move
+        plain = ld.threat_cells(counts, True)[0]
+        assert white == bool(np.array_equal(plain, codes))
+        assert sorted(((plain // 4096 * 64 + (plain // 64 % 64 ^ turn)) * 64 + (plain % 64 ^ turn)).tolist()) == sorted(codes.tolist())
+
+
+def test_threat_labels_come_from_the_database_or_the_search():
+    fens = [ld.normalize_fen(b.fen()) for b in random_positions(3, seed=5, per_start=4)]
+    white = [f.split()[1] == "w" for f in fens]
+    sources = []
+
+    def source(*args, **kw):
+        sources.append(ld.ThreatLabels(*args, **kw))
+        return sources[-1]
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = os.path.join(tmp, "labels.db")
+        conn = rl.open_db(db)
+        rl.write_labels(conn, pr.label_threats((fens[:6], 2)), "threats")
+        conn.executemany("INSERT INTO reach_progress (walk, done) VALUES (?, ?)", [
+            (rl.walk_name("train", 0, 0, 2, 2, "threats"), 123), (rl.walk_name("train", 0, 0, 0, 1, "threats"), 999),
+            (rl.walk_name("train", 0, 0, 2, 3, "reach"), 5000), (rl.walk_name("val", 0, 0, 2, 2, "threats"), 7)])
+        conn.commit()
+        conn.close()
+        was = pr.USING_C
+        try:
+            pr.use_compiled(False)                      # nothing can be searched on the spot now
+            stored = source(2, db)
+            assert not stored.searches and stored.layers == 3
+            # how far the labeller's walks that fit this source have got
+            assert stored.stored_samples("train", 0) == 123 and stored.stored_samples("val", 0) == 7
+            assert stored.stored_samples("train", 1) == 0 and stored.stored_samples("train", 0, epoch=1) == 0
+            assert source(1, db, rollout_steps=0).stored_samples("train", 0) == 999, "a walk without rollout positions will do"
+            assert source(1, db).stored_samples("train", 0) == 123 and source(3, db).stored_samples("train", 0) == 0
+            got = stored.of(fens[0], white[0])
+            want = ld.threat_cells(pr.threat_counts(fens[0], 2), white[0])
+            assert got.origin == ld.THREATS_STORED and got.layers == 3
+            assert np.array_equal(got.codes, want[0]) and np.array_equal(got.logs, want[1])
+            shallow = source(1, db).of(fens[0], white[0])              # a deeper label holds the shallower one
+            assert shallow.origin == ld.THREATS_STORED and shallow.layers == 2
+            assert np.array_equal(shallow.codes, want[0][want[0] < 2 * 4096])
+            for nothing in (stored.of(fens[7], white[7]),                            # not in the database
+                            source(3, db).of(fens[0], white[0]),                     # only labelled to 2 plies
+                            source(2, None).of(fens[0], white[0]),                   # no database at all
+                            source(2, os.path.join(tmp, "absent.db")).of(fens[0], white[0])):
+                assert nothing.origin == ld.THREATS_NONE and len(nothing.codes) == 0 and len(nothing.logs) == 0
+            copy = pickle.loads(pickle.dumps(stored))                   # a loader worker's copy opens its own
+            sources.append(copy)
+            assert copy._conn is None and copy.of(fens[1], white[1]).origin == ld.THREATS_STORED
+        finally:
+            pr.use_compiled(was)
+        if pr.USING_C:                                  # with the compiled search, the rest is searched on the spot
+            searched = source(2, db).of(fens[7], white[7])
+            want = ld.threat_cells(pr.threat_counts(fens[7], 2, use_c=False), white[7])
+            assert searched.origin == ld.THREATS_COMPUTED and np.array_equal(searched.codes, want[0])
+            assert source(2, db).of(fens[0], white[0]).origin == ld.THREATS_STORED, "the database comes first"
+            assert source(2, db, compute=False).of(fens[7], white[7]).origin == ld.THREATS_NONE
+        for s in sources:
+            s.close()
+    for bad in (dict(plies=-1), dict(plies=1, rollout_steps=-1)):
+        try:
+            ld.ThreatLabels(**bad)
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+
+
+def test_samples_and_batches_carry_threat_labels():
+    fens = [ld.normalize_fen(b.fen()) for b in random_positions(4, seed=9, per_start=3)][::3]
+    source = SearchedThreats(1, rollout_steps=2)
+    samples = [ld.build_sample(f, random.Random(i), rollout_steps=3, threats=source) for i, f in enumerate(fens)]
+    plain = [ld.build_sample(f, random.Random(i), rollout_steps=3) for i, f in enumerate(fens)]
+    for s, p in zip(samples, plain):
+        assert p.threats is None and all(m.threats is None for m in p.rollout)
+        assert torch.equal(s.mask, p.mask) and [m.move for m in s.rollout] == [m.move for m in p.rollout], \
+            "labels change nothing in the random draws"
+        board = chess.Board(s.fen, chess960=True)
+        want = ld.threat_cells(pr.threat_counts(s.fen, 1), board.turn == chess.WHITE)
+        assert s.threats.layers == 2 and np.array_equal(s.threats.codes, want[0]) and np.array_equal(s.threats.logs, want[1])
+        for k, m in enumerate(s.rollout, start=1):
+            board.push_uci(m.move)
+            if k > 2:
+                assert m.threats is None, "only the first rollout_steps positions are labelled"
+                continue
+            want = ld.threat_cells(pr.threat_counts(ld.fen_of(board), 1), board.turn == chess.WHITE)
+            assert np.array_equal(m.threats.codes, want[0]), "a rollout position's labels are in its own frame"
+
+    batch = ld.collate_jepa(samples)
+    dense = batch.threats.dense()
+    assert dense.shape == (len(fens), 2, 64, 64) and batch.threats.layers == 2
+    assert batch.threats.origin.tolist() == [ld.THREATS_COMPUTED] * len(fens)
+    for b, s in enumerate(samples):
+        want = torch.zeros(2 * 4096)
+        want[torch.as_tensor(s.threats.codes, dtype=torch.long)] = torch.as_tensor(s.threats.logs)
+        assert torch.equal(dense[b].flatten(), want)
+    assert [step.threats is not None for step in batch.rollout] == [True, True, False]
+    for k, step in enumerate(batch.rollout[:2]):
+        rows = step.threats.dense()
+        assert rows.shape[0] == step.index.numel()
+        for row, b in enumerate(step.index.tolist()):
+            m = samples[b].rollout[k]
+            assert int((rows[row] > 0).sum()) == len(m.threats.codes)
+            assert torch.equal(rows[row].flatten().nonzero().flatten(), torch.as_tensor(np.sort(m.threats.codes), dtype=torch.long))
+    moved = batch.to("cpu")
+    assert torch.equal(moved.threats.dense(), dense) and moved.rollout[0].threats.layers == 2
+    assert ld.collate_jepa(plain).threats is None and all(step.threats is None for step in ld.collate_jepa(plain).rollout)
+
+    # a position without a label: its row of the batch is empty and says so
+    class Half(SearchedThreats):
+        def counts(self, fen):
+            return (None, ld.THREATS_NONE) if fen == fens[1] else super().counts(fen)
+
+    mixed = ld.collate_jepa([ld.build_sample(f, random.Random(i), threats=Half(1, rollout_steps=0)) for i, f in enumerate(fens)])
+    assert mixed.threats.origin.tolist() == [ld.THREATS_COMPUTED, ld.THREATS_NONE] + [ld.THREATS_COMPUTED] * (len(fens) - 2)
+    assert not mixed.threats.dense()[1].any() and mixed.threats.dense()[0].any() and mixed.rollout[0].threats is None
+
+    # labels only where a step is a target, and for sibling moves as for the first step
+    sparse = ld.build_sample(fens[0], random.Random(0), rollout_steps=3, target_steps=[2], threats=source)
+    assert [m.threats is not None for m in sparse.rollout] == [False, True, False]
+    family = ld.build_sample(fens[0], random.Random(0), siblings=3, threats=source)
+    assert family.siblings and all(m.threats is not None for m in family.siblings)
+
+
+def test_loader_hands_out_threat_labels_with_workers():
+    boards = random_positions(6, seed=3)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "fens.txt")
+        with open(path, "w") as f:
+            f.write("\n".join(b.fen() for b in boards))
+        cache = os.path.join(tmp, "cache")
+        ld.build_position_cache_from_file(path, cache, val_fraction=0.0, test_fraction=0.0, verbose=False)
+        seen = []
+        for workers in (0, 2):
+            loader = ld.JEPALoader(cache, "train", 8, num_workers=workers, seed=3, threats=SearchedThreats(1, rollout_steps=1))
+            loader.set_rollout_steps(2)
+            batch = next(iter(loader))
+            assert batch.threats is not None and batch.threats.dense().shape == (8, 2, 64, 64)
+            assert batch.rollout[0].threats is not None and batch.rollout[1].threats is None
+            seen.append((batch.fens, batch.threats.index, batch.threats.value, batch.rollout[0].threats.index))
+        assert seen[0][0] == seen[1][0] and all(torch.equal(a, b) for a, b in zip(seen[0][1:], seen[1][1:])), \
+            "the same labels whatever the number of workers"
+        assert next(iter(ld.JEPALoader(cache, "train", 8, num_workers=0, seed=3))).threats is None
 
 
 # ##### ##### ##### ##### #####
