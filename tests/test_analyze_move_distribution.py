@@ -3,7 +3,7 @@ Tests for analyze_move_distribution.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_analyze_move_distribution.py
+    python tests/test_analyze_move_distribution.py
 
 They check the move flags (capture, check, castle, promotion, the hanging heuristic) on hand-made
 positions, the game phases, the two sampling schemes' shares, and a small end-to-end run writing the CSV.
@@ -18,6 +18,7 @@ from typing import Callable, List
 
 import chess
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import analyze_move_distribution as amd
 
 

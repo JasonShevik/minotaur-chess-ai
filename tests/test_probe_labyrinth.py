@@ -3,7 +3,7 @@ Tests for probe_labyrinth.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_probe_labyrinth.py
+    python tests/test_probe_labyrinth.py
 
 They check the metrics against brute-force or known answers, the label conversions (engine scores
 to the side to move's view, moves to the side to move's frame, the puzzle's setting move), and a
@@ -23,6 +23,7 @@ import chess
 import numpy as np
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import labyrinth_data as ld
 import labyrinth_jepa_encoder as lje
 import probe_labyrinth as pl

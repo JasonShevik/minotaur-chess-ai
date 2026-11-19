@@ -3,7 +3,7 @@ Tests for lichess_position_grabber.py and the self-supervised positions table in
 
 Run with plain Python (no pytest needed):
 
-    python test_lichess_position_grabber.py
+    python tests/test_lichess_position_grabber.py
 
 They write small PGN archives of random games (standard and Chess960, some played down to bare
 endgames) to a temporary folder and check that:
@@ -29,6 +29,7 @@ from typing import Callable, Dict, List
 import chess
 import chess.pgn
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import db_tools
 import labyrinth_data as ld
 import lichess_position_grabber as lpg

@@ -3,7 +3,7 @@ Tests for the JEPA encoder in labyrinth_jepa_encoder.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_jepa_encoder.py
+    python tests/test_jepa_encoder.py
 
 They check contracts, not learning:
   * all three token variants build from a config, run, and give the documented shapes;
@@ -23,6 +23,7 @@ from typing import Callable, List
 import chess
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import labyrinth_data as ld
 import labyrinth_jepa_encoder as lje
 

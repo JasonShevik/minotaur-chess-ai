@@ -32,7 +32,7 @@ Backwards compatibility:
     accepted for replay (one graph at a time), and record_v1=True also returns one, as out.actions_v1.
     actions_to_v1 / actions_from_v1 convert between the formats.
 
-v1 stays as the readable reference implementation; test_guo_unpooling_v2.py checks that the two
+v1 stays as the readable reference implementation; tests/test_guo_unpooling_v2.py checks that the two
 make identical decisions, graphs, log-probabilities and entropies.
 """
 import math

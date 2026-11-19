@@ -3,7 +3,7 @@ Correctness tests for the batched unpooling layer in guo_et_al_unpooling_v2.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_guo_unpooling_v2.py
+    python tests/test_guo_unpooling_v2.py
 
 v1 (guo_et_al_unpooling_v1.py) is the reference. These tests check that v2 is the same layer:
 
@@ -23,6 +23,7 @@ from typing import Callable, List
 
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import chess_graph as cg
 import guo_et_al_unpooling_v1 as gu1
 import guo_et_al_unpooling_v2 as gu2

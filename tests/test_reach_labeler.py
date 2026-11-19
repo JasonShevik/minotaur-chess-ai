@@ -4,7 +4,7 @@ reach_labeler.py (the program).
 
 Run with plain Python (no pytest needed):
 
-    python test_reach_labeler.py
+    python tests/test_reach_labeler.py
 
 They check:
   * the counts against every move sequence played out one by one with python-chess (castling in both directions,
@@ -28,6 +28,7 @@ from typing import Callable, List
 import chess
 import numpy as np
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import labyrinth_data as ld
 import piece_reach as pr
 import reach_labeler as rl

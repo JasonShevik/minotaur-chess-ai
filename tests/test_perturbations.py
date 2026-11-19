@@ -3,14 +3,14 @@ Correctness tests for the position perturbations in chess_graph.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_perturbations.py
+    python tests/test_perturbations.py
 
 Every perturbation must produce a position that is different from the input and plausible:
 something that could arise in a legal game of Chess960. The tests below check the rules the
 perturbations are supposed to obey, the mirror perturbation end to end (including castling
 edges), and the graph features built from perturbed positions.
 
-If minotaur_data.db is present next to this file (or MINOTAUR_DB points at one), a sample of
+If minotaur_data.db is present in the repo's root (or MINOTAUR_DB points at one), a sample of
 real positions is swept as well; otherwise the sweep runs on a small built-in set.
 """
 import collections
@@ -24,6 +24,7 @@ from typing import Callable, List
 import chess
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import chess_graph as cg
 
 
@@ -49,7 +50,7 @@ def _db_path() -> str:
     env = os.environ.get("MINOTAUR_DB")
     if env and os.path.isfile(env):
         return env
-    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minotaur_data.db")
+    local = os.path.join(repo_root.ROOT, "minotaur_data.db")
     return local if os.path.isfile(local) else ""
 
 

@@ -3,7 +3,7 @@ Correctness tests for the unpooling layer in guo_et_al_unpooling_v1.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_guo_unpooling_v1.py
+    python tests/test_guo_unpooling_v1.py
 
 The layer follows appendix A of Guo, Zou and Lerman for undirected graphs. These tests check it
 against the paper's rules, independently of how the layer is implemented, so they can serve as
@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Set, Tuple
 
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import chess_graph as cg
 import guo_et_al_unpooling_v1 as gu
 

@@ -3,7 +3,7 @@ Tests for the Labyrinth training-data pipeline in labyrinth_data.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_labyrinth_data.py
+    python tests/test_labyrinth_data.py
 
 They build small caches in a temporary folder (from a throwaway SQLite database and a FEN file),
 so they do not need minotaur_data.db. They check that:
@@ -27,6 +27,7 @@ from typing import Callable, List
 import chess
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import chess_graph as cg
 import labyrinth_data as ld
 

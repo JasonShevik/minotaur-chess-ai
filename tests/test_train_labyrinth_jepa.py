@@ -3,7 +3,7 @@ Tests for the JEPA training script, train_labyrinth_jepa.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_train_labyrinth_jepa.py
+    python tests/test_train_labyrinth_jepa.py
 
 Tiny models on a tiny position cache built in a temporary folder, on the CPU. They check that a run
 trains, evaluates, checkpoints and resumes; that the schedules and weight-decay groups are right; that
@@ -22,6 +22,7 @@ from typing import Callable, List
 import chess
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import labyrinth_data as ld
 import labyrinth_jepa_encoder as lje
 import probe_labyrinth as pl

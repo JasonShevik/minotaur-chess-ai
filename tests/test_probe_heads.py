@@ -1,6 +1,6 @@
 """
 Tests for probe_heads.py: the quiet-move rule, the from-to pairs, the matched sets and the trained head.
-Run: python test_probe_heads.py
+Run: python tests/test_probe_heads.py
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import chess
 import numpy as np
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import labyrinth_data as ld
 import probe_heads as ph
 

@@ -3,7 +3,7 @@ Tests for the three Labyrinth models in labyrinth_dgi_encoder.py.
 
 Run with plain Python (no pytest needed):
 
-    python test_encoder.py
+    python tests/test_encoder.py
 
 These check shapes and contracts rather than learning: that every model builds from a config,
 that the summarizer can replay its own unpooling decisions exactly, that stacking positions
@@ -19,6 +19,7 @@ from typing import Callable, List
 
 import torch
 
+import repo_root  # noqa: F401  (first: it puts the repo's root folder, where the code under test is, on sys.path)
 import chess_graph as cg
 import labyrinth_dgi_encoder as lde
 
