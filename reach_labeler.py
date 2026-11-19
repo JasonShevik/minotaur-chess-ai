@@ -33,16 +33,23 @@ again from the first sample and deepens the labels in training order, and going 
 adding new samples where depth 3 left off (skipping positions that already have depth 3 or more). For
 threats, DEPTH plies means layers for 0, 1, ..., DEPTH plies of play.
 
-Cost, measured on this machine (python-chess), per position on one core and with 24 workers:
+The search. piece_reach.py has two that give the same labels: its own in Python, and fast_reach.c compiled,
+which `python build_fast_reach.py` builds once per machine. A run says in its first lines which one it is
+using. Cost, measured on this machine: one search on one core, and labels a second from the whole program with
+24 workers.
 
-    threats, 2 plies   0.07 s    about 200 a second   label about 0.9 kB
-    threats, 3 plies   1.6 s     (not run)            label about 2 kB
-    reach, 3 plies     0.03 s    about 400 a second   label about 0.9 kB
-    reach, 4 plies     0.8 s     about 14 a second    label about 1.8 kB
+                       compiled                             Python
+    threats, 2 plies   0.13 ms   about 8,000 a second       0.07 s   about 200 a second     label about 0.9 kB
+    threats, 3 plies   3.4 ms    about 3,000 a second       1.6 s    (not run)              label about 2 kB
+    threats, 4 plies   80 ms     about 140 a second         (not run)                       label about 3.7 kB
+    reach, 3 plies     0.15 ms   about 7,000 a second       0.03 s   about 400 a second     label about 0.9 kB
+    reach, 4 plies     4 ms      (not run)                  0.8 s    about 14 a second      label about 1.8 kB
 
-Each further ply costs roughly 25 times more, so the next depth of either kind needs a compiled search before
-it is practical. Workers use up to about 160 MB each; the main process holds the training order (about 3 GB
-for the full training split).
+Each further ply costs roughly 25 times more. At 2 plies of threats (3 of reach) the compiled search is no
+longer what limits the program: the main process is, replaying each sample's rollout moves and writing the
+database, so more workers add nothing there. Workers on the Python search use up to about 160 MB each; on the
+compiled one, threats to 4 plies or more take up to about 130 MB each for the positions it remembers
+(FAST_REACH_TABLE_MB). The main process holds the training order (about 3 GB for the full training split).
 
 The tables (in their own database file by default, so the 15 GB positions database is never written to and
 position_labeler.py can run at the same time):
@@ -316,6 +323,8 @@ def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT
     row = conn.execute("SELECT done FROM reach_progress WHERE walk = ?", (walk,)).fetchone()
     done = int(row[0]) if row else 0
     log(f"walk '{walk}': {done:,} samples done before this start; {workers} workers")
+    log("search: compiled (fast_reach)" if pr.USING_C else
+        f"search: Python, some hundreds of times slower than the compiled one, which is {pr.C_UNAVAILABLE}")
     positions = walk_positions(cache_dir, split, order_seed, order_epoch, rollout_plies, start=done)
     if workers:
         pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_start_worker,

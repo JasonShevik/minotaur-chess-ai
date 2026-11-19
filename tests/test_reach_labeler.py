@@ -33,6 +33,10 @@ import labyrinth_data as ld
 import piece_reach as pr
 import reach_labeler as rl
 
+# These are the tests of the Python searches, which everything else is measured against, so they run on those
+# even where the compiled search is built. tests/test_fast_reach.py checks the compiled search against them.
+pr.use_compiled(False)
+
 FENS = [
     "1q1rkr2/pp3pnp/2pn2pQ/3p4/3Pb3/2P2NP1/PP2P2P/3RKRNB b - - 1 15",
     "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",       # en passant on offer

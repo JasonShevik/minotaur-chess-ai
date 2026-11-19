@@ -42,17 +42,107 @@ A count above 0 is the yes/no form (can this threat arise within k plies); the c
 
 This module is the search and the storage format, and imports only python-chess and numpy, so the labelling
 program's worker processes stay small. reach_labeler.py is the program that fills a database with it.
+
+Two searches give the same arrays. The ones written here in Python are the reference: short, checked against
+every sequence played out one by one (tests/test_reach_labeler.py). fast_reach.c is the same counting compiled,
+some hundreds of times faster; `python build_fast_reach.py` builds it, and once the library lies next to this
+file reach_counts and threat_counts use it (USING_C says whether they do). tests/test_fast_reach.py checks
+that the two agree. A position the compiled search refuses (one that cannot arise in a game) goes to the
+Python search, so the answer never depends on which is installed.
 """
 from __future__ import annotations
 
+import ctypes
+import os
 import struct
 import zlib
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import chess
 import numpy as np
 
 CAPTURED: int = 64          # the column for "no longer on the board"
+
+# ---------- ---------- ----------
+#   The compiled search, when it has been built
+
+C_VERSION: int = 1          # fast_reach.c's fr_version(): a library built from another version is not used
+# Memory, per process, for the positions the compiled search remembers within and between searches. Only
+# allocated by threat searches of 4 plies or more, which are the ones that meet positions again.
+TABLE_MB: int = int(os.environ.get("FAST_REACH_TABLE_MB", "128"))
+TABLE_SLOTS_LOG2: int = 18
+
+LIBRARY: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fast_reach.dll" if os.name == "nt" else "fast_reach.so")
+
+
+def _load_library() -> Tuple[Optional[ctypes.CDLL], str]:
+    """(the library, "") or (None, why not)."""
+    if not os.path.exists(LIBRARY):
+        return None, "not built (python build_fast_reach.py)"
+    try:
+        lib = ctypes.CDLL(LIBRARY)
+        lib.fr_version.restype = ctypes.c_int
+        if lib.fr_version() != C_VERSION:
+            return None, "built from another version of fast_reach.c (python build_fast_reach.py)"
+        lib.fr_new.argtypes = [ctypes.c_size_t, ctypes.c_int]
+        lib.fr_new.restype = ctypes.c_void_p
+        for call in (lib.fr_clear, lib.fr_free):
+            call.argtypes = [ctypes.c_void_p]
+            call.restype = None
+        lib.fr_stats.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.fr_stats.restype = None
+        for search in (lib.fr_threat_counts, lib.fr_reach_counts):
+            search.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+            search.restype = ctypes.c_int
+    except (OSError, AttributeError) as error:
+        return None, f"could not be loaded ({error})"
+    return lib, ""
+
+
+_LIB, C_UNAVAILABLE = _load_library()
+USING_C: bool = _LIB is not None    # whether the searches below use the compiled one; C_UNAVAILABLE says why not
+_CONTEXT: Optional[int] = None      # this process's search context (a process pool's workers each make their own)
+
+
+def use_compiled(on: bool) -> bool:
+    """Switch the compiled search on or off for this process (off: to run the Python searches where the library
+    is built, as their own tests do). Returns whether it is in use now."""
+    global USING_C
+    USING_C = bool(on) and _LIB is not None
+    return USING_C
+
+
+def _context() -> int:
+    global _CONTEXT
+    if _CONTEXT is None:
+        _CONTEXT = _LIB.fr_new(TABLE_MB, TABLE_SLOTS_LOG2)
+        if not _CONTEXT:
+            raise MemoryError("fast_reach: no memory for a search context")
+    return _CONTEXT
+
+
+def forget() -> None:
+    """Drop what the compiled search remembers from earlier searches (tests; it never changes an answer)."""
+    if _LIB is not None:
+        _LIB.fr_clear(_context())
+
+
+def search_stats() -> Dict[str, int]:
+    """Counters of the compiled search in this process since it started ({} without it)."""
+    if _LIB is None:
+        return {}
+    raw = (ctypes.c_uint64 * 8)()
+    _LIB.fr_stats(_context(), raw)
+    names = ("positions", "table_hits", "table_stores", "answers_reused", "table_clears", "searches")
+    return {name: int(raw[i]) for i, name in enumerate(names)}
+
+
+def _compiled(search, fen: str, depth: int, shape: Tuple[int, int, int]) -> Optional[np.ndarray]:
+    """The compiled search's array, or None when it refuses the position (the Python search then takes it)."""
+    out = np.empty(shape, dtype=np.uint64)
+    if search(_context(), fen.encode("ascii", "replace"), depth, out.ctypes.data):
+        return None
+    return out
 
 
 def position_key(fen: str) -> str:
@@ -61,9 +151,10 @@ def position_key(fen: str) -> str:
     return " ".join(fen.split()[:4])
 
 
-def reach_counts(fen: str, depth: int) -> np.ndarray:
+def reach_counts(fen: str, depth: int, use_c: bool = True) -> np.ndarray:
     """
     [depth, 64, 65] uint64: the counts described at the top of this file, for sequences of 1 to `depth` plies.
+    use_c=False: the Python search below even when the compiled one is there (the two give the same array).
 
     The sequences are not played out one by one. The search goes a ply at a time over the arrangements that can
     arise (who stands where, and whatever else decides the moves to come), and each arrangement carries the
@@ -73,6 +164,10 @@ def reach_counts(fen: str, depth: int) -> np.ndarray:
     """
     if depth < 1:
         raise ValueError("depth must be at least 1")
+    if use_c and USING_C:
+        out = _compiled(_LIB.fr_reach_counts, fen, depth, (depth, 64, 65))
+        if out is not None:
+            return out
     board = chess.Board(fen, chess960=True)
     squares = [sq for sq in chess.SQUARES if board.piece_type_at(sq) is not None]      # the pieces, by their square now
     n = len(squares)
@@ -154,10 +249,11 @@ def reach_counts(fen: str, depth: int) -> np.ndarray:
     return out
 
 
-def threat_counts(fen: str, plies: int) -> np.ndarray:
+def threat_counts(fen: str, plies: int, use_c: bool = True) -> np.ndarray:
     """
     [plies + 1, 64, 64] uint64: the legal threats described at the top of this file, after sequences of 0 to
     `plies` plies. Layer k holds what every piece of both sides could legally move to after k plies.
+    use_c=False: the Python search below even when the compiled one is there (the two give the same array).
 
     The search is reach_counts' (arrangements a ply at a time, each with the number of sequences that lead to
     it, move orders that meet searched once with their numbers added), except that the last ply's positions
@@ -167,6 +263,10 @@ def threat_counts(fen: str, plies: int) -> np.ndarray:
     """
     if plies < 0:
         raise ValueError("plies must be at least 0")
+    if use_c and USING_C:
+        out = _compiled(_LIB.fr_threat_counts, fen, plies, (plies + 1, 64, 64))
+        if out is not None:
+            return out
     board = chess.Board(fen, chess960=True)
     squares = [sq for sq in chess.SQUARES if board.piece_type_at(sq) is not None]      # the pieces, by their square now
     n = len(squares)
@@ -306,6 +406,14 @@ def label_positions(job: Tuple[Sequence[str], int]) -> List[Tuple[str, int, byte
 
 
 def label_threats(job: Tuple[Sequence[str], int]) -> List[Tuple[str, int, bytes]]:
-    """What a worker does for threat labels: (FENs, plies) -> for each FEN, (its position key, plies, its packed counts)."""
+    """
+    What a worker does for threat labels: (FENs, plies) -> for each FEN, (its position key, plies, its packed counts).
+
+    The FENs are searched last one first. The labeller hands over each sample as a position followed by the
+    positions after it in its rollout, and the compiled search keeps the last few whole answers: searched in
+    that order, every position finds the one that follows it already answered and skips that branch (about one
+    branch in thirty). The rows come back in the order the FENs were given.
+    """
     fens, plies = job
-    return [(position_key(fen), plies, pack_counts(threat_counts(fen, plies))) for fen in fens]
+    rows = [(position_key(fen), plies, pack_counts(threat_counts(fen, plies))) for fen in reversed(fens)]
+    return rows[::-1]

@@ -17,6 +17,12 @@ minotaur_reach*.db
 *.db-wal
 *.db-shm
 
+# ----- Compiled search -----
+# Built on each machine from fast_reach.c by build_fast_reach.py.
+fast_reach.dll
+fast_reach.so
+fast_reach.*.new
+
 # ----- Raw game data -----
 lichess-games/
 
