@@ -1,7 +1,8 @@
 """
-Where every piece of a position can be after 1, 2, ... plies of legal play, and in how many ways.
+Where every piece of a position can be after 1, 2, ... plies of legal play, and what it could move to then,
+each with the number of ways: the reach labels and the legal-threat labels.
 
-Take a position and a number of plies d, and look at every sequence of d legal moves from it, the two sides
+Reach (reach_counts). Take a position and a number of plies d, and look at every sequence of d legal moves from it, the two sides
 moving in turn as in a game. For each piece on the board now, and each square:
 
     counts[d - 1, p, s]    how many of those sequences leave the piece that stands on square p NOW standing on
@@ -17,6 +18,27 @@ material) do not end a sequence. Rows of empty squares are zero.
 
 From the counts one can read whether a piece can reach a square within k plies (a count above 0 at some depth
 up to k), the fewest plies that takes, how many move orders do it, and how often each piece is captured.
+
+Legal threats (threat_counts) are the second kind of label, from the same sequences. A piece threatens a
+square when moving there would be a legal move if it were its side's turn:
+
+    threats[k, p, s]       how many sequences of k plies (k = 0: the position as it is) leave the piece that
+                           stands on square p NOW able to move to square s, were it its side's turn.
+
+Both sides' pieces are asked after every sequence, whoever moved last, so each ply adds something for both.
+What follows from "a legal move":
+  * a pinned piece threatens nothing off the line of its pin, and a piece freed by another piece moving out
+    of its way (or by a capture) threatens its new squares from that ply on;
+  * a pawn threatens the squares ahead of it while they are empty, and a diagonal square only when there is
+    something to take there (the en passant square included, for the side whose turn it really is);
+  * a piece giving check threatens the king's square: with the turn handed over it could take the king;
+  * castling counts as the king and the rook each threatening the square they would castle to;
+  * a pawn that could promote threatens the square once, not once per promotion piece;
+  * a captured piece threatens nothing in the sequences where it is gone.
+Not counted, because it is no legal move: standing guard over one's own piece, and a pawn covering an empty
+diagonal square. Both show a ply later, once something stands there to be taken. (A separate "guards" count
+would show them at once: left out on purpose, a possible later addition.)
+A count above 0 is the yes/no form (can this threat arise within k plies); the count is in how many ways.
 
 This module is the search and the storage format, and imports only python-chess and numpy, so the labelling
 program's worker processes stay small. reach_labeler.py is the program that fills a database with it.
@@ -132,56 +154,158 @@ def reach_counts(fen: str, depth: int) -> np.ndarray:
     return out
 
 
+def threat_counts(fen: str, plies: int) -> np.ndarray:
+    """
+    [plies + 1, 64, 64] uint64: the legal threats described at the top of this file, after sequences of 0 to
+    `plies` plies. Layer k holds what every piece of both sides could legally move to after k plies.
+
+    The search is reach_counts' (arrangements a ply at a time, each with the number of sequences that lead to
+    it, move orders that meet searched once with their numbers added), except that the last ply's positions
+    are needed too: threats are read off a position, where reach only counts the moves into it. At each
+    position the side to move's legal moves are listed, then the other side's with the turn handed to it (and
+    the en passant square, which is not that side's to use, set aside).
+    """
+    if plies < 0:
+        raise ValueError("plies must be at least 0")
+    board = chess.Board(fen, chess960=True)
+    squares = [sq for sq in chess.SQUARES if board.piece_type_at(sq) is not None]      # the pieces, by their square now
+    n = len(squares)
+    is_white = [board.color_at(sq) for sq in squares]
+    who = [-1] * 64                             # square -> piece number
+    for i, sq in enumerate(squares):
+        who[sq] = i
+    totals = [[0] * (n * 64) for _ in range(plies + 1)]     # [ply][piece * 64 + square], plain ints (no overflow)
+    layer: List[Tuple[chess.Board, List[int], int]] = [(board, who, 1)]
+    for k in range(plies + 1):
+        total = totals[k]
+        last = k == plies
+        merge = k >= 2 and not last             # the positions after the next ply: move orders meet from the third on
+        merged: Dict[tuple, list] = {}
+        children: List[Tuple[chess.Board, List[int], int]] = []
+        for b, who, m in layer:                 # m: how many sequences lead to this arrangement
+            turn, ep, pawns = b.turn, b.ep_square, b.pawns
+            moves = list(b.generate_legal_moves())
+            # A set, so that a threat with two moves behind it counts once: the four promotions of a pawn move,
+            # or a rook that can reach its castling square by an ordinary move as well
+            threats = set()
+            for mover in (turn, not turn):
+                if mover == turn:
+                    side_moves = moves
+                else:
+                    b.turn, b.ep_square = mover, None           # as if it were the other side's turn
+                    side_moves = b.generate_legal_moves()
+                for move in side_moves:
+                    f, t = move.from_square, move.to_square
+                    i, j = who[f], who[t]
+                    if j >= 0 and is_white[j] == mover:
+                        # Castling: python-chess writes it as the king taking its own rook (Chess960 style)
+                        rank = f & 56
+                        king_to, rook_to = (rank | 2, rank | 3) if t < f else (rank | 6, rank | 5)
+                        if king_to != f:
+                            threats.add(i * 64 + king_to)
+                        if rook_to != t:
+                            threats.add(j * 64 + rook_to)
+                    else:
+                        threats.add(i * 64 + t)                 # (with the turn handed over, t can be the king's square)
+            b.turn, b.ep_square = turn, ep
+            for code in threats:
+                total[code] += m
+            if last:
+                continue
+            for move in moves:
+                f, t = move.from_square, move.to_square
+                w = who[:]
+                i, j = w[f], w[t]
+                if j >= 0 and is_white[j] == turn:
+                    rank = f & 56
+                    king_to, rook_to = (rank | 2, rank | 3) if t < f else (rank | 6, rank | 5)
+                    w[f] = w[t] = -1
+                    w[king_to], w[rook_to] = i, j
+                else:
+                    if j < 0 and t == ep and (pawns >> f) & 1:
+                        w[t - 8 if turn else t + 8] = -1        # en passant: the pawn stands beside, not on t
+                    w[f] = -1
+                    w[t] = i
+                child = b.copy(stack=False)
+                child.push(move)
+                if merge:
+                    key = (tuple(w), child.knights, child.bishops, child.rooks, child.queens,
+                           child.castling_rights, child.ep_square)
+                    known = merged.get(key)
+                    if known is None:
+                        merged[key] = [child, w, m]
+                    else:
+                        known[2] += m
+                else:
+                    children.append((child, w, m))
+        layer = [tuple(state) for state in merged.values()] if merge else children
+    out = np.zeros((plies + 1, 64, 64), dtype=np.uint64)
+    if n:
+        out[:, squares, :] = np.array(totals, dtype=np.uint64).reshape(plies + 1, n, 64)
+    return out
+
+
 # ##### ##### ##### ##### #####
 #       Storage
 
-_HEADER = struct.Struct("<BBBQI")       # version, depth, bytes per count, occupied squares, how many counts are not 0
-_VERSION = 1
+_HEADER = struct.Struct("<BBBQI")       # kind, layers, bytes per count, squares with a row, how many counts are not 0
+_REACH, _THREATS = 1, 2                 # the kind says which array a blob holds
+_COLUMNS = {_REACH: 65, _THREATS: 64}
 
 
 def pack_counts(counts: np.ndarray) -> bytes:
     """
-    reach_counts' array as a compact blob: only the counts above 0 are kept (their places as gaps from the one
-    before, then the counts themselves in 4 or 8 bytes), deflated. Exact; unpack_counts gives the array back.
+    reach_counts' [depth, 64, 65] array or threat_counts' [plies + 1, 64, 64] one as a compact blob: only the
+    counts above 0 are kept (their places as gaps from the one before, then the counts themselves in 4 or 8
+    bytes), deflated. Exact; unpack_counts gives the array back, and the blob says which of the two it is.
     """
-    depth = counts.shape[0]
-    if counts.shape != (depth, 64, 65) or not 1 <= depth <= 255:
-        raise ValueError("counts must be [depth, 64, 65] with depth 1 to 255")
+    layers = counts.shape[0] if counts.ndim == 3 else 0
+    kind = {65: _REACH, 64: _THREATS}.get(counts.shape[2]) if counts.ndim == 3 else None
+    if kind is None or counts.shape[1] != 64 or not 1 <= layers <= 255:
+        raise ValueError("counts must be [depth, 64, 65] (reach) or [plies + 1, 64, 64] (threats), 1 to 255 layers")
     counts = counts.astype(np.uint64, copy=False)
-    occupied = counts.any(axis=(0, 2))                                  # every piece's row has counts at depth 1
-    rows = counts[:, occupied, :].reshape(-1)
+    rowed = counts.any(axis=(0, 2))                                     # the squares whose row holds anything
+    rows = counts[:, rowed, :].reshape(-1)
     places = np.flatnonzero(rows)
     values = rows[places]
     width = 4 if values.size == 0 or int(values.max()) < 2 ** 32 else 8
     gaps = np.diff(places, prepend=0).astype("<u4")
-    mask = sum(1 << int(sq) for sq in np.flatnonzero(occupied))
+    mask = sum(1 << int(sq) for sq in np.flatnonzero(rowed))
     body = gaps.tobytes() + values.astype("<u4" if width == 4 else "<u8").tobytes()
-    return _HEADER.pack(_VERSION, depth, width, mask, places.size) + zlib.compress(body, 6)
+    return _HEADER.pack(kind, layers, width, mask, places.size) + zlib.compress(body, 6)
 
 
 def unpack_counts(blob: bytes) -> np.ndarray:
-    """A pack_counts blob -> [depth, 64, 65] uint64."""
-    version, depth, width, mask, size = _HEADER.unpack_from(blob)
-    if version != _VERSION:
-        raise ValueError(f"unknown reach label format {version}")
+    """A pack_counts blob -> the array it was made from: [depth, 64, 65] or [plies + 1, 64, 64], uint64."""
+    kind, layers, width, mask, size = _HEADER.unpack_from(blob)
+    if kind not in _COLUMNS:
+        raise ValueError(f"unknown label format {kind}")
+    columns = _COLUMNS[kind]
     body = zlib.decompress(blob[_HEADER.size:])
     places = np.cumsum(np.frombuffer(body, dtype="<u4", count=size).astype(np.int64))
     values = np.frombuffer(body, dtype="<u4" if width == 4 else "<u8", count=size, offset=4 * size)
     squares = [sq for sq in range(64) if mask >> sq & 1]
-    rows = np.zeros(depth * len(squares) * 65, dtype=np.uint64)
+    rows = np.zeros(layers * len(squares) * columns, dtype=np.uint64)
     rows[places] = values
-    out = np.zeros((depth, 64, 65), dtype=np.uint64)
+    out = np.zeros((layers, 64, columns), dtype=np.uint64)
     if squares:
-        out[:, squares, :] = rows.reshape(depth, len(squares), 65)
+        out[:, squares, :] = rows.reshape(layers, len(squares), columns)
     return out
 
 
 def packed_depth(blob: bytes) -> int:
-    """How many plies a pack_counts blob covers, without unpacking it."""
-    return _HEADER.unpack_from(blob)[1]
+    """How many plies of play a pack_counts blob covers, without unpacking it (threats have a layer for 0 plies)."""
+    kind, layers = _HEADER.unpack_from(blob)[:2]
+    return layers - 1 if kind == _THREATS else layers
 
 
 def label_positions(job: Tuple[Sequence[str], int]) -> List[Tuple[str, int, bytes]]:
-    """What a worker does: (FENs, depth) -> for each FEN, (its position key, depth, its packed counts)."""
+    """What a worker does for reach labels: (FENs, depth) -> for each FEN, (its position key, depth, its packed counts)."""
     fens, depth = job
     return [(position_key(fen), depth, pack_counts(reach_counts(fen, depth))) for fen in fens]
+
+
+def label_threats(job: Tuple[Sequence[str], int]) -> List[Tuple[str, int, bytes]]:
+    """What a worker does for threat labels: (FENs, plies) -> for each FEN, (its position key, plies, its packed counts)."""
+    fens, plies = job
+    return [(position_key(fen), plies, pack_counts(threat_counts(fen, plies))) for fen in fens]

@@ -1,13 +1,23 @@
 """
-Fills a database with reach labels (piece_reach.py): for training positions, where every piece can be after
-1, 2, ... plies of legal play and in how many ways.
+Fills a database with labels from piece_reach.py for training positions. Two kinds, one per start:
+
+    threats   what every piece of both sides could legally move to after 0, 1, ... plies of legal play, and
+              after how many of the sequences ("legal threats"; piece_reach.threat_counts)
+    reach     where every piece can stand after 1, 2, ... plies of legal play, and in how many ways
+              (piece_reach.reach_counts)
 
 Run it like position_labeler.py: set the options below (or give them on the command line), start it, and press
 q in its window to stop. It finishes the positions it has in hand, and the next start carries on from there.
 
     python reach_labeler.py                         label with the options below
-    python reach_labeler.py --depth 4 --workers 16  the same, deeper and on fewer cores
+    python reach_labeler.py --label reach --depth 4 --workers 16
+                                                    the other kind, at another depth, on fewer cores
     python reach_labeler.py --check                 what the database holds so far
+
+Two words used throughout. A SAMPLE is one training position as a run meets it, together with the positions
+after the first moves of its rollout. A POSITION is any one of those boards: each gets its own search and
+its own label. With ROLLOUT_PLIES = 2 a sample is three positions, so "samples done" is about a third of
+"positions searched".
 
 Which positions. Labels are only useful for positions a training run will see, so the labeler walks the
 training split in the order a run with seed ORDER_SEED meets it (the trainer's own shuffle), and with
@@ -15,26 +25,33 @@ ROLLOUT_PLIES > 0 also labels the positions after the first moves of each sample
 "predicted next z" losses are graded on. Those moves are the trainer's own random draws for that seed and
 epoch, so they match what the run will play (as long as it uses the default masks: a sample's mask is drawn
 before its moves). Labels are stored under the position itself, so another seed or split reuses whatever
-positions it shares.
+positions it shares. The two kinds of label walk the same samples in the same order, each from its own start.
 
 Depth. A search to DEPTH plies gives the counts for every depth up to it, so a deeper label replaces a
 shallower one. Each depth keeps its own place in the walk: after a while at depth 3, a day at depth 4 starts
-again from the first position and deepens the labels in training order, and going back to depth 3 carries on
-adding new positions where depth 3 left off (skipping any that already have depth 3 or more).
+again from the first sample and deepens the labels in training order, and going back to depth 3 carries on
+adding new samples where depth 3 left off (skipping positions that already have depth 3 or more). For
+threats, DEPTH plies means layers for 0, 1, ..., DEPTH plies of play.
 
-Cost, measured on this machine (python-chess): one core searches a position in about 0.03 s at 3 plies and
-0.8 s at 4; 24 workers label about 400 positions a second at 3 plies and about 14 at 4 (a sample with two
-rollout positions is three positions). Each further ply costs roughly 25 times more, so 5 plies needs a
-compiled search before it is practical. A label takes about 0.9 kB at 3 plies and 1.8 kB at 4. Workers use up to
-about 160 MB each at 4 plies; the main process holds the training order (about 3 GB for the full training split).
+Cost, measured on this machine (python-chess), per position on one core and with 24 workers:
 
-The table (in its own database file by default, so the 15 GB positions database is never written to and
+    threats, 2 plies   0.07 s    about 200 a second   label about 0.9 kB
+    threats, 3 plies   1.6 s     (not run)            label about 2 kB
+    reach, 3 plies     0.03 s    about 400 a second   label about 0.9 kB
+    reach, 4 plies     0.8 s     about 14 a second    label about 1.8 kB
+
+Each further ply costs roughly 25 times more, so the next depth of either kind needs a compiled search before
+it is practical. Workers use up to about 160 MB each; the main process holds the training order (about 3 GB
+for the full training split).
+
+The tables (in their own database file by default, so the 15 GB positions database is never written to and
 position_labeler.py can run at the same time):
 
-    reach_counts     position  the position: a FEN without its move counters
-                     depth     plies searched
-                     counts    piece_reach.pack_counts of the [depth, 64, 65] array
-    reach_progress   walk, done: how many positions of each walk are finished
+    threat_counts    position  the position: a FEN without its move counters
+                     depth     plies of play searched
+                     counts    piece_reach.pack_counts of the [depth + 1, 64, 64] array
+    reach_counts     position, depth, counts: the same, for the [depth, 64, 65] array
+    reach_progress   walk, done: how many samples of each walk (kind, depth, seed, ...) are finished
 """
 from __future__ import annotations
 
@@ -44,6 +61,7 @@ import concurrent.futures
 import logging
 import os
 import pathlib
+import random
 import signal
 import sqlite3
 import sys
@@ -56,7 +74,8 @@ import piece_reach as pr
 # ---------- ---------- ----------
 #   Options (the command line overrides them)
 
-DEPTH: int = 3                          # plies searched per position
+LABEL: str = "threats"                  # which labels to make: "threats" or "reach" (see the top of this file)
+DEPTH: Dict[str, int] = {"threats": 2, "reach": 3}      # plies of play searched per position, for each kind
 WORKERS: int = 24                       # worker processes; this machine has 32 logical cores, so 24 leaves 8 free
 LOW_PRIORITY: bool = True               # workers run below normal priority: whatever else you do comes first
 DB_PATH: str = "minotaur_reach.db"      # the labels database (created if missing)
@@ -65,11 +84,15 @@ SPLIT: str = "train"
 ORDER_SEED: int = 0                     # walk the positions in the order a training run with this seed meets them
 ORDER_EPOCH: int = 0                    # ... in this epoch (a run's first epoch is 0)
 ROLLOUT_PLIES: int = 2                  # also label the positions after this many moves of each sample's rollout
-CHUNK: int = 8                          # cache positions handed to a worker at a time
+CHUNK: int = 8                          # samples handed to a worker at a time
 REPORT_SECONDS: float = 30.0            # a progress line this often
 LOG_FILE: str = "reach_labeler_log.log"
 
 Log = Callable[[str], None]
+
+TABLE = {"threats": "threat_counts", "reach": "reach_counts"}
+SEARCH = {"threats": pr.label_threats, "reach": pr.label_positions}     # what a worker runs
+LEAST_DEPTH = {"threats": 0, "reach": 1}
 
 
 # ---------- ---------- ----------
@@ -81,13 +104,14 @@ def open_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode = WAL")       # readers (a training run) never wait for the writer
     conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS reach_counts (
-        position TEXT PRIMARY KEY,
-        depth INTEGER NOT NULL,
-        counts BLOB NOT NULL
-        )
-    """)
+    for table in TABLE.values():
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+            position TEXT PRIMARY KEY,
+            depth INTEGER NOT NULL,
+            counts BLOB NOT NULL
+            )
+        """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS reach_progress (
         walk TEXT PRIMARY KEY,
@@ -98,22 +122,23 @@ def open_db(path: str) -> sqlite3.Connection:
     return conn
 
 
-def write_labels(conn: sqlite3.Connection, rows: Sequence[Tuple[str, int, bytes]]) -> None:
-    """Add labels, replacing a position's label only by a deeper one. Does not commit."""
-    conn.executemany("""
-        INSERT INTO reach_counts (position, depth, counts) VALUES (?, ?, ?)
+def write_labels(conn: sqlite3.Connection, rows: Sequence[Tuple[str, int, bytes]], kind: str = "reach") -> None:
+    """Add labels of this kind, replacing a position's label only by a deeper one. Does not commit."""
+    table = TABLE[kind]
+    conn.executemany(f"""
+        INSERT INTO {table} (position, depth, counts) VALUES (?, ?, ?)
         ON CONFLICT(position) DO UPDATE SET depth = excluded.depth, counts = excluded.counts
-        WHERE excluded.depth > reach_counts.depth
+        WHERE excluded.depth > {table}.depth
     """, rows)
 
 
-def labelled_depths(conn: sqlite3.Connection, positions: Sequence[str]) -> Dict[str, int]:
-    """The depth each of these positions is labelled to (those without a label are left out)."""
+def labelled_depths(conn: sqlite3.Connection, positions: Sequence[str], kind: str = "reach") -> Dict[str, int]:
+    """The depth each of these positions is labelled to, for this kind (those without a label are left out)."""
     found: Dict[str, int] = {}
     for lo in range(0, len(positions), 500):
         part = list(positions[lo:lo + 500])
         marks = ",".join("?" * len(part))
-        found.update(conn.execute(f"SELECT position, depth FROM reach_counts WHERE position IN ({marks})", part))
+        found.update(conn.execute(f"SELECT position, depth FROM {TABLE[kind]} WHERE position IN ({marks})", part))
     return found
 
 
@@ -123,9 +148,12 @@ class ReachLabels:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(pathlib.Path(path).resolve().as_uri() + "?mode=ro", uri=True)
 
-    def get(self, fen: str):
-        """The position's [depth, 64, 65] counts (piece_reach.reach_counts), or None when it has no label."""
-        row = self.conn.execute("SELECT counts FROM reach_counts WHERE position = ?", (pr.position_key(fen),)).fetchone()
+    def get(self, fen: str, kind: str = "reach"):
+        """
+        The position's counts, or None when it has no label of this kind: [depth, 64, 65] for "reach"
+        (piece_reach.reach_counts), [depth + 1, 64, 64] for "threats" (piece_reach.threat_counts).
+        """
+        row = self.conn.execute(f"SELECT counts FROM {TABLE[kind]} WHERE position = ?", (pr.position_key(fen),)).fetchone()
         return None if row is None else pr.unpack_counts(row[0])
 
     def close(self) -> None:
@@ -139,17 +167,27 @@ def check_db(path: str, log: Log = print) -> None:
         return
     conn = open_db(path)
     log(f"{path}: {os.path.getsize(path) / 2 ** 20:,.1f} MB")
-    for depth, rows, size in conn.execute("SELECT depth, COUNT(*), SUM(LENGTH(counts)) FROM reach_counts GROUP BY depth ORDER BY depth"):
-        log(f"  {rows:,} positions labelled to {depth} plies ({size / max(rows, 1):,.0f} bytes each)")
+    for kind, table in TABLE.items():
+        for depth, rows, size in conn.execute(f"SELECT depth, COUNT(*), SUM(LENGTH(counts)) FROM {table} GROUP BY depth ORDER BY depth"):
+            log(f"  {kind}: {rows:,} positions labelled to {depth} plies ({size / max(rows, 1):,.0f} bytes each)")
     for walk, done in conn.execute("SELECT walk, done FROM reach_progress ORDER BY walk"):
-        log(f"  walk {walk}: {done:,} positions done")
-    row = conn.execute("SELECT position, depth, counts FROM reach_counts ORDER BY RANDOM() LIMIT 1").fetchone()
-    if row is not None:
+        log(f"  walk {walk}: {done:,} samples done")
+    for kind, table in TABLE.items():
+        top = conn.execute(f"SELECT MAX(rowid) FROM {table}").fetchone()[0]
+        if top is None:
+            continue
+        row = conn.execute(f"SELECT position, depth, counts FROM {table} WHERE rowid >= ? LIMIT 1",
+                           (random.randint(1, top),)).fetchone()
         counts = pr.unpack_counts(row[2])
-        log(f"  for example {row[0]}")
-        for d in range(row[1]):
-            log(f"    {int(counts[d].sum(1).max()):,} sequences of {d + 1} plies; (piece, square) pairs with a way: "
-                f"{int((counts[d][:, :64] > 0).sum()):,}; pieces that can be captured: {int((counts[d][:, 64] > 0).sum())}")
+        log(f"  {kind}, for example {row[0]}")
+        if kind == "reach":
+            for d in range(row[1]):
+                log(f"    {int(counts[d].sum(1).max()):,} sequences of {d + 1} {'ply' if d == 0 else 'plies'}; (piece, square) pairs with a way: "
+                    f"{int((counts[d][:, :64] > 0).sum()):,}; pieces that can be captured: {int((counts[d][:, 64] > 0).sum())}")
+        else:
+            for k in range(row[1] + 1):
+                log(f"    after {k} {'ply' if k == 1 else 'plies'}: (piece, square) pairs with a legal threat: {int((counts[k] > 0).sum()):,}; "
+                    f"the most sequences behind one of them: {int(counts[k].max()):,}")
     conn.close()
 
 
@@ -157,8 +195,9 @@ def check_db(path: str, log: Log = print) -> None:
 #   Which positions
 
 
-def walk_name(split: str, seed: int, epoch: int, rollout_plies: int, depth: int) -> str:
-    return f"{split} seed {seed} epoch {epoch} rollout {rollout_plies} depth {depth}"
+def walk_name(split: str, seed: int, epoch: int, rollout_plies: int, depth: int, kind: str = "reach") -> str:
+    """What a walk's place is kept under. (Reach walks say "depth": the name they had before threats existed.)"""
+    return f"{split} seed {seed} epoch {epoch} rollout {rollout_plies} {'depth' if kind == 'reach' else kind} {depth}"
 
 
 def rollout_fens(fen: str, rng, plies: int, mask_config=None) -> List[str]:
@@ -183,8 +222,8 @@ def rollout_fens(fen: str, rng, plies: int, mask_config=None) -> List[str]:
 def walk_positions(cache_dir: str, split: str, seed: int, epoch: int, rollout_plies: int,
                    start: int = 0) -> Iterator[List[str]]:
     """
-    For each position of the split, in the order a training run with this seed and epoch meets them and
-    starting `start` positions in: the FENs to label (the position, then its rollout positions).
+    For each sample of the split, in the order a training run with this seed and epoch meets them and
+    starting `start` samples in: the FENs to label (the position, then its rollout positions).
     """
     import labyrinth_data as ld
     dataset = ld.PositionDataset(cache_dir, split, seed=seed)
@@ -254,26 +293,29 @@ def watch_for_q(stop: threading.Event) -> None:
 #   The labeling loop
 
 
-def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT, depth: int = DEPTH,
+def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT, depth: Optional[int] = None,
           workers: int = WORKERS, order_seed: int = ORDER_SEED, order_epoch: int = ORDER_EPOCH,
           rollout_plies: int = ROLLOUT_PLIES, chunk: int = CHUNK, max_positions: Optional[int] = None,
           stop: Optional[threading.Event] = None, low_priority: bool = LOW_PRIORITY,
-          report_seconds: float = REPORT_SECONDS, log: Log = print) -> Dict[str, int]:
+          report_seconds: float = REPORT_SECONDS, log: Log = print, kind: str = LABEL) -> Dict[str, int]:
     """
-    Label positions until `stop` is set, the file <db_path>.stop appears, max_positions cache positions have been
-    handled in this call, or the split runs out. Returns {"done": positions of the walk finished in all,
-    "handled": cache positions handled in this call, "searched": positions searched, "skipped": positions that
-    already had a label this deep}.
+    Make labels of this kind ("threats" or "reach") until `stop` is set, the file <db_path>.stop appears,
+    max_positions samples have been handled in this call, or the split runs out. depth: None for the kind's
+    DEPTH. Returns {"done": samples of the walk finished in all, "handled": samples handled in this call,
+    "searched": positions searched, "skipped": positions that already had a label this deep}.
     """
-    if depth < 1 or workers < 0 or chunk < 1 or rollout_plies < 0:
-        raise ValueError("need depth >= 1, workers >= 0, chunk >= 1 and rollout_plies >= 0")
+    if kind not in TABLE:
+        raise ValueError(f"kind must be one of {sorted(TABLE)}")
+    depth = DEPTH[kind] if depth is None else int(depth)
+    if depth < LEAST_DEPTH[kind] or workers < 0 or chunk < 1 or rollout_plies < 0:
+        raise ValueError(f"need depth >= {LEAST_DEPTH[kind]}, workers >= 0, chunk >= 1 and rollout_plies >= 0")
     stop = stop if stop is not None else threading.Event()
     stop_file = db_path + ".stop"
     conn = open_db(db_path)
-    walk = walk_name(split, order_seed, order_epoch, rollout_plies, depth)
+    walk = walk_name(split, order_seed, order_epoch, rollout_plies, depth, kind)
     row = conn.execute("SELECT done FROM reach_progress WHERE walk = ?", (walk,)).fetchone()
     done = int(row[0]) if row else 0
-    log(f"walk '{walk}': {done:,} positions done before this start; {workers} workers")
+    log(f"walk '{walk}': {done:,} samples done before this start; {workers} workers")
     positions = walk_positions(cache_dir, split, order_seed, order_epoch, rollout_plies, start=done)
     if workers:
         pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_start_worker,
@@ -283,10 +325,10 @@ def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT
 
     handled = searched = skipped = taken = 0
     exhausted = False
-    in_hand: Deque[Tuple[int, int, concurrent.futures.Future]] = collections.deque()   # cache positions, skipped, job
+    in_hand: Deque[Tuple[int, int, concurrent.futures.Future]] = collections.deque()   # samples, skipped, job
 
     def hand_out() -> None:
-        """One more job for the pool: the next `chunk` cache positions, less whatever is labelled already."""
+        """One more job for the pool: the positions of the next `chunk` samples, less whatever is labelled already."""
         nonlocal taken, exhausted
         fens: List[str] = []
         count = 0
@@ -301,13 +343,13 @@ def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT
         if not count:
             return
         keys = {pr.position_key(fen): fen for fen in fens}                  # one search per position
-        have = labelled_depths(conn, list(keys))
-        todo = [fen for key, fen in keys.items() if have.get(key, 0) < depth]
-        in_hand.append((count, len(fens) - len(todo), pool.submit(pr.label_positions, (todo, depth))))
+        have = labelled_depths(conn, list(keys), kind)
+        todo = [fen for key, fen in keys.items() if have.get(key, -1) < depth]
+        in_hand.append((count, len(fens) - len(todo), pool.submit(SEARCH[kind], (todo, depth))))
 
     def finish(count: int, already: int, rows: List[Tuple[str, int, bytes]], advance: bool) -> None:
         nonlocal done, handled, searched, skipped
-        write_labels(conn, rows)
+        write_labels(conn, rows, kind)
         searched += len(rows)
         skipped += already
         if advance:
@@ -335,7 +377,7 @@ def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT
             now = time.time()
             if now - last_report >= report_seconds:
                 last_report = now
-                log(f"{done:,} positions of the walk done; this start: {searched:,} searched "
+                log(f"{done:,} samples done; this start: {searched:,} positions searched "
                     f"({searched / max(now - started, 1e-9):,.1f} a second), {skipped:,} already labelled")
             if os.path.exists(stop_file):
                 os.remove(stop_file)
@@ -354,7 +396,7 @@ def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT
         pool.shutdown(wait=True, cancel_futures=True)
         conn.commit()
         conn.close()
-    log(f"walk '{walk}': {done:,} positions done; this start searched {searched:,} positions in "
+    log(f"walk '{walk}': {done:,} samples done; this start searched {searched:,} positions in "
         f"{time.time() - started:,.0f} s, {skipped:,} were already labelled")
     return {"done": done, "handled": handled, "searched": searched, "skipped": skipped}
 
@@ -363,8 +405,9 @@ def label(db_path: str = DB_PATH, cache_dir: str = CACHE_DIR, split: str = SPLIT
 #   Program body
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fill a database with reach labels (see the top of this file).")
-    parser.add_argument("--depth", type=int, default=DEPTH, help="plies searched per position")
+    parser = argparse.ArgumentParser(description="Fill a database with threat or reach labels (see the top of this file).")
+    parser.add_argument("--label", choices=sorted(TABLE), default=LABEL, help="which labels to make")
+    parser.add_argument("--depth", type=int, default=None, help="plies of play searched per position (default: DEPTH for the kind)")
     parser.add_argument("--workers", type=int, default=WORKERS, help="worker processes (0: none, search in this process)")
     parser.add_argument("--db", default=DB_PATH, help="the labels database")
     parser.add_argument("--cache", default=CACHE_DIR, help="the position cache the trainer reads")
@@ -372,8 +415,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=ORDER_SEED, help="walk in the order a training run with this seed meets the positions")
     parser.add_argument("--epoch", type=int, default=ORDER_EPOCH)
     parser.add_argument("--rollout-plies", type=int, default=ROLLOUT_PLIES, help="also label this many rollout positions per sample")
-    parser.add_argument("--chunk", type=int, default=CHUNK, help="cache positions handed to a worker at a time")
-    parser.add_argument("--positions", type=int, default=None, help="stop after this many cache positions (default: run until stopped)")
+    parser.add_argument("--chunk", type=int, default=CHUNK, help="samples handed to a worker at a time")
+    parser.add_argument("--positions", type=int, default=None, help="stop after this many samples (default: run until stopped)")
     parser.add_argument("--normal-priority", action="store_true", help="do not lower the workers' priority")
     parser.add_argument("--check", action="store_true", help="print what the database holds and exit")
     args = parser.parse_args()
@@ -390,9 +433,12 @@ if __name__ == "__main__":
 
     stop_event = threading.Event()
     watch_for_q(stop_event)
-    say(f"Labelling to {args.depth} plies with {args.workers} workers into {args.db}. "
+    depth = DEPTH[args.label] if args.depth is None else args.depth
+    what = f"legal threats after 0 to {depth} plies" if args.label == "threats" else f"reach to {depth} plies"
+    say(f"Labelling {what} with {args.workers} workers into {args.db}. "
         f"Press q in this window to stop (or create the file {args.db}.stop).")
-    label(db_path=args.db, cache_dir=args.cache, split=args.split, depth=args.depth, workers=args.workers,
+    label(db_path=args.db, cache_dir=args.cache, split=args.split, depth=depth, workers=args.workers,
           order_seed=args.seed, order_epoch=args.epoch, rollout_plies=args.rollout_plies, chunk=args.chunk,
-          max_positions=args.positions, stop=stop_event, low_priority=not args.normal_priority, log=say)
+          max_positions=args.positions, stop=stop_event, low_priority=not args.normal_priority, log=say,
+          kind=args.label)
     check_db(args.db, say)

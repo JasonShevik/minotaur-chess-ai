@@ -1,5 +1,6 @@
 """
-Tests for the reach labels: piece_reach.py (the search and the storage format) and reach_labeler.py (the program).
+Tests for the reach and legal-threat labels: piece_reach.py (the searches and the storage format) and
+reach_labeler.py (the program).
 
 Run with plain Python (no pytest needed):
 
@@ -9,9 +10,12 @@ They check:
   * the counts against every move sequence played out one by one with python-chess (castling in both directions,
     Chess960 castling, en passant, promotions, captures, positions where the game can end early);
   * that every move order is counted, and each piece's counts add up to the number of sequences;
+  * the legal threats against the same play-out, asking python-chess at every position what each side could
+    play, and against cases worked out by hand (a pin, a check, a line opened by a pawn, castling, en passant);
   * that the storage format gives the counts back exactly, large ones included;
   * that the labeler walks the positions a training run will see, in its order, with its rollout moves;
-  * that it stores what the search gives, resumes where it stopped, deepens labels, and runs with workers.
+  * that it stores what the search gives, resumes where it stopped, deepens labels, and runs with workers;
+  * that the two kinds of label keep their own tables and their own places in the walk.
 """
 import os
 import random
@@ -74,6 +78,57 @@ def played_out(fen: str, depth: int) -> np.ndarray:
                 after[move.to_square] = after.pop(move.from_square)
             board.push(move)
             walk(after, d + 1)
+            board.pop()
+
+    walk({sq: sq for sq in homes}, 0)
+    return out
+
+
+def threats_played_out(fen: str, plies: int) -> np.ndarray:
+    """The legal threats by playing every sequence one by one and asking python-chess, at each position, for
+    the legal moves of the side to move and then of the other side with the turn handed over."""
+    board = chess.Board(fen, chess960=True)
+    out = np.zeros((plies + 1, 64, 64), dtype=np.uint64)
+    homes = [sq for sq in chess.SQUARES if board.piece_at(sq) is not None]
+
+    def could_move_to(b: chess.Board, at: dict) -> set:     # {(the piece's square at the start, a square it could move to)}
+        pairs = set()
+        for move in b.legal_moves:
+            if b.is_castling(move):
+                rank = chess.square_rank(move.from_square)
+                kingside = b.is_kingside_castling(move)
+                king_to, rook_to = chess.square(6 if kingside else 2, rank), chess.square(5 if kingside else 3, rank)
+                if king_to != move.from_square:
+                    pairs.add((at[move.from_square], king_to))
+                if rook_to != move.to_square:
+                    pairs.add((at[move.to_square], rook_to))
+            else:
+                pairs.add((at[move.from_square], move.to_square))
+        return pairs
+
+    def walk(at: dict, k: int) -> None:                 # at: square now -> square at the start
+        other = board.copy(stack=False)
+        other.turn = not board.turn
+        other.ep_square = None
+        for home, square in could_move_to(board, at) | could_move_to(other, at):
+            out[k, home, square] += 1
+        if k == plies:
+            return
+        for move in list(board.legal_moves):
+            after = dict(at)
+            if board.is_castling(move):
+                rank = chess.square_rank(move.from_square)
+                kingside = board.is_kingside_castling(move)
+                king, rook = after.pop(move.from_square), after.pop(move.to_square)
+                after[chess.square(6 if kingside else 2, rank)] = king
+                after[chess.square(5 if kingside else 3, rank)] = rook
+            else:
+                if board.is_en_passant(move):
+                    del after[chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))]
+                after.pop(move.to_square, None)
+                after[move.to_square] = after.pop(move.from_square)
+            board.push(move)
+            walk(after, k + 1)
             board.pop()
 
     walk({sq: sq for sq in homes}, 0)
@@ -172,6 +227,84 @@ def test_every_move_order_counts_and_rows_add_up_to_the_number_of_sequences():
         pass
 
 
+def test_threats_match_every_sequence_played_out():
+    for fen in FENS:
+        got, expected = pr.threat_counts(fen, 2), threats_played_out(fen, 2)
+        assert got.dtype == np.uint64 and got.shape == (3, 64, 64)
+        assert np.array_equal(got, expected), fen
+        assert np.array_equal(pr.threat_counts(fen, 1), expected[:2]), "a shallower search is the deeper one's start"
+        assert np.array_equal(pr.threat_counts(fen, 0), expected[:1])
+    for fen in SMALL:                                   # deep enough for move orders to meet (from the third ply)
+        assert np.array_equal(pr.threat_counts(fen, 3), threats_played_out(fen, 3)), fen
+    for fen in SMALL[:3]:
+        assert np.array_equal(pr.threat_counts(fen, 4), threats_played_out(fen, 4)), fen
+    assert np.array_equal(pr.threat_counts(FENS[3], 3), threats_played_out(FENS[3], 3))
+    # the side to move's threats in the position itself are its legal moves; every count is at most the
+    # number of sequences
+    for fen in FENS:
+        board, counts = chess.Board(fen, chess960=True), pr.threat_counts(fen, 2)
+        mine = [sq for sq in chess.SQUARES if board.color_at(sq) == board.turn]
+        plain = {(m.from_square, m.to_square) for m in board.legal_moves if not board.is_castling(m)}
+        assert plain <= {(p, s) for p in mine for s in range(64) if counts[0, p, s]}
+        assert counts[0].max() <= 1
+        for k in (1, 2):
+            assert counts[k].max() <= perft(board, k), (fen, k)
+
+
+def test_threats_are_the_legal_moves_each_side_would_have():
+    # the opening position, worked out by hand
+    t = pr.threat_counts(chess.STARTING_FEN, 1)
+    assert t[0].sum() == 40, "20 moves for white, 20 for black were it black's turn"
+    assert t[0, chess.G1, chess.F3] == 1 and t[0, chess.G8, chess.F6] == 1
+    assert t[0, chess.E2, chess.E3] == 1 and t[0, chess.E2, chess.E4] == 1
+    assert t[0, chess.E2, chess.D3] == 0, "a pawn does not threaten an empty diagonal square"
+    assert not t[0, chess.F1].any(), "the bishop is shut in"
+    # after one ply: the bishop is let out by e3 or e4, and by g3 or g4
+    for square in (chess.E2, chess.D3, chess.C4, chess.B5, chess.A6, chess.G2, chess.H3):
+        assert t[1, chess.F1, square] == 2, chess.square_name(square)
+    assert t[1, chess.B8, chess.C6] == 20, "black's knight move stays legal after every white move"
+    assert t[1, chess.G1, chess.F3] == 17, "20 moves, less the knight's own two and f3 (which blocks it)"
+    assert t[1, chess.G1, chess.G1] == 2, "having moved, the knight could come back"
+    assert t[1, chess.G1, chess.E2] == 2, "after e3 or e4"
+    # a pinned piece threatens nothing; the piece pinning it threatens it, and no further
+    for turn in "wb":
+        t = pr.threat_counts(f"4k3/4r3/8/8/8/8/4B3/4K3 {turn} - - 0 1", 0)
+        assert not t[0, chess.E2].any()
+        assert t[0, chess.E7, chess.E2] == 1 and t[0, chess.E7, chess.E1] == 0
+    # a check is a threat on the king's square (the turn handed over, the rook could take the king); the king
+    # cannot stay on the rook's file
+    t = pr.threat_counts("4k3/8/8/8/8/8/4R3/4K3 b - - 0 1", 0)
+    assert t[0, chess.E2, chess.E8] == 1
+    assert t[0, chess.E8, chess.D8] == 1 and t[0, chess.E8, chess.E7] == 0
+    # a captured piece threatens nothing in the sequences where it is gone: white has 6 moves, one takes the rook
+    t = pr.threat_counts("4k3/8/8/8/8/8/r7/R3K3 w - - 0 1", 1)
+    assert t[1, chess.A2, chess.A3] == 5
+    assert t[1, chess.A1, chess.A3] == 1, "only after taking on a2 can the white rook go up the file"
+    assert t[0, chess.A1, chess.A2] == 1 and t[0, chess.A2, chess.A1] == 1
+    # en passant: the side whose turn it is may take; the other side has no such move
+    t = pr.threat_counts("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", 0)
+    assert t[0, chess.E5, chess.D6] == 1 and t[0, chess.E5, chess.E6] == 1
+    assert t[0, chess.D5, chess.D4] == 1 and t[0, chess.D5].sum() == 1
+    # castling: the king and the rook threaten the squares they would castle to; a rook that can also get
+    # there by an ordinary move is counted once
+    t = pr.threat_counts("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", 0)
+    assert t[0, chess.E1, chess.G1] == 1 and t[0, chess.E1, chess.C1] == 1
+    assert t[0, chess.H1, chess.F1] == 1 and t[0, chess.A1, chess.D1] == 1
+    assert t[0, chess.E8, chess.G8] == 1, "black too, were it black's turn"
+    # Chess960: the king already stands on its castling square, so only the rook gains a square by castling
+    t = pr.threat_counts("1rk3r1/8/8/8/8/8/8/1RK3R1 w KQkq - 0 1", 0)
+    assert t[0, chess.B1, chess.D1] == 1 and t[0, chess.C1, chess.C1] == 0
+    # promotion: the square is threatened once, not once for each piece the pawn could become
+    t = pr.threat_counts("4k3/P6P/8/8/8/8/p6p/4K3 w - - 0 1", 0)
+    assert t[0, chess.A7, chess.A8] == 1 and t[0, chess.A2, chess.A1] == 1
+    assert not pr.threat_counts("4k3/8/8/8/8/8/8/4K3 w - - 0 1", 1)[:, chess.C3].any(), "an empty square has no row"
+    try:
+        pr.threat_counts(FENS[0], -1)
+        raise AssertionError("a negative number of plies should be rejected")
+    except ValueError:
+        pass
+
+
 def test_storage_gives_the_counts_back():
     for fen in FENS + ["7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"]:
         counts = pr.reach_counts(fen, 3)
@@ -185,7 +318,18 @@ def test_storage_gives_the_counts_back():
     assert [r[0] for r in rows] == [pr.position_key(FENS[0]), pr.position_key(FENS[1])] and rows[0][1] == 2
     assert np.array_equal(pr.unpack_counts(rows[1][2]), pr.reach_counts(FENS[1], 2))
     assert pr.position_key(FENS[0]) == ld.position_key(FENS[0])
-    for bad in (np.zeros((2, 64, 64)), np.zeros((64, 65))):
+    # threats: the same format, and the blob says which kind it holds
+    for fen in FENS + ["7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", "k7/8/8/8/8/8/8/K7 w - - 0 1"]:
+        counts = pr.threat_counts(fen, 2)
+        blob = pr.pack_counts(counts)
+        back = pr.unpack_counts(blob)
+        assert back.shape == (3, 64, 64) and np.array_equal(back, counts) and pr.packed_depth(blob) == 2
+        assert len(blob) < 4000
+    assert pr.unpack_counts(pr.pack_counts(pr.threat_counts(FENS[0], 0))).shape == (1, 64, 64)
+    rows = pr.label_threats(([FENS[0], FENS[1]], 1))
+    assert [r[0] for r in rows] == [pr.position_key(FENS[0]), pr.position_key(FENS[1])] and rows[0][1] == 1
+    assert np.array_equal(pr.unpack_counts(rows[1][2]), pr.threat_counts(FENS[1], 1))
+    for bad in (np.zeros((2, 64, 63)), np.zeros((2, 63, 64)), np.zeros((64, 65))):
         try:
             pr.pack_counts(bad)
             raise AssertionError("a wrong shape should be rejected")
@@ -221,7 +365,7 @@ def test_labeler_stores_resumes_and_deepens():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cache, db = make_cache(tmp), os.path.join(tmp, "reach.db")
         walked = list(rl.walk_positions(cache, "train", 0, 0, rollout_plies=2))
-        common = dict(db_path=db, cache_dir=cache, order_seed=0, rollout_plies=2, chunk=3, log=quiet)
+        common = dict(db_path=db, cache_dir=cache, order_seed=0, rollout_plies=2, chunk=3, log=quiet, kind="reach")
 
         first = rl.label(depth=2, workers=0, max_positions=7, **common)
         assert first["done"] == first["handled"] == 7
@@ -280,6 +424,65 @@ def test_labeler_stores_resumes_and_deepens():
         messages: List[str] = []
         rl.check_db(db, messages.append)
         assert any("labelled to 2 plies" in m for m in messages) and any("walk train seed 0" in m for m in messages)
+
+
+def test_labeler_keeps_threats_and_reach_apart():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache, db = make_cache(tmp), os.path.join(tmp, "labels.db")
+        walked = list(rl.walk_positions(cache, "train", 0, 0, rollout_plies=2))
+        common = dict(db_path=db, cache_dir=cache, order_seed=0, rollout_plies=2, chunk=3, log=quiet)
+        assert rl.LABEL == "threats" and rl.DEPTH["threats"] == 2, "what a plain start makes"
+
+        reach = rl.label(depth=2, workers=0, max_positions=5, kind="reach", **common)
+        first = rl.label(depth=1, workers=0, max_positions=7, kind="threats", **common)
+        assert reach["done"] == 5 and first["done"] == first["handled"] == 7, "each kind has its own place in the walk"
+        assert first["skipped"] == 0, "a reach label does not stand in for a threat label"
+        labels = rl.ReachLabels(db)
+        for fens in walked[:7]:
+            for fen in fens:
+                assert np.array_equal(labels.get(fen, "threats"), pr.threat_counts(fen, 1)), fen
+        for fen in walked[4]:
+            assert np.array_equal(labels.get(fen), pr.reach_counts(fen, 2)), "the reach labels are as they were"
+        seen = {pr.position_key(f) for fens in walked[:7] for f in fens}
+        assert labels.get(walked[7][0], "threats") is None or pr.position_key(walked[7][0]) in seen
+        labels.close()
+
+        # 0 plies is a depth too (the position's own legal moves, both sides): its walk starts at the beginning,
+        # finds everything labelled deeper already, and searches nothing
+        shallow = rl.label(depth=0, workers=0, max_positions=3, kind="threats", **common)
+        assert shallow["done"] == 3 and shallow["searched"] == 0 and shallow["skipped"] >= 3
+
+        # deeper: from the first sample again, replacing the shallower labels; then the default depth with workers
+        deeper = rl.label(depth=2, workers=0, max_positions=4, kind="threats", **common)
+        assert deeper["done"] == 4
+        rest = rl.label(workers=2, kind="threats", **common)
+        assert rest["done"] == len(walked), "no depth given: DEPTH['threats'], carrying on from sample 4"
+        labels = rl.ReachLabels(db)
+        for fens in walked:
+            for fen in fens:
+                assert labels.get(fen, "threats").shape == (3, 64, 64)
+        assert np.array_equal(labels.get(walked[-1][-1], "threats"), pr.threat_counts(walked[-1][-1], 2))
+        assert labels.get(walked[-1][0]) is None or pr.position_key(walked[-1][0]) in {
+            pr.position_key(f) for fens in walked[:5] for f in fens}, "no reach label was made for it"
+        labels.close()
+
+        conn = rl.open_db(db)
+        progress = dict(conn.execute("SELECT walk, done FROM reach_progress"))
+        assert progress == {"train seed 0 epoch 0 rollout 2 depth 2": 5, "train seed 0 epoch 0 rollout 2 threats 0": 3,
+                            "train seed 0 epoch 0 rollout 2 threats 1": 7, "train seed 0 epoch 0 rollout 2 threats 2": len(walked)}
+        assert rl.walk_name("train", 0, 0, 2, 3) == "train seed 0 epoch 0 rollout 2 depth 3", "the name old databases hold"
+        conn.close()
+        messages: List[str] = []
+        rl.check_db(db, messages.append)
+        assert any("threats:" in m and "labelled to 2 plies" in m for m in messages)
+        assert any("reach:" in m and "labelled to 2 plies" in m for m in messages)
+        assert any("samples done" in m for m in messages) and any("after 2 plies" in m for m in messages)
+        for bad in (dict(kind="guards"), dict(kind="reach", depth=0), dict(kind="threats", depth=-1)):
+            try:
+                rl.label(workers=0, **common, **bad)
+                raise AssertionError("should be rejected")
+            except ValueError:
+                pass
 
 
 # ##### ##### ##### ##### #####
