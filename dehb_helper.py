@@ -55,6 +55,13 @@ class DEHBRunConfig:
     output_path: Union[str, Path] = "dehb_out"
     log_level: str = "INFO"  # loguru levels used by DEHB
     resume: bool = False     # restart from saved state if output_path has it
+    save_freq: Optional[str] = None  # when DEHB writes its state: "step" (after every evaluation), "incumbent"
+                                     # (its default: when the best changes) or "end". A search that may be
+                                     # stopped at any time wants "step"
+
+    # Which evaluation counts as the best. False: the best metric of all, whatever its fidelity. True: the
+    # best among those at the highest fidelity evaluated so far (a short run and a long one do not compare)
+    best_at_highest_fidelity: bool = False
 
 
 def _json_safe(obj: Any) -> Any:
@@ -106,10 +113,12 @@ class DEHBHelper:
 
         self._jsonl_path = self.output_path / "evals.jsonl"
         self._best_path = self.output_path / "best_config.json"
+        self._pending_path = self.output_path / "pending_job.json"
 
         self._best_fitness = np.inf
         self._best_metric_raw: Optional[float] = None
         self._best_config: Optional[Dict[str, Any]] = None
+        self._best_fidelity: float = -np.inf
 
         # On resume, reload our own incumbent tracking from disk so that
         # best_config.json stays trustworthy mid-run instead of only being
@@ -126,6 +135,7 @@ class DEHBHelper:
                 self._best_config = prev.get("best_config")
                 self._best_fitness = float(prev.get("best_fitness", np.inf))
                 self._best_metric_raw = prev.get("best_metric_raw")
+                self._best_fidelity = float(prev.get("best_fidelity", -np.inf))
                 print(
                     f"[DEHBHelper] Resumed incumbent from {self._best_path} "
                     f"(best_metric_raw={self._best_metric_raw})"
@@ -147,6 +157,8 @@ class DEHBHelper:
             de_kwargs["crossover_prob"] = self.run_cfg.crossover_prob
         if self.run_cfg.strategy is not None:
             de_kwargs["strategy"] = self.run_cfg.strategy
+        if self.run_cfg.save_freq is not None:
+            de_kwargs["save_freq"] = self.run_cfg.save_freq
 
         self._dehb = DEHB(
             cs=self.cs,
@@ -198,6 +210,98 @@ class DEHBHelper:
         }
         return summary
 
+    def run_stoppable(
+        self,
+        should_stop: Callable[[], bool],
+        *,
+        fevals: Optional[int] = None,
+        seconds: Optional[float] = None,
+        interrupted: Union[type, Tuple[type, ...]] = (),
+    ) -> Dict[str, Any]:
+        """
+        Runs DEHB one evaluation at a time (one worker), so the search can be stopped and taken up again.
+
+        should_stop: asked before every evaluation; True ends the search. An objective that is stopped part-way
+            says so by raising one of `interrupted`: nothing of that evaluation is reported, the job stays
+            written in pending_job.json, and the next start (a new helper, resume=True) gives the objective the
+            same configuration and fidelity first, so an objective that kept a checkpoint can carry on with it.
+        fevals: stop once this many evaluations are done in all, earlier starts included.
+        seconds: stop asking for new evaluations after this long (the one under way finishes).
+
+        Use save_freq="step" in the run config, so DEHB's own state is on disk after every evaluation.
+        After this returns, do not keep using the helper: build a new one to continue.
+        """
+        started = time.time()
+        pending = self._read_pending()
+        reason = "stopped"
+        while True:
+            if should_stop():
+                break
+            if fevals is not None and len(self._dehb.traj) >= fevals:
+                reason = "evaluations"
+                break
+            if seconds is not None and time.time() - started >= seconds:
+                reason = "time"
+                break
+            job = self._dehb.ask()
+            if pending is not None:
+                self._adopt(job, pending)
+                pending = None
+            self._write_pending(job)
+            try:
+                result = self._dehb_objective_wrapper(job["config"], job["fidelity"])
+            except interrupted:
+                break                      # pending_job.json stays: the next start takes this evaluation up again
+            self._dehb.tell(job, result)
+            self._pending_path.unlink(missing_ok=True)
+            self._dehb._clean_inactive_brackets()
+            print(f"[DEHBHelper] evaluation {len(self._dehb.traj)}: fidelity {float(job['fidelity']):g}, metric "
+                  f"{self._fitness_to_metric(result['fitness']):.4f}, {result['cost'] / 60:.1f} min; best so far "
+                  f"{self._best_metric_raw:.4f} at fidelity {self._best_fidelity:g}; "
+                  f"{(time.time() - started) / 3600:.1f} h since this start", flush=True)
+        self._dehb.save()
+        return {
+            "output_path": str(self.output_path),
+            "best_config": self._best_config,
+            "best_fitness": float(self._best_fitness),
+            "best_metric_raw": None if self._best_metric_raw is None else float(self._best_metric_raw),
+            "evaluations": len(self._dehb.traj),
+            "ended_because": reason,
+            "eval_log": str(self._jsonl_path),
+            "best_config_path": str(self._best_path),
+        }
+
+    def _write_pending(self, job: dict) -> None:
+        """The job about to be evaluated, as DEHB holds it: its point of the unit cube, and its fidelity."""
+        vector = self._dehb.config_repository.configs[job["config_id"]].config
+        with self._pending_path.open("w", encoding="utf-8") as f:
+            json.dump(_json_safe({"vector": np.asarray(vector).tolist(), "fidelity": float(job["fidelity"])}), f)
+
+    def _read_pending(self) -> Optional[Dict[str, Any]]:
+        if not self._pending_path.exists():
+            return None
+        try:
+            with self._pending_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[DEHBHelper] Could not read {self._pending_path} ({e}); the interrupted evaluation is dropped.")
+            return None
+
+    def _adopt(self, job: dict, pending: Dict[str, Any]) -> None:
+        """
+        Make the job DEHB just handed out the one that was interrupted. After a restart DEHB replays the
+        finished evaluations and then proposes a job for the same place in its schedule, but with a freshly
+        drawn configuration; putting the interrupted one in its place is what DEHB's own replay does with
+        every finished evaluation. If the fidelities differ the schedule is not where it was (the settings
+        changed): the interrupted evaluation is dropped.
+        """
+        if float(job["fidelity"]) != float(pending["fidelity"]):
+            print("[DEHBHelper] The interrupted evaluation does not fit the schedule any more; dropping it.")
+            return
+        vector = np.asarray(pending["vector"], dtype=float)
+        self._dehb.config_repository.configs[job["config_id"]].config = vector
+        job["config"] = self._dehb.vector_to_configspace(vector) if self._dehb.use_configspace else vector
+
     def ask(self, n: int = 1) -> Union[dict, list[dict]]:
         """
         Manual scheduling mode: ask DEHB for the next job(s).
@@ -235,16 +339,24 @@ class DEHBHelper:
         with self._jsonl_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(_json_safe(record), ensure_ascii=False) + "\n")
 
-    def _maybe_update_best(self, *, config: Dict[str, Any], fitness: float, metric_raw: float) -> None:
-        if fitness < self._best_fitness:
+    def _maybe_update_best(self, *, config: Dict[str, Any], fitness: float, metric_raw: float,
+                           fidelity: float = 0.0, info: Optional[Dict[str, Any]] = None) -> None:
+        if self.run_cfg.best_at_highest_fidelity:
+            better = fidelity > self._best_fidelity or (fidelity == self._best_fidelity and fitness < self._best_fitness)
+        else:
+            better = fitness < self._best_fitness
+        if better:
             self._best_fitness = float(fitness)
             self._best_metric_raw = float(metric_raw)
             self._best_config = _json_safe(dict(config))
+            self._best_fidelity = float(fidelity)
 
             payload = {
                 "best_config": self._best_config,
                 "best_fitness": self._best_fitness,
                 "best_metric_raw": self._best_metric_raw,
+                "best_fidelity": self._best_fidelity,
+                "best_info": info or {},
                 "direction": self.direction,
                 "updated_at_unix": time.time(),
             }
@@ -298,6 +410,10 @@ class DEHBHelper:
         )
 
         # Track incumbent ourselves too
-        self._maybe_update_best(config=config_dict, fitness=fitness, metric_raw=metric_raw)
+        self._maybe_update_best(config=config_dict, fitness=fitness, metric_raw=metric_raw,
+                                fidelity=float(fidelity), info=info)
 
-        return {"fitness": fitness, "cost": cost, "info": info}
+        # DEHB keeps `info` in a table it writes with pandas, which takes flat values only: nested ones (kept
+        # in evals.jsonl and best_config.json above) are left out of what DEHB itself stores
+        flat = {k: v for k, v in _json_safe(info).items() if isinstance(v, (int, float, str, bool)) or v is None}
+        return {"fitness": fitness, "cost": cost, "info": flat}

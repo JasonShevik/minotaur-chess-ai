@@ -12,7 +12,7 @@ They check contracts, not learning:
   * no gradient reaches the target encoder, which moves only by the moving average;
   * the losses reach every trainable part, and the unpooling policy only when unpool_rl is on;
   * LiDAR, RankMe and the self-consistency ratio behave as defined on constructed embeddings;
-  * the DEHB search space samples valid configurations.
+  * unpooling into slots for the concat readout, and what its decisions are rewarded with.
 """
 import math
 import random
@@ -344,24 +344,6 @@ def test_unbiased_sigreg_has_no_pull_at_small_batches():
     value, pull = averages(True)
     assert biased_value > 0.5 and biased_pull > 0.4, (biased_value, biased_pull)
     assert abs(value) < 0.2 and abs(pull) < 0.25, (value, pull)
-
-
-def test_search_space_leaves_out_fixed_values():
-    names = lambda cs: set(cs.keys())
-    full = names(lje.build_jepa_configspace())
-    squares = lje.build_jepa_configspace(fixed={"token_variant": "squares"})
-    assert not names(squares) & {"token_variant", "num_registers", "unpool_layers", "unpool_hidden", "rl_coef"}
-    unpool = lje.build_jepa_configspace(fixed={"token_variant": "unpool", "lr": 1e-4})
-    assert {"unpool_layers", "unpool_hidden", "rl_coef"} <= names(unpool) and "lr" not in names(unpool)
-    for sample in unpool.sample_configuration(5):       # the unpool settings are now always sampled
-        assert "unpool_layers" in dict(sample)
-    assert not names(lje.build_jepa_configspace(fixed={"anticollapse": "none"})) & {"sigreg_weight", "vicreg_weight"}
-    assert "rollout_stage_positions" not in names(lje.build_jepa_configspace(fixed={"rollout_max_steps": 1}))
-    assert "rollout_stage_positions" in names(lje.build_jepa_configspace(fixed={"rollout_max_steps": 4}))
-    for sample in lje.build_jepa_configspace(seed=3).sample_configuration(30):
-        values = dict(sample)
-        assert ("rollout_stage_positions" in values) == (values["rollout_max_steps"] > 1)
-    assert names(squares) < full
 
 
 def test_rollout_schedule():
@@ -1340,28 +1322,6 @@ def test_move_encodings_and_the_move_predictor():
             pass
 
 
-def test_dehb_search_space_samples_build():
-    cs = lje.build_jepa_configspace(seed=1)
-    seen = set()
-    for sample in cs.sample_configuration(12):
-        values = dict(sample)
-        cfg = lje.JEPAConfig.from_dict(values)
-        cfg.validate()
-        seen.add(cfg.token_variant)
-        if cfg.token_variant != "unpool":
-            assert "unpool_layers" not in values and "rl_coef" not in values
-        if cfg.token_variant != "registers":
-            assert "num_registers" not in values
-        assert cfg.z_dim == lje.JEPAConfig().z_dim, "z_dim must stay fixed during a search"
-    assert len(seen) >= 2
-    # a small sample from the space actually runs
-    for sample in cs.sample_configuration(3):
-        cfg = lje.JEPAConfig.from_dict({**dict(sample), "unpool_layers": 1, "z_dim": 64, "next_hidden": 64,
-                                        "d_model": 32, "readout_queries": 4})
-        model = lje.LabyrinthJEPA(cfg)
-        assert torch.isfinite(model.losses(make_batch(cfg, FENS[:2]), rng=torch.Generator().manual_seed(0)).total)
-
-
 def test_heads_alone_train_without_the_latent_losses():
     """
     With the latent losses at 0 and the heads fitting the online z, nothing the target encoder makes reaches the
@@ -1726,6 +1686,225 @@ def test_threat_head_learns_from_real_z_and_judges_predictions_held_fixed():
     assert torch.isfinite(out.total) and abs(out.stats["zthreat_labelled"] - (len(FENS) - 1) / len(FENS)) < 1e-6
     described = lje.describe(small_config("squares", zthreat_weight=1.0, zthreat_plies=1))
     assert described["zthreat_head_params"] == 64 * (2 * 4096) + 2 * 4096
+
+
+def test_validation_rejects_bad_move_settings():
+    for bad in (dict(move_encoding="names"), dict(inverse_weight=-1.0), dict(move_encoding="rank_file", d_model=33)):
+        try:
+            small_config("squares", **bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+
+
+def slotted_config(**kw) -> lje.JEPAConfig:
+    """The concat encoder with unpooling into slots, small."""
+    base = dict(gat_style="concat", gat_growth=1.5, readout="concat", readout_hidden=48, transformer_layers=0,
+                unpool_layers=2, unpool_dim=16, unpool_slot_dim=8, move_encoding="rank_file")
+    base.update(kw)
+    return small_config("unpool", **base)
+
+
+def test_descendant_slots_follow_the_family_tree():
+    # three nodes: the first and third are kept, the second is split in two
+    square, place = torch.tensor([5, 6, 7]), torch.tensor([0, 0, 1])
+    parent_map = {"f": torch.tensor([0, -1, 1]), "f1": torch.tensor([-1, 2, -1]), "f2": torch.tensor([-1, 3, -1])}
+    new_square, new_place = lje.descendant_slots(parent_map, square, place, 4)
+    assert new_square.tolist() == [5, 7, 6, 6]
+    assert new_place.tolist() == [0, 2, 0, 1], "kept and first child: 2 * place; second child: 2 * place + 1"
+
+
+def test_unpooling_into_slots_feeds_the_concat_readout():
+    """
+    With readout "concat" the unpooled nodes reach z through slots anchored to the squares they descend from:
+    every square has 2 ** unpool_layers of them, a node always lands in the slot its path through the splits
+    names, and the readout MLP reads the 64 square tokens and all the slots side by side.
+    """
+    cfg = slotted_config()
+    cfg.validate()
+    torch.manual_seed(0)
+    encoder = lje.LabyrinthEncoder(cfg)
+    batch = make_batch(cfg)
+    B = batch.num_graphs
+    assert encoder.readout_proj[0].in_features == 64 * cfg.d_model + 64 * 4 * cfg.unpool_slot_dim
+    assert encoder.unpool_in.in_features == cfg.gat_widths[-1] and encoder.unpool_in.out_features == 16
+
+    seen = {}
+    original = encoder.readout_proj.forward
+    encoder.readout_proj.forward = lambda x: (seen.__setitem__("input", x), original(x))[1]
+    out = encoder(batch.full, rng=torch.Generator().manual_seed(0))
+    assert out.z.shape == (B, cfg.z_dim) and out.squares.shape == (B, 64, cfg.d_model)
+    slots = seen["input"][:, 64 * cfg.d_model:].view(B, 64, 4, cfg.unpool_slot_dim)
+    filled = slots.abs().sum(-1) > 0
+    assert bool(filled[:, :, 0].all()), "a square's first slot always holds a node (a kept node, or its first child)"
+    assert torch.equal(filled.sum((1, 2)), out.num_tokens - 64), "one slot per unpooled node, none shared"
+    assert int(filled.sum()) > 64 * B, "the untrained policy splits some nodes"
+    assert bool((out.num_decisions > 0).all()) and bool(torch.isfinite(out.log_prob).all())
+
+    # the same decisions give the same z, and a position gets the same z alone as in a batch
+    again = encoder(batch.full, actions_to_replay=out.actions)
+    assert torch.allclose(again.z, out.z, atol=1e-5)
+    alone = make_batch(cfg, FENS[:1])
+    one = encoder(alone.full, actions_to_replay=[a.select([0]) for a in out.actions])
+    assert torch.allclose(one.z, out.z[:1], atol=1e-4)
+    # other decisions give another z: the slots are read
+    other = encoder(batch.full, rng=torch.Generator().manual_seed(1))
+    assert not torch.allclose(other.z, out.z, atol=1e-4)
+
+    # z's gradient reaches the unpooling layers' features and the slots' projection
+    encoder.zero_grad()
+    out.z.pow(2).sum().backward()
+    for name in ("slot_proj.weight", "unpool_in.weight", "unpool_layers.0.mlp_y.0.weight", "unpool_gats.1.gat.lin.weight"):
+        grad = dict(encoder.named_parameters())[name].grad
+        assert grad is not None and float(grad.abs().sum()) > 0, name
+
+    # the combinations that cannot work are refused
+    for bad in (dict(transformer_layers=1), dict(unpool_dim=15), dict(readout="mean"), dict(unpool_slot_dim=0)):
+        try:
+            slotted_config(**bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+    try:
+        small_config("registers", readout="concat", transformer_layers=0).validate()
+        raise AssertionError("registers have no slots")
+    except ValueError:
+        pass
+    # without unpool_dim the unpooling works at the square tokens' own width
+    wide = slotted_config(unpool_dim=0, gat_growth=1.0)
+    wide.validate()
+    assert lje.LabyrinthEncoder(wide).unpool_in is None and wide.unpool_width == wide.gat_dim
+
+
+def test_unpooling_decisions_are_rewarded_by_what_reads_z():
+    """
+    The decisions made encoding a view are rewarded with minus what the losses charged that view's z: the heads'
+    reading of it included. Without a transformer the masked-square loss cannot depend on the decisions, so
+    it is not part of the reward.
+    """
+    heads = dict(zhead_fit="online", zpred_weight=1.0, decode_next_weight=1.0, decode_masked_weight=1.0,
+                 zthreat_next_weight=1.0, zthreat_masked_weight=1.0, zthreat_plies=1, zthreat_head="piece_mlp",
+                 zthreat_hidden=8, zthreat_mode="count", rollout_max_steps=2)
+    cfg = slotted_config(**heads)
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+    rnd = random.Random(0)
+    batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=2,
+                                             threats=SearchedThreats(1, rollout_steps=2)) for f in FENS])
+    out = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0, 1.0])
+    assert torch.isfinite(out.total) and torch.isfinite(out.rl)
+    assert out.stats["mask_reward_std"] > 0 and out.stats["next_reward_std"] > 0
+    out.total.backward()
+    policy = model.encoder.unpool_layers[0].mlp_r[0].weight.grad
+    assert policy is not None and float(policy.abs().sum()) > 0, "the decision policy learns from the reward"
+    assert float(model.baselines["mask"][0].weight.grad.abs().sum()) > 0
+
+    # with the policy frozen nothing reaches it, and the losses are otherwise the same
+    frozen = lje.LabyrinthJEPA(slotted_config(unpool_rl=False, **heads))
+    frozen.load_state_dict(model.state_dict())
+    off = frozen.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0, 1.0])
+    off.total.backward()
+    assert frozen.encoder.unpool_layers[0].mlp_r[0].weight.grad is None
+    assert abs(float(off.total) - float(out.total - out.terms["rl"])) < 1e-4
+
+    # nothing reads the masked board's z but the anti-collapse term: its decisions get no reward at all
+    bare = lje.LabyrinthJEPA(slotted_config(rollout_max_steps=2))
+    plain = make_batch(bare.config)
+    stats = bare.losses(plain, rng=torch.Generator().manual_seed(0)).stats
+    assert "mask_reward_std" not in stats and "next_reward_std" in stats
+    # with a transformer the square tokens depend on the decisions, and the masked-square loss is the reward
+    stats = lje.LabyrinthJEPA(small_config("unpool")).losses(make_batch(small_config("unpool")),
+                                                           rng=torch.Generator().manual_seed(0)).stats
+    assert "mask_reward_std" in stats and "next_reward_std" in stats
+
+
+def test_row_losses_average_to_the_losses():
+    torch.manual_seed(0)
+    logits, classes = torch.randn(5, 64, lje.SQUARE_CLASSES), torch.randint(0, lje.SQUARE_CLASSES, (5, 64))
+    loss, _ = lje.decode_scores(logits, classes)
+    assert abs(float(lje.decode_row_losses(logits, classes).mean()) - float(loss)) < 1e-6
+
+    rows, layers = 6, 3
+    outputs = (torch.randn(rows, layers, 64, 64), torch.randn(rows, layers, 64, 64))
+    target = torch.where(torch.rand(rows, layers, 64, 64) < 0.1, torch.rand(rows, layers, 64, 64) * 5, torch.zeros(()))
+    graded = torch.rand(rows, 64) < 0.4
+    graded[2] = False                                   # a position without a label
+    for weights in (None, [1.0, 0.0, 0.5]):
+        loss, _ = lje.threat_scores(outputs, target, graded, weights, 0.7)
+        per_row = lje.threat_row_losses(outputs, target, graded, weights, 0.7)
+        assert per_row.shape == (rows,) and float(per_row[2]) == 0.0
+        assert abs(float(per_row.mean()) - float(loss)) < 1e-5, (float(per_row.mean()), float(loss))
+
+
+def test_losses_without_scores_are_the_same_losses():
+    """with_scores False skips the heads' scoring: the same total, the same gradients, no scores in stats."""
+    heads = dict(zhead_fit="online", zpred_weight=1.0, decode_next_weight=1.0, decode_masked_weight=1.0,
+                 zlegal_next_weight=1.0, zlegal_masked_weight=1.0, zthreat_next_weight=1.0, zthreat_masked_weight=1.0,
+                 zthreat_plies=1, zthreat_mode="count", zthreat_head="bilinear", zthreat_dim=8, rollout_max_steps=2)
+    cfg = small_config("squares", transformer_layers=0, move_encoding="rank_file", **heads)
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+    rnd = random.Random(0)
+    batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=2,
+                                             threats=SearchedThreats(1, rollout_steps=2)) for f in FENS])
+    grads, outs = [], []
+    for with_scores in (True, False):
+        model.zero_grad()
+        out = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0, 1.0], with_scores=with_scores)
+        out.total.backward()
+        outs.append(out)
+        grads.append([p.grad.clone() for p in model.trainable_parameters() if p.grad is not None])
+    full, bare = outs
+    assert float(full.total) == float(bare.total)
+    assert len(grads[0]) == len(grads[1]) and all(torch.equal(a, b) for a, b in zip(*grads))
+    assert {"decode_fit_exact", "decode_next_exact_2", "zlegal_next_found", "zthreat_fit_wrong", "zthreat_next_close_1_step2"} \
+        <= set(full.stats)
+    scored = {k for k in full.stats if k.startswith(("decode_", "zlegal_", "zthreat_"))}
+    assert scored and not scored & set(bare.stats), "no scores without with_scores"
+    assert {k for k in full.stats if k.startswith("loss_")} == {k for k in bare.stats if k.startswith("loss_")}
+    assert set(full.terms) == set(bare.terms)
+
+
+def test_deeper_mlps_in_the_square_stage_and_the_readout():
+    linears = lambda module: [m for m in module if isinstance(m, torch.nn.Linear)]
+    base = dict(gat_style="concat", readout="concat", readout_hidden=48, transformer_layers=0)
+    torch.manual_seed(0)
+    one = lje.LabyrinthEncoder(small_config("squares", **base))
+    torch.manual_seed(0)
+    same = lje.LabyrinthEncoder(small_config("squares", gat_mlp_layers=1, readout_layers=1, **base))
+    assert all(torch.equal(a, b) for a, b in zip(one.parameters(), same.parameters())), "1 and 1 are what there was"
+    assert len(linears(one.square_gats[0].mlp)) == 2 and len(linears(one.readout_proj)) == 2
+
+    deep_cfg = small_config("squares", gat_mlp_layers=3, readout_layers=2, **base)
+    deep = lje.LabyrinthEncoder(deep_cfg)
+    widths = deep_cfg.gat_widths
+    assert [(m.in_features, m.out_features) for m in linears(deep.square_gats[1].mlp)] == \
+        [(3 * widths[1], widths[2])] + [(widths[2], widths[2])] * 3
+    assert [(m.in_features, m.out_features) for m in linears(deep.readout_proj)] == \
+        [(64 * deep_cfg.d_model, 48), (48, 48), (48, deep_cfg.z_dim)]
+    assert deep(make_batch(deep_cfg).full).z.shape == (len(FENS), deep_cfg.z_dim)
+    for bad in (dict(gat_mlp_layers=0), dict(readout_layers=0)):
+        try:
+            small_config("squares", **base, **bad).validate()
+            raise AssertionError(f"{bad} should be rejected")
+        except ValueError:
+            pass
+
+
+def test_threat_labels_are_asked_for_as_many_rollout_steps_as_the_config_says():
+    """The predicted next z is judged on the rollout positions that carry labels: zthreat_rollout_steps of them."""
+    cfg = small_config("squares", transformer_layers=0, move_encoding="rank_file", zhead_fit="online",
+                       zthreat_next_weight=1.0, zthreat_plies=1, rollout_max_steps=4, zthreat_rollout_steps=3)
+    cfg.validate()
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+    rnd = random.Random(0)
+    batch = ld.collate_jepa([ld.build_sample(f, rnd, cfg.mask_config(), rollout_steps=4,
+                                             threats=SearchedThreats(1, rollout_steps=cfg.zthreat_rollout_steps))
+                             for f in FENS[:3]])
+    assert [step.threats is not None for step in batch.rollout] == [True, True, True, False]
+    stats = model.losses(batch, rollout_weights=[1.0] * 4).stats
+    assert "zthreat_next_found_step3" in stats and "zthreat_next_found_step4" not in stats
 
 
 # ##### ##### ##### ##### #####

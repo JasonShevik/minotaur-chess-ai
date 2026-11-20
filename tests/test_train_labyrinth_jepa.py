@@ -7,10 +7,12 @@ Run with plain Python (no pytest needed):
 
 Tiny models on a tiny position cache built in a temporary folder, on the CPU. They check that a run
 trains, evaluates, checkpoints and resumes; that the schedules and weight-decay groups are right; that
-the memory guard trips; and that the DEHB objective scores runs and handles runs that do not fit.
+the memory guard trips; that the exam grades every run alike; that a run or a search can be stopped
+and taken up again; and that the search's objective scores runs and handles runs that do not fit.
 """
 import csv
 import json
+import math
 import os
 import random
 import sys
@@ -248,72 +250,6 @@ def test_memory_guard():
         raise AssertionError("15 of 16 GB must exceed a 90% budget")
 
 
-def test_dehb_objective_scores_runs_and_handles_failures():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        cache = make_cache(tmp)
-        base = tiny_run(cache, None, batch_size=8)
-        fixed = {k: v for k, v in tiny_config().to_dict().items() if k not in ("token_variant",)}
-        objective = tj.make_objective(base, fixed=fixed, log=quiet)
-        result = objective({"token_variant": "squares"}, 0.024)     # 24 positions = 3 steps of 8
-        assert result.metric >= 1.0 - 1e-6 and result.info["steps"] == 3 and result.info["batch_size"] == 8
-
-        # a run that does not fit is retried once at half the batch size, then scores 0
-        calls = []
-
-        def never_fits(config, run, log=None):
-            calls.append(run.batch_size)
-            raise tj.MemoryBudgetExceeded("too big")
-        result = tj.make_objective(replace(base, batch_size=32), log=quiet, train_fn=never_fits)({}, 1.0)
-        assert calls == [32, 16] and result.metric == 0.0 and result.info["failed"] == "memory"
-
-        def fits_at_half(config, run, log=None):
-            calls.append(run.batch_size)
-            if run.batch_size > 16:
-                raise tj.MemoryBudgetExceeded("too big")
-            return {"final": {"lidar": 7.0, "online_lidar": 11.0, "rankme": 9.0, "self_consistency": 0.1},
-                    "steps": run.total_steps}
-        calls.clear()
-        result = tj.make_objective(replace(base, batch_size=32), log=quiet, train_fn=fits_at_half)({}, 1.6)
-        assert calls == [32, 16] and result.info["steps"] == 100   # 1,600 positions / 16
-        assert result.metric == 11.0 and result.info["target_lidar"] == 7.0, "the objective scores the online encoder"
-
-        # a real CUDA out-of-memory error is handled like the memory guard, not allowed to end the search
-        calls.clear()
-
-        def cuda_oom_then_fits(config, run, log=None):
-            calls.append(run.batch_size)
-            if run.batch_size > 16:
-                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
-            return fits_at_half(config, run)
-        calls_before = len(calls)
-        result = tj.make_objective(replace(base, batch_size=32), log=quiet, train_fn=cuda_oom_then_fits)({}, 1.6)
-        assert result.metric == 11.0 and 16 in calls
-
-        # fixed values win over anything DEHB samples
-        seen = []
-
-        def record(config, run, log=None):
-            seen.append(config.token_variant)
-            return fits_at_half(config, replace(run, batch_size=16))
-        tj.make_objective(replace(base, batch_size=16), fixed={"token_variant": "squares"}, log=quiet,
-                          train_fn=record)({"token_variant": "unpool"}, 1.6)
-        assert seen == ["squares"]
-
-        def diverges(config, run, log=None):
-            raise tj.TrainingDiverged("nan")
-        assert tj.make_objective(base, log=quiet, train_fn=diverges)({}, 1.0).metric == 0.0
-
-
-def test_config_loading_accepts_dehb_and_run_files():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        for payload in ({"best_config": {"gat_dim": 64}}, {"jepa_config": {"gat_dim": 64}}, {"gat_dim": 64}):
-            path = os.path.join(tmp, "c.json")
-            with open(path, "w") as f:
-                json.dump(payload, f)
-            assert tj._load_config(path) == {"gat_dim": 64}
-    assert tj._load_config(None) == {}
-
-
 def test_a_run_with_the_legal_threat_head_reads_the_labellers_database():
     """
     The labeller walks the positions a run will see, in its order, with its rollout moves. So a run on a
@@ -369,6 +305,405 @@ def test_a_run_with_the_legal_threat_head_reads_the_labellers_database():
             last = [h for h in result["history"] if "loss" in h][-1]
             assert last["threats_stored"] == 0.0 and last["threats_searched"] == 1.0
             assert result["final"]["val_zthreat_fit_labelled"] == 1.0 and result["final"]["val_loss_zthreat_fit"] > 0
+
+
+def heads_config(**kw) -> lje.JEPAConfig:
+    """A tiny concat encoder with the decoder judging its own z, the predicted next z and the predicted whole z."""
+    base = dict(gat_style="concat", readout="concat", readout_hidden=32, transformer_layers=0, move_encoding="rank_file",
+                zhead_fit="online", zpred_weight=1.0, decode_next_weight=1.0, decode_masked_weight=1.0, decode_hidden=32,
+                rollout_start_steps=1, rollout_max_steps=3, rollout_stage_positions=16)
+    base.update(kw)
+    return tiny_config("squares", **base)
+
+
+def test_the_exam_grades_the_whole_rollout_whatever_the_curriculum():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        exam = dict(exam=True, exam_positions=16, exam_batch_size=8, exam_workers=0, probe_positions=0, eval_every=0)
+        # a run whose curriculum never gets past one move is still examined on all three
+        stuck = heads_config(rollout_stage_positions=10 ** 9)
+        result = tj.train(stuck, tiny_run(cache, None, total_steps=3, **exam), log=quiet)
+        assert [len(h["rollout_weights"]) for h in result["history"] if "loss" in h] == [1, 1, 1]
+        final = result["final"]
+        assert {"exam_loss", "exam_loss_decode_fit", "exam_loss_decode_next", "exam_loss_decode_masked",
+                "exam_decode_fit_exact", "exam_decode_next_exact_3", "exam_latent_next"} <= set(final)
+        parts = [v for k, v in final.items() if k.startswith("exam_loss_")]
+        assert len(parts) == 3 and abs(final["exam_loss"] - sum(parts)) < 1e-6, "the exam loss is the heads' terms"
+        assert "exam_loss_mask" not in final and "exam_loss_zpred" not in final, "the latent terms are not in it"
+        messages = []
+        tj.train(stuck, tiny_run(cache, None, total_steps=1, **exam), log=messages.append)
+        assert any("exam  loss=" in m and "boards decoded exactly" in m for m in messages)
+
+        # the exam's positions, masks and moves do not depend on the run's batch size or seed
+        torch.manual_seed(0)
+        model = lje.LabyrinthJEPA(stuck)
+        val = ld.PositionDataset(cache, "val")
+        rows = random.Random(tj.EVAL_SUBSET_SEED).sample(range(len(val)), 16)
+
+        def sit(batch: int) -> dict:
+            loader = ld.JEPALoader(cache, "val", batch, num_workers=0, mask_config=ld.MaskConfig(), seed=tj.EXAM_SEED,
+                                   shuffle=False, indices=rows)
+            return tj.exam(model, loader, torch.device("cpu"))
+        first, again = sit(8), sit(8)
+        assert first == again, "the same model sits the same exam twice"
+        assert abs(sit(16)["exam_loss"] - first["exam_loss"]) < 1e-4, "(equal batches: the mean over batches is the mean)"
+
+
+def test_eager_rollouts_train_like_restarted_loaders():
+    """Carrying the whole rollout in every batch and using what the curriculum has reached gives the same
+    training as restarting the loader each time the curriculum adds a move."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        for cfg in (heads_config(), heads_config(rollout_start_steps=2, rollout_max_steps=6, rollout_targets="log",
+                                                 rollout_stage_positions=8)):
+            runs = [tj.train(cfg, tiny_run(cache, None, total_steps=6, eval_every=0, probe_positions=0,
+                                           grad_terms_every=0, eager_rollouts=eager), log=quiet)
+                    for eager in (False, True)]
+            losses = [[h["loss"] for h in r["history"] if "loss" in h] for r in runs]
+            lengths = [[len(h["rollout_weights"]) for h in r["history"] if "loss" in h] for r in runs]
+            assert lengths[0] == lengths[1] and len(set(lengths[0])) > 1, lengths
+            assert all(abs(a - b) < 1e-5 for a, b in zip(*losses)), losses
+            graded = [sorted(k for k in r["history"][-2] if k.startswith("loss_next_")) for r in runs]
+            assert graded[0] == graded[1], "the same steps are graded"
+
+
+def test_a_stopped_run_saves_and_carries_on():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        cfg = heads_config()
+        settings = dict(total_steps=6, eval_every=0, probe_positions=0, grad_terms_every=0, checkpoint_every=0,
+                        snapshot_first=0, snapshot_every=4)
+        whole = tj.train(cfg, tiny_run(cache, os.path.join(tmp, "whole"), **settings), log=quiet)
+        assert os.listdir(os.path.join(tmp, "whole", "snapshots")) == ["step_0000004.pt"], "snapshot_every"
+
+        out = os.path.join(tmp, "run")
+        asked = []
+
+        def stop() -> bool:
+            asked.append(1)
+            return len(asked) > 4                       # before the fifth step
+        messages = []
+        first = tj.train(cfg, tiny_run(cache, out, **settings), log=messages.append, stop=stop)
+        assert first["stopped"] and first["steps"] == 4 and first["final"] == {}
+        assert any("stopped on request" in m for m in messages)
+        assert torch.load(os.path.join(out, "last.pt"), weights_only=False)["step"] == 4
+        rest = tj.train(cfg, tiny_run(cache, out, **settings), log=quiet, stop=lambda: False)
+        assert not rest["stopped"] and rest["steps"] == 6
+        assert [h["step"] for h in rest["history"] if "loss" in h] == [5, 6]
+        with open(os.path.join(out, "history.jsonl")) as f:
+            losses = [json.loads(line)["loss"] for line in f if '"loss"' in line]
+        assert len(losses) == 6
+        expected = [h["loss"] for h in whole["history"] if "loss" in h]
+        assert all(abs(a - b) < 1e-4 for a, b in zip(losses, expected)), "a stop loses nothing"
+
+        # the command line's switch: a file named "stop" in the run's folder
+        switch = tj.stop_switch(out, log=quiet)
+        assert not switch()
+        open(os.path.join(out, "stop"), "w").close()
+        assert switch() and switch() and not os.path.exists(os.path.join(out, "stop"))
+
+
+def test_a_stopped_run_carries_on_on_the_gpu():
+    """The checkpoint is loaded onto the run's device, the random generator's state with it; resuming on a GPU
+    must still restore it (it once failed there, and only there)."""
+    if not torch.cuda.is_available():
+        return
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        cfg = heads_config()
+        settings = dict(total_steps=4, eval_every=0, probe_positions=0, grad_terms_every=0, checkpoint_every=0,
+                        snapshot_first=0, device="cuda")
+        out = os.path.join(tmp, "run")
+        asked = []
+
+        def stop() -> bool:
+            asked.append(1)
+            return len(asked) > 2
+        first = tj.train(cfg, tiny_run(cache, out, **settings), log=quiet, stop=stop)
+        assert first["stopped"] and first["steps"] == 2
+        rest = tj.train(cfg, tiny_run(cache, out, **settings), log=quiet)
+        assert not rest["stopped"] and rest["steps"] == 4 and [h["step"] for h in rest["history"] if "loss" in h] == [3, 4]
+
+
+def test_search_space_and_how_a_point_becomes_a_run():
+    names = lambda cs: set(cs.keys())
+    full = names(tj.build_search_space())
+    assert full == {name for name, _, _, _ in tj.SEARCH_DIMENSIONS}
+    assert {"token_variant", "unpool_layers", "gat_heads", "z_dim", "batch_size", "rollout_curriculum"} <= full
+    assert not full & {"zthreat_hidden", "zthreat_head", "decode_hidden", "next_weight", "mask_weight"}, \
+        "the heads and the loss weights are not searched"
+    squares = names(tj.build_search_space(fixed={"token_variant": "squares", "lr": 1e-4}))
+    assert not squares & {"token_variant", "unpool_layers", "unpool_hidden", "unpool_dim", "rl_coef", "lr"}
+    unpool = tj.build_search_space(fixed={"token_variant": "unpool"})
+    assert {"unpool_layers", "unpool_hidden", "unpool_dim", "rl_coef"} <= names(unpool)
+    assert all("unpool_layers" in dict(s) for s in unpool.sample_configuration(5))
+
+    fixed = dict(gat_style="concat", readout="concat", transformer_layers=0, move_encoding="rank_file",
+                 rollout_start_steps=2, rollout_max_steps=10, rollout_targets="all", zthreat_plies=3,
+                 zthreat_start_plies=1, zthreat_next_weight=1.0, zhead_fit="online")
+    seen = set()
+    for sample in tj.build_search_space(seed=1).sample_configuration(40):
+        point = {**dict(sample), **fixed}
+        values, how = tj.resolve_search(point, 3_000_000)
+        config = lje.JEPAConfig.from_dict(values)
+        config.validate()
+        seen.add(config.token_variant)
+        assert ("unpool_layers" in dict(sample)) == (config.token_variant == "unpool")
+        cap = tj.UNPOOL_MAX_BATCH[config.unpool_layers] if config.token_variant == "unpool" else 256
+        assert how["batch_size"] == min(point["batch_size"], cap) and how["warmup_steps"] == 256_000 // how["batch_size"]
+        assert not set(values) & set(tj.SEARCH_ONLY)
+        # the curricula's shares of the run, as stage lengths: 8 stages from 2 to 10 moves, 2 from 1 to 3 plies
+        assert config.rollout_stage_positions == round(point["rollout_curriculum"] * 3_000_000 / 8)
+        assert config.zthreat_stage_positions == round(point["threat_curriculum"] * 3_000_000 / 2)
+        full_length_at = (config.rollout_max_steps - config.rollout_start_steps) * config.rollout_stage_positions
+        assert len(lje.rollout_schedule(config, full_length_at)) == 10 and full_length_at <= 0.8 * 3_000_000 + 8
+        assert abs(config.sigreg_weight - point["sigreg_weight"] * 256 / how["batch_size"]) < 1e-12
+    assert seen == {"squares", "unpool"}
+    # an unpooling setting that is fixed for the whole search does not make the squares configurations invalid
+    for variant in ("squares", "unpool"):
+        values, _ = tj.resolve_search({**fixed, "token_variant": variant, "unpool_dim": 64, "unpool_layers": 1,
+                                       "gat_heads": 4}, 1000)
+        lje.JEPAConfig.from_dict(values).validate()
+        assert ("unpool_dim" in values) == (variant == "unpool")
+    # a run that did not fit is resolved again at half the batch: more steps of warm-up, a stronger weight
+    values, how = tj.resolve_search({**fixed, "batch_size": 256, "sigreg_weight": 0.01}, 1000, batch_size=64)
+    assert how == {"batch_size": 64, "warmup_steps": 4000} and abs(values["sigreg_weight"] - 0.04) < 1e-12
+    assert abs(values["ema_start"] - 0.999) < 1e-12, "0.996 at 256 a step: the same horizon in positions at 64"
+    assert abs(tj.resolve_search({**fixed, "token_variant": "squares", "batch_size": 256}, 1000)[0]["ema_start"] - 0.996) < 1e-12
+    # an unpooling configuration starts no larger than fits: its batch is capped by its number of layers
+    for layers, cap in tj.UNPOOL_MAX_BATCH.items():
+        how = tj.resolve_search({**fixed, "token_variant": "unpool", "unpool_layers": layers, "unpool_dim": 64,
+                                 "batch_size": 256}, 1000)[1]
+        assert how["batch_size"] == cap
+    assert tj.resolve_search({**fixed, "token_variant": "unpool", "unpool_layers": 3, "unpool_dim": 64, "batch_size": 256},
+                             1000, batch_size=16)[1]["batch_size"] == 16, "a retry's batch is taken as given"
+
+
+def test_search_objective_scores_runs_and_handles_failures():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        base = tiny_run(cache, None, exam_positions=16, exam_batch_size=8, exam_workers=0)
+        fixed = heads_config().to_dict()
+        objective = tj.make_objective(base, fixed=fixed, log=quiet)
+        result = objective({"batch_size": 8, "rollout_curriculum": 0.5}, 0.048)     # 48 positions = 6 steps of 8
+        info = result.info
+        assert 0 < result.metric < tj.FAILED and abs(result.metric - info["exam_loss"]) < 1e-9
+        assert info["steps"] == 6 and info["batch_size"] == 8 and info["positions"] == 48
+        assert {"exam_loss_decode_fit", "exam_decode_next_exact", "positions_per_s", "seconds"} <= set(info)
+        ran = info["run"]
+        assert ran["batch_size"] == 8 and ran["jepa_config"]["rollout_stage_positions"] == 12   # half of 48, in 2 stages
+        assert "batch_size" not in ran["jepa_config"] and ran["jepa_config"]["gat_style"] == "concat"
+
+        def finished(run) -> dict:
+            return {"final": {"exam_loss": 2.5, "exam_loss_decode_fit": 2.5}, "steps": run.total_steps,
+                    "history": [{"positions_per_s": 10.0}], "stopped": False}
+
+        # a run that does not fit is tried again at half the batch size, down to the smallest allowed
+        calls = []
+
+        def never_fits(config, run, log=None, stop=None):
+            calls.append(run.batch_size)
+            raise tj.MemoryBudgetExceeded("too big")
+        result = tj.make_objective(base, fixed=fixed, log=quiet, train_fn=never_fits)({"batch_size": 64}, 1.0)
+        assert calls == [64, 32, 16] and result.metric == tj.FAILED and result.info["failed"] == "memory"
+
+        seen = []
+
+        def fits_at_32(config, run, log=None, stop=None):
+            calls.append(run.batch_size)
+            seen.append((config, run))
+            if run.batch_size > 32:
+                if run.batch_size == 64:
+                    raise torch.cuda.OutOfMemoryError("CUDA out of memory")      # handled like the memory guard
+                raise tj.MemoryBudgetExceeded("too big")
+            return finished(run)
+        calls.clear()
+        searched = {k: v for k, v in fixed.items() if k != "sigreg_weight"}
+        result = tj.make_objective(base, fixed=searched, log=quiet, train_fn=fits_at_32)(
+            {"batch_size": 128, "sigreg_weight": 0.01}, 3.2)
+        assert calls == [128, 64, 32] and result.metric == 2.5 and result.info["batch_size"] == 32
+        config, run = seen[-1]
+        assert run.total_steps == 100 and run.warmup_steps == 8000, "the same 3,200 positions, in more steps"
+        assert abs(config.sigreg_weight - 0.08) < 1e-12 and run.exam and run.eager_rollouts and run.min_lr_fraction == 1.0
+        assert run.eval_every == 0 and run.probe_positions == 0 and run.val_loss_batches == 0
+
+        # fixed values win over anything DEHB samples; --batch-size style overrides go through `fixed` too
+        seen.clear()
+        tj.make_objective(base, fixed={**fixed, "token_variant": "squares", "batch_size": 16}, log=quiet,
+                          train_fn=fits_at_32)({"token_variant": "unpool", "batch_size": 32}, 1.6)
+        assert seen[-1][0].token_variant == "squares" and seen[-1][1].batch_size == 16
+
+        def diverges(config, run, log=None, stop=None):
+            raise tj.TrainingDiverged("nan")
+        result = tj.make_objective(base, fixed=fixed, log=quiet, train_fn=diverges)({"batch_size": 8}, 1.0)
+        assert result.metric == tj.FAILED and result.info["failed"] == "diverged"
+        result = tj.make_objective(base, fixed={**fixed, "gat_heads": 5}, log=quiet, train_fn=fits_at_32)({"batch_size": 8}, 1.0)
+        assert result.metric == tj.FAILED and result.info["failed"] == "invalid", "16 wide does not split into 5 heads"
+
+        # a stop in the middle of an evaluation keeps its checkpoint; the same point carries on from it
+        work = os.path.join(tmp, "search")
+        asked = []
+
+        def stop() -> bool:
+            asked.append(1)
+            return len(asked) == 4
+        objective = tj.make_objective(base, fixed=fixed, log=quiet, work_dir=work, stop=stop)
+        point = {"batch_size": 8, "rollout_curriculum": 0.5}
+        try:
+            objective(point, 0.048)
+            raise AssertionError("the stop should have ended the evaluation")
+        except tj.SearchStopped:
+            pass
+        current = os.path.join(work, "current")
+        assert torch.load(os.path.join(current, "last.pt"), weights_only=False)["step"] == 3
+        messages = []
+        result = tj.make_objective(base, fixed=fixed, log=messages.append, work_dir=work, stop=stop)(point, 0.048)
+        assert any("resumed from" in m and "at step 3" in m for m in messages)
+        assert result.info["steps"] == 6 and not os.path.exists(os.path.join(current, "last.pt"))
+        # another job (here: the same point, a longer run) does not take a stale checkpoint up
+        try:
+            asked.clear()
+            objective(point, 0.048)
+        except tj.SearchStopped:
+            pass
+        assert os.path.exists(os.path.join(current, "last.pt"))
+        messages.clear()
+        other = tj.make_objective(base, fixed=fixed, log=messages.append, work_dir=work)(point, 0.064)
+        assert not any("resumed from" in m for m in messages) and other.info["steps"] == 8
+
+
+def test_an_evaluation_runs_in_a_process_of_its_own():
+    """train_in_subprocess gives what train gives, tells a run to stop through its stop file, and turns the
+    ways a run can fail into the exceptions the search's objective handles."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        cfg = heads_config()
+        settings = dict(total_steps=6, eval_every=0, probe_positions=0, grad_terms_every=0, checkpoint_every=0,
+                        snapshot_first=0, exam=True, exam_positions=16, exam_batch_size=8, exam_workers=0)
+        here = tj.train(cfg, tiny_run(cache, None, **settings), log=quiet)
+        out = os.path.join(tmp, "eval")
+        asked = []
+
+        def stop() -> bool:                                 # asked twice a second while the run's process lives
+            asked.append(1)
+            return False
+        there = tj.train_in_subprocess(cfg, tiny_run(cache, out, **settings), stop=stop)
+        assert there["steps"] == 6 and not there["stopped"] and asked
+        assert abs(there["final"]["exam_loss"] - here["final"]["exam_loss"]) < 1e-4, "the same run, in another process"
+        assert len(there["history"]) == 6 and all(set(h) == {"positions_per_s"} for h in there["history"])
+
+        # a stop is passed on through the run's stop file: it saves and says it stopped
+        stopped = tj.train_in_subprocess(cfg, tiny_run(cache, os.path.join(tmp, "stopped"), **{**settings, "total_steps": 4000}),
+                                         stop=lambda: True)
+        assert stopped["stopped"] and stopped["steps"] < 4000
+        assert os.path.exists(os.path.join(tmp, "stopped", "last.pt"))
+
+        # failures come back as the exceptions train raises
+        try:
+            tj.train_in_subprocess(cfg, tiny_run(os.path.join(tmp, "no such cache"), os.path.join(tmp, "bad"), **settings))
+            raise AssertionError("a run that cannot start should raise")
+        except tj.EvaluationCrashed as error:
+            assert "positions_train" in str(error) or "No such file" in str(error) or "FileNotFound" in str(error), error
+        assert tj._is_out_of_memory(RuntimeError("CUDA error: out of memory")) and not tj._is_out_of_memory(RuntimeError("x"))
+        assert tj._is_out_of_memory(torch.cuda.OutOfMemoryError("CUDA out of memory"))
+
+        # the objective scores a crash as a failure, and gives up when the same thing fails three times running
+        def crashes(config, run, log=None, stop=None):
+            raise tj.EvaluationCrashed("boom")
+        objective = tj.make_objective(tiny_run(cache, None), fixed=cfg.to_dict(), log=quiet, train_fn=crashes)
+        for _ in range(2):
+            result = objective({"batch_size": 8}, 1.0)
+            assert result.metric == tj.FAILED and result.info["failed"] == "crashed"
+        try:
+            objective({"batch_size": 8}, 1.0)
+            raise AssertionError("three crashes in a row should end the search")
+        except tj.EvaluationCrashed:
+            pass
+
+        def kernel_oom_then_fits(config, run, log=None, stop=None):
+            if run.batch_size > 16:
+                raise RuntimeError("CUDA error: out of memory")
+            return {"final": {"exam_loss": 1.5}, "steps": run.total_steps, "history": [], "stopped": False}
+        result = tj.make_objective(tiny_run(cache, None), fixed=cfg.to_dict(), log=quiet,
+                                   train_fn=kernel_oom_then_fits)({"batch_size": 32}, 1.6)
+        assert result.metric == 1.5 and result.info["batch_size"] == 16
+
+
+def test_a_search_can_be_stopped_and_taken_up_again():
+    """DEHB one evaluation at a time: a stop between evaluations or in the middle of one loses nothing."""
+    from dehb_helper import DEHBHelper, DEHBRunConfig, ObjectiveResult
+
+    class Interrupted(Exception):
+        pass
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        out = os.path.join(tmp, "search")
+        space = tj.build_search_space(seed=0, fixed={"token_variant": "squares"})
+        evaluated, state = [], {"interrupt_at": None}
+
+        def objective(cfg, fidelity):
+            if state["interrupt_at"] == len(evaluated):
+                state["interrupt_at"] = None
+                state["interrupted"] = (dict(cfg), fidelity)
+                raise Interrupted()
+            evaluated.append((dict(cfg), fidelity))
+            # (longer runs score better, as real ones do)
+            return ObjectiveResult(metric=abs(math.log10(cfg["lr"]) + 3.5) + 1.0 / fidelity,
+                                   info={"run": {"jepa_config": {"lr": cfg["lr"]}, "batch_size": 8}})
+
+        def helper(resume: bool) -> DEHBHelper:
+            return DEHBHelper(configspace=space, objective=objective, direction="minimize",
+                              run_cfg=DEHBRunConfig(min_fidelity=1, max_fidelity=9, eta=3, seed=0, n_workers=1,
+                                                    output_path=out, resume=resume, save_freq="step",
+                                                    best_at_highest_fidelity=True, log_level="ERROR"))
+
+        summary = helper(False).run_stoppable(lambda: False, fevals=5, interrupted=Interrupted)
+        assert summary["evaluations"] == 5 and summary["ended_because"] == "evaluations" and len(evaluated) == 5
+        assert not os.path.exists(os.path.join(out, "pending_job.json"))
+
+        state["interrupt_at"] = 7                           # the eighth evaluation is cut short
+        summary = helper(True).run_stoppable(lambda: False, fevals=20, interrupted=Interrupted)
+        assert summary["evaluations"] == 7 and summary["ended_because"] == "stopped"
+        assert os.path.exists(os.path.join(out, "pending_job.json"))
+
+        summary = helper(True).run_stoppable(lambda: False, fevals=14, interrupted=Interrupted)
+        assert summary["evaluations"] == 14 and len(evaluated) == 14
+        again, cut = evaluated[7], state["interrupted"]
+        assert again[1] == cut[1] and again[0].keys() == cut[0].keys(), "the interrupted evaluation came first"
+        assert all(again[0][k] == cut[0][k] or abs(again[0][k] - cut[0][k]) < 1e-9 * abs(cut[0][k])
+                   for k in cut[0]), (again[0], cut[0])
+        with open(os.path.join(out, "evals.jsonl")) as f:
+            logged = [json.loads(line) for line in f]
+        assert len(logged) == 14
+
+        # the best is the best of the longest runs, and its file says how to run it again
+        with open(os.path.join(out, "best_config.json")) as f:
+            best = json.load(f)
+        top = max(e["fidelity"] for e in logged)
+        assert best["best_fidelity"] == top
+        assert best["best_metric_raw"] == min(e["metric_raw"] for e in logged if e["fidelity"] == top)
+        assert tj._load_config(os.path.join(out, "best_config.json")) == {"lr": best["best_config"]["lr"]}
+        assert tj._load_run_settings(os.path.join(out, "best_config.json")) == {"batch_size": 8}
+
+        # a stop asked for between evaluations ends the search at once
+        summary = helper(True).run_stoppable(lambda: True, fevals=30, interrupted=Interrupted)
+        assert summary["evaluations"] == 14 and summary["ended_because"] == "stopped"
+
+
+def test_config_loading_accepts_search_and_run_files():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "c.json")
+        for payload in ({"best_config": {"gat_dim": 64}}, {"jepa_config": {"gat_dim": 64}}, {"gat_dim": 64},
+                        {"best_config": {"gat_dim": 32, "batch_size": 64},
+                         "best_info": {"run": {"jepa_config": {"gat_dim": 64}, "batch_size": 64, "warmup_steps": 4000}}}):
+            with open(path, "w") as f:
+                json.dump(payload, f)
+            assert tj._load_config(path) == {"gat_dim": 64}
+        assert tj._load_run_settings(path) == {"batch_size": 64, "warmup_steps": 4000}
+        with open(path, "w") as f:
+            json.dump({"jepa_config": {"gat_dim": 64}, "run_config": {}, "batch_size": 128}, f)
+        assert tj._load_run_settings(path) == {"batch_size": 128}
+    assert tj._load_config(None) == {} and tj._load_run_settings(None) == {}
 
 
 # ##### ##### ##### ##### #####

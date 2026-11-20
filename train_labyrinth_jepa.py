@@ -3,9 +3,11 @@ Training and hyperparameter search for the Labyrinth JEPA encoder (labyrinth_jep
 
     python train_labyrinth_jepa.py train [--config best_config.json] [--steps 20000] [--out runs/jepa] \\
         [--probe-db minotaur_data.db --probe-puzzles lichess_db_puzzle.csv.zst]
-    python train_labyrinth_jepa.py tune  [--out dehb_jepa_out] [--fevals 40]
+    python train_labyrinth_jepa.py tune  --config base.json --out dehb_jepa_out --hours 36
 
-Build the position cache first (python labyrinth_data.py build ...).
+Build the position cache first (python labyrinth_data.py build ...). Both commands stop when q is pressed in
+their window (or a file named "stop" appears in --out): they save and close, and the same command carries on
+from there.
 
 train(model_config, run_config) is one training run:
   * AdamW (no weight decay on biases, norms and learned tokens), linear warm-up then cosine decay;
@@ -14,7 +16,11 @@ train(model_config, run_config) is one training run:
   * the rollout curriculum (labyrinth_jepa_encoder.rollout_schedule): how many moves ahead the model
     predicts grows with the number of training positions seen; when it grows, the loader continues the
     current epoch with longer rollouts, without repeating positions, building graphs only for the steps
-    that are graded (rollout_target_steps);
+    that are graded (rollout_target_steps). With eager_rollouts the batches carry the whole rollout from
+    the start and each step uses what the curriculum has reached: the same training, no loader restarts;
+  * the loaders hand the batches' graphs over in a compact form (labyrinth_data.CompactGraphs) and they are
+    expanded on the GPU: every chess graph repeats the same edges, and with ten-move rollouts a loader's
+    ready batches would otherwise fill the machine's memory;
   * with the legal-threat head (JEPAConfig.zthreat_*), batches carry threat labels from the labels database
     reach_labeler.py fills (threat_db). Positions it does not hold, the validation positions among them, are
     searched on the spot when the compiled search is built and go ungraded when it is not. The head's own
@@ -28,7 +34,10 @@ train(model_config, run_config) is one training run:
     fragments the allocator's cache until the reserved memory is far above the allocated. So whenever the
     reserved memory passes cache_release_fraction of the card, the unused cache is handed back first;
   * every eval_every steps: LiDAR, RankMe and the self-consistency ratio of the target encoder on a fixed
-    set of validation positions, plus the losses on validation batches;
+    set of validation positions, plus the losses on validation batches, graded as training is at that
+    step. With exam, also the exam (exam()): the heads' losses with the whole rollout and every threat ply
+    at full weight, on positions, masks and moves that are the same for every run, so runs with different
+    curricula and batch sizes compare;
   * probes at every evaluation (probe_positions > 0): linear and nearest-neighbour probes of the target
     encoder at several views (probe_views: z and vectors inside the encoder), on fixed positions with
     fixed labels: board facts of validation positions, plus engine evaluations and best moves (probe_db)
@@ -37,18 +46,25 @@ train(model_config, run_config) is one training run:
   * every grad_terms_every steps, the gradient each loss term alone gives each part of the model (the
     square stage, the transformer, the readout, the predictors), and the cosine between terms' gradients on
     the encoder's parts: which signal shapes which layers, and whether signals pull against each other;
-  * weights-only snapshots at step 0 and at snapshot_first, 2x, 4x, ... steps, and at the end, in
-    snapshots/ (probe_labyrinth.py --snapshots probes them all);
-  * logs (history.jsonl), last.pt every checkpoint_every steps and at the end, best.pt by LiDAR, and
-    resuming from last.pt.
+  * weights-only snapshots at step 0 and at snapshot_first, 2x, 4x, ... steps, at every multiple of
+    snapshot_every and at the end, in snapshots/ (probe_labyrinth.py --snapshots probes them all);
+  * logs (history.jsonl), last.pt every checkpoint_every steps, at a stop and at the end, best.pt by LiDAR,
+    and resuming from last.pt.
 
-tune runs DEHB over build_jepa_configspace(). Each evaluation trains from scratch on `fidelity`
-thousand positions and reports the ONLINE encoder's LiDAR on the validation positions (higher is
-better; RunConfig.objective_metric). Not the target's: its moving average is stretched over the run, so
-over DEHB's short runs the target is still largely its initial weights. Values given with --config or
---variant are fixed: they are left out of the search space. A configuration that does not fit in memory
-(MemoryBudgetExceeded, or a CUDA out-of-memory error) is retried once at half the batch size; one that
-still does not fit, or diverges, scores 0.
+tune runs DEHB over build_search_space(): the square stage's and the readout's sizes, z's size, whether to
+unpool and how, the next-position predictor's size, the learning rate, the batch size, SIGReg's weight and
+how fast the two curricula go (SEARCH_DIMENSIONS). Each evaluation trains from scratch on `fidelity`
+thousand positions, at a constant learning rate after the warm-up, and reports its exam loss (lower is
+better): the loss terms graded against the board and the rules, measured the same way for every run. Not
+LiDAR, which went the other way from everything else we measured, and not the whole training loss: its
+prediction terms are graded against what the encoder itself makes, so an encoder that keeps less scores
+better on them. For the same reason the search does not vary the heads or the loss weights. Values given
+with --config or --variant are fixed: they are left out of the search space. Every evaluation runs in a
+process of its own. One that does not fit in memory is tried again at half the batch size; one that never
+fits, is not a valid configuration, diverges or crashes scores FAILED. The search writes its state after
+every evaluation and keeps the checkpoint of the one under way when stopped, so nothing is lost.
+<out>/best_config.json holds the best of the longest runs and the configuration it ran: train --config
+takes it as it is.
 """
 from __future__ import annotations
 
@@ -113,7 +129,21 @@ class RunConfig:
     memory_check_every: int = 100                    # also check the budget every this many steps (0: only at step 3)
     cache_release_fraction: float = 0.7              # hand the allocator's unused cache back to the GPU whenever the
                                                      # reserved memory passes this fraction of the card (0: never)
-    objective_metric: str = "online_lidar"           # what the DEHB objective reports from the final evaluation
+    exam: bool = False                               # every evaluation also sits the exam (see exam()): the heads'
+                                                     # losses with the whole rollout and every threat ply at full
+                                                     # weight, whatever the curricula have reached
+    exam_positions: int = 2_048                      # validation positions the exam is set on (the same for every run)
+    exam_batch_size: int = 128                       # and how many are graded at once (the same for every run, so the
+                                                     # exam does not depend on the training batch size)
+    exam_workers: int = 8                            # loader processes for the exam (its positions' threat labels are
+                                                     # searched on the spot); 0: in the main process
+    eager_rollouts: bool = False                     # batches always carry the full rollout and the trainer uses as much
+                                                     # as the curriculum has reached, instead of restarting the loader
+                                                     # every time the curriculum adds a move
+    compact_batches: bool = True                     # the loaders hand the graphs over without what every chess graph
+                                                     # repeats (labyrinth_data.CompactGraphs): the same batches on the
+                                                     # GPU, a fraction of the memory kept ready on the way there
+    prefetch_factor: int = 4                         # batches each loader process keeps ready
     max_consecutive_skips: int = 50
     probe_positions: int = 8_000                     # positions per probe set, probed at every evaluation (0: no probes)
     probe_views: Tuple[str, ...] = ("z", "token_mean", "pre_transformer_mean")   # see probe_labyrinth.VIEWS
@@ -121,6 +151,8 @@ class RunConfig:
     probe_puzzles: Optional[str] = None              # lichess_db_puzzle.csv.zst: puzzle themes (loading takes ~1 min)
     grad_terms_every: int = 200                      # per-term gradient norms every this many steps (0: never)
     snapshot_first: int = 250                        # snapshots at step 0, this, twice this, ... (0: none)
+    snapshot_every: int = 0                          # and at every multiple of this (0: only the doubling ones): a long
+                                                     # run's doubling snapshots grow hours apart
     threat_db: Optional[str] = "minotaur_reach.db"   # the labels database (reach_labeler.py), for the legal-threat head
     threat_compute: bool = True                      # search the positions it does not hold on the spot (needs the
                                                      # compiled search, build_fast_reach.py); False: leave them ungraded
@@ -204,6 +236,67 @@ def evaluate(model: lje.LabyrinthJEPA, eval_fens: List[str], val_loader: Optiona
     return metrics
 
 
+# The loss terms graded against the board and the rules of chess (not against the target encoder's own output)
+BOARD_TERMS = ("count", "legal", "decode", "zlegal", "zthreat")
+EXAM_SEED = 20261120             # the exam's masks, moves and unpooling draws: the same for every run and seed
+
+
+@torch.no_grad()
+def exam(model: lje.LabyrinthJEPA, loader: ld.JEPALoader, device: torch.device) -> Dict[str, float]:
+    """
+    The exam: the heads' losses on fixed validation positions, with the whole rollout (rollout_max_steps moves,
+    every one of them graded, each counting the same) and every threat ply at full weight, whatever the run's
+    curricula have reached and whichever steps it trains on. So two runs' exams compare whatever their
+    curricula, batch sizes and learning rates: a run cannot look better by keeping its task easy.
+
+      exam_loss            the sum of the loss terms graded against the board (BOARD_TERMS), each at its training
+                           weight: the part of the training loss an encoder cannot lower by keeping less. Lower
+                           is better; this is what the search minimizes.
+      exam_loss_<term>     each of those terms
+      exam_<score>         the heads' scores (boards decoded exactly, threat cells wrong, ...), as in training
+      exam_latent_<term>   the prediction losses graded against the target encoder (mask, next, zpred), for the
+                           record only: they depend on what the encoder itself makes, so they do not compare
+                           between encoders
+    loader: validation positions with the full rollout as targets (train() builds it: every run the same
+    positions, masks and moves).
+    """
+    config = model.config
+    was_training = model.training
+    model.eval()
+    loader.set_epoch(0)
+    loader.set_rollout_steps(config.rollout_max_steps, None)
+    rollout_weights = [1.0] * config.rollout_max_steps
+    threat_weights = [1.0] * (config.zthreat_plies + 1) if config.uses_threats else None
+    gen = torch.Generator(device=device).manual_seed(EXAM_SEED)
+    sums: Dict[str, float] = {"exam_loss": 0.0}
+    n = 0
+    for batch in loader:
+        out = model.losses(batch.to(device), rng=gen, rollout_weights=rollout_weights, threat_weights=threat_weights)
+        for name, value in out.terms.items():
+            if name.startswith(BOARD_TERMS):
+                sums["exam_loss"] += float(value)
+                sums[f"exam_loss_{name}"] = sums.get(f"exam_loss_{name}", 0.0) + float(value)
+            elif name in ("mask", "next", "zpred"):
+                sums[f"exam_latent_{name}"] = sums.get(f"exam_latent_{name}", 0.0) + float(value)
+        for key, value in out.stats.items():
+            if key.startswith(("count_", "legal_", "decode_", "zlegal_", "zthreat_")):
+                sums[f"exam_{key}"] = sums.get(f"exam_{key}", 0.0) + value
+        n += 1
+    model.train(was_training)
+    return {k: v / max(1, n) for k, v in sums.items()}
+
+
+def exam_line(metrics: Dict[str, float]) -> str:
+    """The exam's headline scores, for the log."""
+    names = (("", "own z"), ("_fit", "own z"), ("_next", "next z"), ("_masked", "whole z"))
+    boards = [f"{label} {100 * metrics[key]:.1f}%" for key, label in
+              ((f"exam_decode{part}_exact", label) for part, label in names) if key in metrics]
+    wrong = [f"{label} {metrics[key]:.0f}" for key, label in
+             ((f"exam_zthreat{part}_wrong", label) for part, label in names) if key in metrics]
+    return "; ".join(([f"boards decoded exactly: {', '.join(boards)}"] if boards else [])
+                     + ([f"threat cells wrong a position per ply: {', '.join(wrong)}"] if wrong else []))
+
+
 EVAL_SUBSET_SEED = 20261114      # one draw for every run and seed, so evaluations compare across runs
 
 
@@ -258,7 +351,7 @@ def threat_labels(config: lje.JEPAConfig, run: RunConfig, batch_size: int,
         return None
     on_steps = config.zthreat_next_weight > 0 or (config.zthreat_judges_predictions and config.zhead_fit == "target")
     source = ld.ThreatLabels(config.zthreat_plies, run.threat_db, compute=run.threat_compute,
-                             rollout_steps=2 if on_steps else 0)
+                             rollout_steps=config.zthreat_rollout_steps if on_steps else 0)
     if source.connection is None and not source.searches:
         raise ValueError(f"the legal-threat head needs labels: there is no labels database at {run.threat_db!r} "
                          f"(reach_labeler.py makes one; --threat-db says where it is) and the compiled search "
@@ -403,12 +496,26 @@ def _snapshot(folder: str, model, step: int, config, run) -> None:
     os.replace(path + ".tmp", path)
 
 
-def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = print) -> Dict[str, Any]:
+def _trim_rollout(batch: ld.JEPABatch, steps: int, targets: Optional[Sequence[int]]) -> None:
+    """(eager rollouts) Cut a batch's rollout to its first `steps` moves, and take the target graphs (and
+    with them the labels) off the moves that are not among `targets` (None: every move is one)."""
+    rollout = batch.rollout[:steps]
+    if targets is not None:
+        graded = set(targets)
+        rollout = [step if k in graded else replace(step, graphs=None, legal=None, threats=None)
+                   for k, step in enumerate(rollout, start=1)]
+    batch.rollout = rollout
+
+
+def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = print,
+          stop: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
     """
     One training run. Returns {"final": metrics at the end, "probe": the last probe averages (or None),
-    "best_lidar", "steps", "history"}. With run.out_dir set, writes run_config.json, history.jsonl,
-    probes.csv, last.pt, best.pt and snapshots/ there, and resumes from last.pt when run.resume is set
-    and it exists.
+    "best_lidar", "steps", "history", "stopped"}. With run.out_dir set, writes run_config.json,
+    history.jsonl, probes.csv, last.pt, best.pt and snapshots/ there, and resumes from last.pt when
+    run.resume is set and it exists.
+    stop: asked before every step; when it answers True the run saves last.pt and returns at once, with
+    "stopped" set and no final evaluation. Running the same command again carries on from there.
     """
     config.validate()
     device = torch.device(run.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -439,7 +546,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             model.load_state_dict(ckpt["model"])
             opt.load_state_dict(ckpt["optimizer"])
             sched.load_state_dict(ckpt["scheduler"])
-            gen.set_state(ckpt["generator"])
+            gen.set_state(ckpt["generator"].cpu())     # (loaded onto the run's device with the rest; a state is kept on the CPU)
             step, best_lidar = ckpt["step"], ckpt["best_lidar"]
             log(f"resumed from {paths['last.pt']} at step {step}")
 
@@ -457,7 +564,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     loader = ld.JEPALoader(run.cache_dir, "train", batch_size, num_workers=run.num_workers,
                            mask_config=config.mask_config(), seed=run.seed, indices=indices,
                            pin_memory=device.type == "cuda", drop_last=True, siblings=config.rollout_siblings,
-                           threats=threats)
+                           threats=threats, compact=run.compact_batches, prefetch_factor=run.prefetch_factor)
     if len(loader) == 0:
         raise ValueError(f"the training set ({len(loader.dataset)} positions) is smaller than one batch ({batch_size})")
     val_dataset = ld.PositionDataset(run.cache_dir, "val")
@@ -466,7 +573,15 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     n_val = len(val_rows)
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
                                seed=run.seed + 1, shuffle=False, indices=val_rows,
-                               siblings=config.rollout_siblings, threats=threats) if n_val else None
+                               siblings=config.rollout_siblings, threats=threats,
+                               compact=run.compact_batches) if n_val else None
+    exam_loader = None
+    if run.exam:
+        # The same positions, masks and moves for every run, whatever its seed, batch size and mask settings
+        exam_rows = random.Random(EVAL_SUBSET_SEED).sample(range(len(val_dataset)), min(run.exam_positions, len(val_dataset)))
+        exam_loader = ld.JEPALoader(run.cache_dir, "val", run.exam_batch_size, num_workers=run.exam_workers,
+                                    mask_config=ld.MaskConfig(), seed=EXAM_SEED, shuffle=False, indices=exam_rows,
+                                    threats=threats, compact=run.compact_batches, prefetch_factor=2)
 
     # Evaluation and probes encode no more positions at once than a training step does: the unpool
     # variant's enlarged graphs make a few hundred positions at once far heavier than its training batch
@@ -498,7 +613,11 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     loader.resume_at((step - epoch * len(loader)) * batch_size)
     epoch_start_step = epoch * len(loader)
     rollout_weights = lje.rollout_schedule(config, step * batch_size)
-    loader.set_rollout_steps(len(rollout_weights), lje.rollout_target_steps(config, len(rollout_weights)))
+    if run.eager_rollouts:
+        # Every batch carries the whole rollout, every move a target; each step uses what the curriculum has reached
+        loader.set_rollout_steps(config.rollout_max_steps, None)
+    else:
+        loader.set_rollout_steps(len(rollout_weights), lje.rollout_target_steps(config, len(rollout_weights)))
     threat_weights = lje.threat_schedule(config, step * batch_size) if threats is not None else None
     batches = iter(loader)
     skips = 0
@@ -524,6 +643,10 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             log(f"[{step:>7}] probes took {time.perf_counter() - t0:.0f}s")
         metrics = evaluate(model, eval_fens, val_loader, run, device, rollout_weights, encode_batch=batch_size,
                            threat_weights=threat_weights)
+        if exam_loader is not None:
+            t0 = time.perf_counter()
+            metrics.update(exam(model, exam_loader, device))
+            metrics["exam_seconds"] = time.perf_counter() - t0
         if device.type == "cuda":
             torch.cuda.empty_cache()           # hand evaluation's odd-sized blocks back before training resumes
         record({"step": step, "eval": metrics})
@@ -532,6 +655,9 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             f"online_rankme_centered={metrics['online_rankme_centered']:.1f}  "
             f"self_consistency={metrics['self_consistency']:.3f}  "
             f"val_mask={metrics.get('val_loss_mask', float('nan')):.4f}  val_next={metrics.get('val_loss_next', float('nan')):.4f}")
+        if "exam_loss" in metrics:
+            log(f"[{step:>7}] exam  loss={metrics['exam_loss']:.4f}  " + exam_line(metrics)
+                + f"  ({metrics['exam_seconds']:.0f}s)")
         if metrics["lidar"] > best_lidar:
             best_lidar = metrics["lidar"]
             if paths:
@@ -539,13 +665,18 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
         return metrics
 
     final: Dict[str, float] = {}
+    stopped = False
     while step < run.total_steps:
+        if stop is not None and stop():
+            stopped = True
+            break
         new_weights = lje.rollout_schedule(config, step * batch_size)
         if len(new_weights) != len(rollout_weights):
-            # The curriculum adds a move: continue this epoch with longer rollouts, without repeating positions
-            loader.set_rollout_steps(len(new_weights), lje.rollout_target_steps(config, len(new_weights)))
-            loader.resume_at((step - epoch_start_step) * batch_size)
-            batches = iter(loader)
+            if not run.eager_rollouts:
+                # The curriculum adds a move: continue this epoch with longer rollouts, without repeating positions
+                loader.set_rollout_steps(len(new_weights), lje.rollout_target_steps(config, len(new_weights)))
+                loader.resume_at((step - epoch_start_step) * batch_size)
+                batches = iter(loader)
             log(f"[{step:>7}] rollout curriculum: now predicting {len(new_weights)} move(s) ahead")
         rollout_weights = new_weights
         if threats is not None:
@@ -561,9 +692,15 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             loader.set_epoch(epoch)
             batches = iter(loader)
             continue
+        if run.eager_rollouts:
+            _trim_rollout(batch, len(rollout_weights), lje.rollout_target_steps(config, len(rollout_weights)))
         batch = batch.to(device, non_blocking=True)
         model.train()
-        out = model.losses(batch, rng=gen, rollout_weights=rollout_weights, threat_weights=threat_weights)
+        # The heads' scores (boards decoded, threats found, ...) only on the steps that are logged: scoring
+        # takes a good part of a small batch's step and changes nothing in the losses
+        logged = (step + 1) % run.log_every == 0 or step + 1 == run.total_steps
+        out = model.losses(batch, rng=gen, rollout_weights=rollout_weights, threat_weights=threat_weights,
+                           with_scores=logged)
         opt.zero_grad(set_to_none=True)
         if not torch.isfinite(out.total):
             skips += 1
@@ -655,14 +792,19 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             run_eval()
         if paths and run.checkpoint_every and step % run.checkpoint_every == 0:
             _save(paths["last.pt"], model, opt, sched, step, best_lidar, gen, config, run)
-        if paths and (snapshot_due(step, run.snapshot_first) or (run.snapshot_first and step == run.total_steps)):
+        if paths and (snapshot_due(step, run.snapshot_first) or (run.snapshot_first and step == run.total_steps)
+                      or (run.snapshot_every and step % run.snapshot_every == 0)):
             _snapshot(paths["snapshots"], model, step, config, run)
 
-    final = run_eval()
+    if stopped:
+        log(f"[{step:>7}] stopped on request" + (f": saved {paths['last.pt']}; the same command carries on from here"
+                                                  if paths else ""))
+    else:
+        final = run_eval()
     if paths:
         _save(paths["last.pt"], model, opt, sched, step, best_lidar, gen, config, run)
     result = {"final": final, "probe": last_probe, "best_lidar": best_lidar, "steps": step, "batch_size": batch_size,
-              "history": history}
+              "history": history, "stopped": stopped}
     del model, opt
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -670,7 +812,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
 
 
 # ##### ##### ##### ##### #####
-#       DEHB
+#       The search (DEHB)
 
 
 def _release_gpu_memory() -> None:
@@ -680,47 +822,331 @@ def _release_gpu_memory() -> None:
         torch.cuda.empty_cache()
 
 
-def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
-                   train_fn: Callable[..., Dict[str, Any]] = train, log: Callable[[str], None] = print):
+class SearchStopped(Exception):
+    """A stop was asked for in the middle of an evaluation. Its checkpoint is kept, to carry on from."""
+
+
+class EvaluationCrashed(RuntimeError):
+    """A training run in a process of its own ended with an error that is not about memory or divergence."""
+
+
+def _is_out_of_memory(error: BaseException) -> bool:
+    """A GPU out of memory: PyTorch's allocator says so with OutOfMemoryError, a CUDA library that could not
+    get its own workspace with some other RuntimeError ("CUDA error: out of memory")."""
+    return isinstance(error, torch.cuda.OutOfMemoryError) or \
+        (isinstance(error, RuntimeError) and "out of memory" in str(error).lower())
+
+
+def train_in_subprocess(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = print,
+                        stop: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
     """
-    The DEHB objective: config dict and fidelity (thousands of training positions) -> base_run's
-    objective_metric (the online encoder's LiDAR). Fidelity counts positions rather than steps so
-    configurations with different batch sizes get the same amount of data. fixed: JEPAConfig values every
-    evaluation shares (e.g. z_dim, or a token_variant); they override anything sampled.
+    train(config, run) in a process of its own, as a search runs its evaluations: a run that exhausts the
+    GPU can leave CUDA unusable for the rest of its process, and a search is a hundred runs, some of them
+    meant to find out what fits. The run needs run.out_dir: the job goes in as <out_dir>/evaluation.json and
+    the outcome comes back as <out_dir>/evaluation_result.json. Returns what train returns (of the history,
+    only the rates), and raises what train raises: MemoryBudgetExceeded for any way of running out of memory,
+    TrainingDiverged, and EvaluationCrashed for anything else.
+    stop: asked twice a second; when it answers True the run is told through its stop file, saves and returns.
+    """
+    import subprocess
+    import sys
+    if not run.out_dir:
+        raise ValueError("a run in a process of its own needs an out_dir")
+    os.makedirs(run.out_dir, exist_ok=True)
+    result_path = os.path.join(run.out_dir, "evaluation_result.json")
+    if os.path.exists(result_path):
+        os.remove(result_path)
+    with open(os.path.join(run.out_dir, "evaluation.json"), "w") as f:
+        json.dump({"jepa_config": config.to_dict(), "run_config": run.to_dict()}, f)
+    process = subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), "evaluate", run.out_dir])
+    told = False
+    while process.poll() is None:
+        if stop is not None and not told and stop():
+            open(os.path.join(run.out_dir, "stop"), "w").close()
+            told = True
+        time.sleep(0.5)
+    if not os.path.exists(result_path):
+        raise EvaluationCrashed(f"the run's process ended with exit code {process.returncode} and no result")
+    with open(result_path) as f:
+        outcome = json.load(f)
+    if outcome["status"] == "memory":
+        raise MemoryBudgetExceeded(outcome["error"])
+    if outcome["status"] == "diverged":
+        raise TrainingDiverged(outcome["error"])
+    if outcome["status"] != "done":
+        raise EvaluationCrashed(outcome["error"])
+    return outcome["result"]
+
+
+def _evaluate_job(folder: str) -> int:
+    """The other end of train_in_subprocess: run the job in `folder` and write its outcome there."""
+    with open(os.path.join(folder, "evaluation.json")) as f:
+        job = json.load(f)
+    config = lje.JEPAConfig.from_dict(job["jepa_config"])
+    run = RunConfig(**{**job["run_config"], "probe_views": tuple(job["run_config"]["probe_views"])})
+    try:
+        result = train(config, run, stop=stop_switch(folder, keys=False))
+        outcome: Dict[str, Any] = {"status": "done", "result": {
+            "final": result["final"], "steps": result["steps"], "batch_size": result["batch_size"],
+            "stopped": result["stopped"],
+            "history": [{"positions_per_s": h["positions_per_s"]} for h in result["history"] if "positions_per_s" in h]}}
+    except TrainingDiverged as error:
+        outcome = {"status": "diverged", "error": str(error)}
+    except Exception as error:
+        if isinstance(error, MemoryBudgetExceeded) or _is_out_of_memory(error):
+            outcome = {"status": "memory", "error": f"{type(error).__name__}: {error}"}
+        else:
+            import traceback
+            traceback.print_exc()
+            outcome = {"status": "error", "error": f"{type(error).__name__}: {error}"}
+    path = os.path.join(folder, "evaluation_result.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(outcome, f)
+    os.replace(path + ".tmp", path)
+    return 0
+
+
+# What the search varies: (name, kind, values, None or (the setting it depends on, the value that needs)).
+# kind "choice": one of the listed values (numbers in rising order, so neighbours in the search are neighbours
+# in size); "log" / "float": a number between the two, on a log or a plain scale. A name that is a JEPAConfig
+# field goes into the configuration as it is; the others (SEARCH_ONLY) are the search's own, resolved by
+# resolve_search. The heads are NOT here, nor are the loss weights: the exam is the heads' losses, so a
+# search that could enlarge the heads or reweigh the terms would improve its score without improving z.
+SEARCH_DIMENSIONS: Tuple[Tuple[str, str, Any, Optional[Tuple[str, Any]]], ...] = (
+    # the square stage (gat_style "concat": every layer's per-square MLP is gat_growth times as wide as its input)
+    ("gat_layers", "choice", (2, 3, 4), None),
+    ("gat_dim", "choice", (64, 128, 192), None),
+    ("gat_heads", "choice", (2, 4, 8), None),
+    ("gat_growth", "choice", (1.0, 1.25, 1.5), None),
+    ("gat_mlp_layers", "choice", (1, 2, 3), None),
+    # the square tokens, the readout MLP and z
+    ("d_model", "choice", (128, 256, 384), None),
+    ("readout_hidden", "choice", (1024, 2048, 4096), None),
+    ("readout_layers", "choice", (1, 2, 3), None),
+    ("z_dim", "choice", (512, 1024, 2048), None),
+    # unpooling: whether, how many layers, how wide its MLPs and its nodes, how hard its decisions are trained
+    ("token_variant", "choice", ("squares", "unpool"), None),
+    ("unpool_layers", "choice", (1, 2, 3), ("token_variant", "unpool")),
+    ("unpool_hidden", "choice", (64, 128, 256), ("token_variant", "unpool")),
+    ("unpool_dim", "choice", (64, 128), ("token_variant", "unpool")),
+    ("rl_coef", "log", (1e-3, 1e-1), ("token_variant", "unpool")),
+    # the next-position predictor, which has to carry a rollout to its last move
+    ("next_hidden", "choice", (1024, 2048), None),
+    ("next_layers", "choice", (2, 3, 4), None),
+    # training
+    ("lr", "log", (1e-4, 1e-3), None),
+    ("batch_size", "choice", (64, 128, 256), None),
+    ("sigreg_weight", "log", (0.002, 0.05), None),
+    ("rollout_curriculum", "float", (0.0, 0.8), None),
+    ("threat_curriculum", "float", (0.0, 0.5), None),
+)
+# The search's own settings (not JEPAConfig fields):
+#   batch_size           positions a step. Every evaluation gets the same number of POSITIONS, so a smaller batch
+#                        takes more steps on the same data
+#   rollout_curriculum   the share of the run after which the rollout has grown to its full length (0: full
+#                        length from the first step). A share, not a number of positions: every evaluation, short
+#                        or long, then finishes its curriculum and is examined on what it trained on
+#   threat_curriculum    the same for the legal-threat head's plies
+SEARCH_ONLY = ("batch_size", "rollout_curriculum", "threat_curriculum")
+SIGREG_BATCH = 256              # sigreg_weight and ema_start are given for this batch size (see resolve_search)
+WARMUP_POSITIONS = 256_000      # the learning rate's warm-up, in positions (1,000 steps of 256), at most a tenth of a run
+FAILED = 1e3                    # the exam loss given to a configuration that does not fit, is not valid or diverges
+# The largest batch an unpooling configuration starts at, by its number of unpooling layers: the enlarged graphs
+# take several times the memory of the squares alone, and finding that out by running out of it costs minutes.
+# (What fits a 16 GB card at the smallest unpooling sizes; the memory guard still halves the batch when needed.)
+UNPOOL_MAX_BATCH = {1: 128, 2: 64, 3: 32}
+
+
+def build_search_space(seed: int = 0, fixed: Optional[Dict[str, Any]] = None):
+    """
+    The DEHB search space: SEARCH_DIMENSIONS without the settings `fixed` gives a value for. A setting that
+    only applies under one value of another (unpool_layers under token_variant "unpool") is left out when
+    the other is fixed to something else, and kept unconditionally when it is fixed to that value.
+    """
+    import ConfigSpace as CS
+    fixed = fixed or {}
+    cs = CS.ConfigurationSpace(seed=seed)
+    kept: Dict[str, Tuple[Any, Optional[Tuple[str, Any]]]] = {}
+    for name, kind, values, condition in SEARCH_DIMENSIONS:
+        if name in fixed:
+            continue
+        if condition is not None and condition[0] in fixed and fixed[condition[0]] != condition[1]:
+            continue
+        if kind == "choice":
+            hp = CS.CategoricalHyperparameter(name, choices=list(values))
+        else:
+            hp = CS.UniformFloatHyperparameter(name, lower=values[0], upper=values[1], log=kind == "log")
+        cs.add_hyperparameter(hp)
+        kept[name] = (hp, condition)
+    for hp, condition in kept.values():
+        if condition is not None and condition[0] in kept:
+            cs.add_condition(CS.EqualsCondition(hp, kept[condition[0]][0], condition[1]))
+    return cs
+
+
+def resolve_search(point: Dict[str, Any], positions: int,
+                   batch_size: Optional[int] = None) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """
+    A point of the search space (with the fixed values merged in) -> (JEPAConfig values, {"batch_size",
+    "warmup_steps"}) for a run of `positions` training positions. batch_size: use this one instead of the
+    point's (a configuration that did not fit is tried again at half).
+
+      * the curricula's shares of the run become stage lengths in positions;
+      * sigreg_weight is taken as the weight at SIGREG_BATCH positions a batch and scaled by SIGREG_BATCH /
+        batch size: SIGReg's statistic is multiplied by the batch size, so its pull on one position does not
+        shrink as the batch grows, while that of the other losses (means over the batch) does. Unscaled, a
+        smaller batch would also be a weaker regularizer;
+      * ema_start is taken as the target encoder's momentum at SIGREG_BATCH positions a batch too, and set so
+        that the target averages over the same number of POSITIONS at any batch size (a quarter of the batch:
+        four times the steps, each moving the target a quarter as far);
+      * the warm-up is WARMUP_POSITIONS positions, whatever the batch size;
+      * an unpooling configuration's batch is at most UNPOOL_MAX_BATCH for its number of layers.
+    So the batch size changes how many gradient steps the same data makes, and nothing else on the way.
+    """
+    point = {k: (v.item() if hasattr(v, "item") else v) for k, v in point.items()}
+    values = {k: v for k, v in point.items() if k not in SEARCH_ONLY}
+    for name, _, _, condition in SEARCH_DIMENSIONS:
+        # a setting that only applies under another's value (a fixed unpool_dim, say) is left at its default
+        # where it does not apply: the configuration is then valid whichever way the other went
+        if condition is not None and name in values and lje.JEPAConfig.from_dict(values).to_dict()[condition[0]] != condition[1]:
+            del values[name]
+    base = lje.JEPAConfig.from_dict(values)
+    batch = int(batch_size or point.get("batch_size") or DEFAULT_BATCH_SIZE[base.token_variant])
+    if base.uses_unpool and not batch_size:
+        batch = min(batch, UNPOOL_MAX_BATCH.get(base.unpool_layers, min(UNPOOL_MAX_BATCH.values())))
+    if "rollout_curriculum" in point:
+        stages = base.rollout_max_steps - base.rollout_start_steps
+        values["rollout_stage_positions"] = int(round(point["rollout_curriculum"] * positions / stages)) if stages > 0 else 0
+    if "threat_curriculum" in point:
+        stages = base.zthreat_plies - base.zthreat_start_plies
+        values["zthreat_stage_positions"] = int(round(point["threat_curriculum"] * positions / stages)) if stages > 0 else 0
+    values["sigreg_weight"] = base.sigreg_weight * SIGREG_BATCH / batch
+    values["ema_start"] = 1.0 - (1.0 - base.ema_start) * batch / SIGREG_BATCH
+    return values, {"batch_size": batch, "warmup_steps": max(1, round(WARMUP_POSITIONS / batch))}
+
+
+def _plain(value: Any) -> Any:
+    """Numbers as plain Python ones (rounded, so a value read back from a file compares equal)."""
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in sorted(value.items())}
+    if hasattr(value, "item"):
+        value = value.item()
+    return round(value, 12) if isinstance(value, float) else value
+
+
+def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
+                   train_fn: Callable[..., Dict[str, Any]] = train, log: Callable[[str], None] = print,
+                   work_dir: Optional[str] = None, stop: Optional[Callable[[], bool]] = None,
+                   min_batch_size: int = 16, retry_wait: float = 0.0):
+    """
+    The DEHB objective: a point of the search space and a fidelity (thousands of training positions) -> the
+    exam loss of a run trained from scratch on that many positions (exam(): lower is better). Fidelity counts
+    positions, not steps, so every batch size gets the same data. fixed: settings every evaluation shares; they
+    override anything sampled.
+
+    Every evaluation runs at a constant learning rate after the warm-up, as a long run will, and sits the exam
+    once, at its end. One that does not fit in memory is tried again at half the batch size (after retry_wait
+    seconds), down to min_batch_size; one that never fits, is not a valid configuration, diverges or fails
+    some other way gets FAILED. train_fn: train, or train_in_subprocess to give every evaluation a process
+    of its own.
+
+    work_dir: where the evaluation under way keeps its checkpoint (<work_dir>/current). stop: passed to the
+    training run; when it stops a run, the checkpoint stays and SearchStopped is raised, and the next call
+    with the same point and fidelity carries on from the checkpoint instead of starting over.
     """
     from dehb_helper import ObjectiveResult
+    import shutil
+
+    current = os.path.join(work_dir, "current") if work_dir else None
+    crashes = {"in a row": 0}
 
     def objective(cfg: Dict[str, Any], fidelity: float) -> ObjectiveResult:
-        config = lje.JEPAConfig.from_dict({**cfg, **(fixed or {})})
-        batch_size = base_run.batch_size or DEFAULT_BATCH_SIZE[config.token_variant]
         positions = int(round(fidelity * 1000))
-        for attempt in range(2):
-            run = replace(base_run, out_dir=None, resume=False, eval_every=0, checkpoint_every=0,
-                          batch_size=batch_size, total_steps=max(1, positions // batch_size),
-                          probe_positions=0, grad_terms_every=0, snapshot_first=0)
+        point = _plain({**cfg, **(fixed or {})})
+        job = {"point": point, "positions": positions}
+        batch_size: Optional[int] = None if "batch_size" in point else base_run.batch_size   # (the point's, if it has one)
+        resume = False
+        if current:
+            job_path = os.path.join(current, "job.json")
+            if os.path.exists(job_path) and os.path.exists(os.path.join(current, "last.pt")):
+                with open(job_path) as f:
+                    kept = json.load(f)
+                if kept.get("point") == point and kept.get("positions") == positions:
+                    resume, batch_size = True, kept["batch_size"]       # the evaluation that was stopped
+            if not resume:
+                shutil.rmtree(current, ignore_errors=True)
+
+        started = time.perf_counter()
+        while True:
+            try:
+                values, how = resolve_search(point, positions, batch_size)
+                config = lje.JEPAConfig.from_dict(values)
+                config.validate()
+            except ValueError as e:
+                return ObjectiveResult(metric=FAILED, info={"failed": "invalid", "error": str(e)})
+            batch_size = how["batch_size"]
+            if current:
+                os.makedirs(current, exist_ok=True)
+                with open(os.path.join(current, "job.json"), "w") as f:
+                    json.dump({**job, "batch_size": batch_size}, f)
+            run = replace(base_run, out_dir=current, resume=resume, batch_size=batch_size,
+                          total_steps=max(1, positions // batch_size), warmup_steps=how["warmup_steps"],
+                          min_lr_fraction=1.0, eval_every=0, checkpoint_every=0, val_loss_batches=0,
+                          probe_positions=0, grad_terms_every=0, snapshot_first=0, snapshot_every=0,
+                          exam=True, eager_rollouts=True)
             failure = None
             try:
-                result = train_fn(config, run, log=log)
-            except (MemoryBudgetExceeded, torch.cuda.OutOfMemoryError) as e:
-                failure = f"{type(e).__name__}: {e}"
+                result = train_fn(config, run, log=log, stop=stop)
             except TrainingDiverged as e:
-                return ObjectiveResult(metric=0.0, info={"failed": "diverged", "error": str(e)})
+                return ObjectiveResult(metric=FAILED, info={"failed": "diverged", "error": str(e), "batch_size": batch_size})
+            except EvaluationCrashed as e:
+                # One odd configuration must not end a search; the same failure three times running is not a
+                # configuration's fault (a missing file, a bug), and scoring on would only waste the search
+                crashes["in a row"] += 1
+                log(f"  the evaluation failed: {e}")
+                if crashes["in a row"] >= 3:
+                    raise
+                return ObjectiveResult(metric=FAILED, info={"failed": "crashed", "error": str(e), "batch_size": batch_size})
+            except RuntimeError as e:
+                if not (isinstance(e, MemoryBudgetExceeded) or _is_out_of_memory(e)):
+                    raise
+                failure = f"{type(e).__name__}: {e}"
+            crashes["in a row"] = 0
             if failure is not None:
                 _release_gpu_memory()      # outside the except block, once the failed run's frames are gone
+                time.sleep(retry_wait)     # the driver takes a moment to hand a dead run's memory back
                 log(f"  does not fit at batch size {batch_size}: {failure}")
-                if attempt == 0 and batch_size >= 16:
-                    batch_size //= 2
+                if current:
+                    shutil.rmtree(current, ignore_errors=True)
+                if batch_size // 2 >= min_batch_size:
+                    batch_size, resume = batch_size // 2, False
                     continue
-                return ObjectiveResult(metric=0.0, info={"failed": "memory", "batch_size": batch_size})
+                return ObjectiveResult(metric=FAILED, info={"failed": "memory", "batch_size": batch_size})
+            if result.get("stopped"):
+                raise SearchStopped()
+            if current:                    # done: nothing of it is to be taken up again
+                shutil.rmtree(current, ignore_errors=True)
             final = result["final"]
-            return ObjectiveResult(metric=float(final[base_run.objective_metric]), info={
-                "target_lidar": final.get("lidar"),
-                "rankme": final["rankme"], "rankme_centered": final.get("rankme_centered"),
-                "online_lidar": final.get("online_lidar"),
-                "self_consistency": final["self_consistency"],
-                "val_loss_mask": final.get("val_loss_mask"), "val_loss_next": final.get("val_loss_next"),
-                "batch_size": batch_size, "steps": result["steps"]})
-        return ObjectiveResult(metric=0.0, info={"failed": "memory"})
+            if not math.isfinite(final.get("exam_loss", math.nan)):
+                return ObjectiveResult(metric=FAILED, info={"failed": "no exam loss", "batch_size": batch_size,
+                                                            "error": "the run has no finite exam loss (no head graded "
+                                                                     "against the board, or the exam went non-finite)"})
+            rates = [h["positions_per_s"] for h in result["history"] if "positions_per_s" in h]
+            info: Dict[str, Any] = {key: final[key] for key in sorted(final) if key.startswith("exam_loss")}
+            info.update({key: final[key] for key in sorted(final) if key.startswith("exam_") and key.endswith(
+                ("_exact", "_wrong", "_close", "_found", "_rejected"))})
+            # (and how decoding the predicted next z holds up along the rollout, move by move)
+            info.update({key: final[key] for key in sorted(final) if key.startswith("exam_decode_next_exact_")})
+            info.update({
+                "online_lidar": final.get("online_lidar"), "online_rankme_centered": final.get("online_rankme_centered"),
+                "self_consistency": final.get("self_consistency"),
+                "batch_size": batch_size, "steps": result["steps"], "positions": positions,
+                "positions_per_s": sorted(rates)[len(rates) // 2] if rates else None,
+                "seconds": time.perf_counter() - started,
+                # how to run this configuration again: train --config <the search's best_config.json> reads it
+                "run": {"jepa_config": config.to_dict(), "batch_size": batch_size, "warmup_steps": how["warmup_steps"]},
+            })
+            return ObjectiveResult(metric=float(final["exam_loss"]), info=info)
 
     return objective
 
@@ -730,12 +1156,54 @@ def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
 
 
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
-    """A JEPAConfig dict, a DEHB best_config.json ({"best_config": {...}}), or a run_config.json."""
+    """
+    JEPAConfig values from a file: a plain dict of them, a run's run_config.json ({"jepa_config": {...}}), or
+    a search's best_config.json (the configuration its best evaluation ran, curricula and all).
+    """
     if not path:
         return {}
     with open(path) as f:
         data = json.load(f)
-    return data.get("best_config") or data.get("jepa_config") or data
+    return (data.get("best_info") or {}).get("run", {}).get("jepa_config") or data.get("best_config") \
+        or data.get("jepa_config") or data
+
+
+def _load_run_settings(path: Optional[str]) -> Dict[str, int]:
+    """The batch size and warm-up a configuration file was run with, where it says: a search's
+    best_config.json (both), a run's run_config.json (the batch size)."""
+    if not path:
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    found = (data.get("best_info") or {}).get("run") or data
+    return {key: int(found[key]) for key in ("batch_size", "warmup_steps") if isinstance(found.get(key), (int, float))}
+
+
+def stop_switch(folder: Optional[str], log: Callable[[str], None] = print, keys: bool = True) -> Callable[[], bool]:
+    """
+    A run's stop switch, as the labelling programs have: it answers True once q has been pressed in this
+    console window (only this one: typing elsewhere is safe; keys=False: it does not listen), or once a file
+    named "stop" appears in `folder` (for a run started without a console; the file is removed when seen).
+    """
+    import threading
+    event = threading.Event()
+    if keys:
+        from reach_labeler import watch_for_q
+        watch_for_q(event)
+    stop_file = os.path.join(folder, "stop") if folder else None
+    said = False
+
+    def stop() -> bool:
+        nonlocal said
+        if stop_file and not event.is_set() and os.path.exists(stop_file):
+            os.remove(stop_file)
+            event.set()
+        if event.is_set() and not said:
+            said = True
+            log("stop requested: saving and closing...")
+        return event.is_set()
+
+    return stop
 
 
 def _read_history(out_dir: str) -> List[Dict[str, Any]]:
@@ -803,20 +1271,36 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("train", "tune"):
         p = sub.add_parser(name)
-        p.add_argument("--config", default=None, help="JEPAConfig values (JSON), e.g. a DEHB best_config.json")
+        p.add_argument("--config", default=None,
+                       help="JEPAConfig values (JSON): a plain dict, a run's run_config.json or a search's best_config.json")
         p.add_argument("--variant", choices=lje.TOKEN_VARIANTS, default=None)
         p.add_argument("--cache", default=ld.DEFAULT_CACHE_DIR)
         p.add_argument("--batch-size", type=int, default=None)
         p.add_argument("--workers", type=int, default=8)
         p.add_argument("--max-train-positions", type=int, default=None)
         p.add_argument("--seed", type=int, default=0)
-        p.add_argument("--min-lr-fraction", type=float, default=RunConfig.min_lr_fraction,
-                       help="the cosine decays to this fraction of the peak learning rate; 1 keeps it constant after the warm-up")
+        p.add_argument("--threat-db", default=RunConfig.threat_db,
+                       help="the labels database reach_labeler.py fills, for the legal-threat head")
+        p.add_argument("--exam-workers", type=int, default=RunConfig.exam_workers,
+                       help="loader processes for the exam's positions (their threat labels are searched on the spot)")
+        p.add_argument("--no-stop-key", action="store_true",
+                       help="do not listen for q in this window (a file named 'stop' in --out still stops the run)")
     t = sub.choices["train"]
+    t.add_argument("--min-lr-fraction", type=float, default=RunConfig.min_lr_fraction,
+                   help="the cosine decays to this fraction of the peak learning rate; 1 keeps it constant after the warm-up")
+    t.add_argument("--warmup-steps", type=int, default=None,
+                   help="warm-up steps (default: what the --config file was run with, else 1,000); at most a tenth of the run")
     t.add_argument("--steps", type=int, default=20_000)
     t.add_argument("--out", default="runs/labyrinth_jepa")
     t.add_argument("--eval-every", type=int, default=2_000)
+    t.add_argument("--checkpoint-every", type=int, default=RunConfig.checkpoint_every,
+                   help="save last.pt every this many steps (a stop always saves it)")
     t.add_argument("--no-resume", action="store_true")
+    t.add_argument("--exam", action="store_true",
+                   help="every evaluation also sits the exam: the heads' losses with the whole rollout and every "
+                        "threat ply at full weight, whatever the curricula have reached")
+    t.add_argument("--eager-rollouts", action="store_true",
+                   help="batches always carry the full rollout, so the loader is not restarted when the curriculum adds a move")
     t.add_argument("--probe-db", default=None, help="minotaur_data.db: engine evaluations and best moves to probe")
     t.add_argument("--probe-puzzles", default=None, help="lichess_db_puzzle.csv.zst: puzzle themes to probe")
     t.add_argument("--probe-positions", type=int, default=8_000, help="positions per probe set (0: no probes)")
@@ -825,53 +1309,91 @@ def main() -> None:
     t.add_argument("--grad-terms-every", type=int, default=200, help="per-term gradient norms (0: never)")
     t.add_argument("--snapshot-first", type=int, default=250,
                    help="snapshots at step 0, this, twice this, ... and at the end (0: none)")
-    t.add_argument("--threat-db", default=RunConfig.threat_db,
-                   help="the labels database reach_labeler.py fills, for the legal-threat head")
+    t.add_argument("--snapshot-every", type=int, default=0, help="also a snapshot at every multiple of this (0: no)")
+    t.add_argument("--prefetch-factor", type=int, default=RunConfig.prefetch_factor,
+                   help="batches each loader process keeps ready")
     d = sub.choices["tune"]
     d.add_argument("--out", default="dehb_jepa_out")
-    d.add_argument("--fevals", type=int, default=40)
-    d.add_argument("--min-fidelity", type=float, default=30, help="thousands of training positions")
-    d.add_argument("--max-fidelity", type=float, default=810, help="thousands of training positions")
+    d.add_argument("--fevals", type=int, default=None, help="stop after this many evaluations in all (earlier starts included)")
+    d.add_argument("--hours", type=float, default=None,
+                   help="stop asking for new evaluations after this many hours of this start (the one under way finishes)")
+    d.add_argument("--max-fidelity", type=float, default=3000,
+                   help="the longest evaluations, in thousands of training positions")
+    d.add_argument("--rungs", type=int, default=4,
+                   help="how many lengths of evaluation there are: each one --eta times the one below")
+    d.add_argument("--eta", type=int, default=3, help="each rung keeps one in this many and trains them this many times longer")
+    d.add_argument("--prefetch-factor", type=int, default=2, help="batches each loader process keeps ready")
+    d.add_argument("--in-process", action="store_true",
+                   help="run the evaluations in this process instead of giving each a process of its own")
+    e = sub.add_parser("evaluate", help="(used by tune) run the evaluation whose job is in this folder")
+    e.add_argument("folder")
     args = parser.parse_args()
+    if args.command == "evaluate":
+        raise SystemExit(_evaluate_job(args.folder))
 
     values = _load_config(args.config)
+    how = _load_run_settings(args.config)
     if args.variant:
         values["token_variant"] = args.variant
-    run = RunConfig(cache_dir=args.cache, batch_size=args.batch_size, num_workers=args.workers,
-                    max_train_positions=args.max_train_positions, seed=args.seed,
-                    min_lr_fraction=args.min_lr_fraction)
+    run = RunConfig(cache_dir=args.cache, batch_size=args.batch_size or how.get("batch_size"), num_workers=args.workers,
+                    max_train_positions=args.max_train_positions, seed=args.seed, threat_db=args.threat_db,
+                    exam_workers=args.exam_workers, prefetch_factor=args.prefetch_factor)
 
     if args.command == "train":
-        config = lje.JEPAConfig.from_dict(values)
+        config = lje.JEPAConfig.from_dict({k: v for k, v in values.items() if k not in SEARCH_ONLY})
         run = replace(run, out_dir=args.out, total_steps=args.steps, eval_every=args.eval_every,
-                      resume=not args.no_resume, probe_db=args.probe_db, probe_puzzles=args.probe_puzzles,
+                      min_lr_fraction=args.min_lr_fraction,
+                      warmup_steps=args.warmup_steps or how.get("warmup_steps") or RunConfig.warmup_steps,
+                      checkpoint_every=args.checkpoint_every, resume=not args.no_resume,
+                      exam=args.exam, eager_rollouts=args.eager_rollouts,
+                      probe_db=args.probe_db, probe_puzzles=args.probe_puzzles,
                       probe_positions=args.probe_positions,
                       probe_views=tuple(v.strip() for v in args.probe_views.split(",") if v.strip()),
                       grad_terms_every=args.grad_terms_every, snapshot_first=args.snapshot_first,
-                      threat_db=args.threat_db)
-        result = train(config, run)
+                      snapshot_every=args.snapshot_every)
+        os.makedirs(args.out, exist_ok=True)
+        if not args.no_stop_key:
+            print(f"Press q in this window to stop: the run saves and closes, and the same command carries on "
+                  f"from there. (Or create a file named 'stop' in {args.out}.)")
+        result = train(config, run, stop=stop_switch(args.out, keys=not args.no_stop_key))
         _plot(_read_history(args.out) or result["history"], args.out)
-        print(json.dumps({"final": result["final"], "best_lidar": result["best_lidar"]}, indent=2))
+        print(json.dumps({"final": result["final"], "best_lidar": result["best_lidar"], "steps": result["steps"],
+                          "stopped": result["stopped"]}, indent=2))
     else:
         from dehb_helper import DEHBHelper, DEHBRunConfig
-        known = {f.name for f in dataclasses.fields(lje.JEPAConfig)}
+        if args.fevals is None and args.hours is None:
+            raise SystemExit("say how long to search: --fevals (evaluations in all) and / or --hours")
+        known = {f.name for f in dataclasses.fields(lje.JEPAConfig)} | set(SEARCH_ONLY)
         unknown = sorted(set(values) - known)
         if unknown:
-            raise SystemExit(f"--config has keys JEPAConfig does not know: {unknown}")
-        if values:
-            print(f"Fixed for this search (not searched): {values}")
-        resume = os.path.exists(os.path.join(args.out, "evals.jsonl"))
+            raise SystemExit(f"--config has keys the search does not know: {unknown}")
+        if run.batch_size:
+            values["batch_size"] = run.batch_size       # (--batch-size fixes it: it is then not searched)
+            run = replace(run, batch_size=None)
+        space = build_search_space(seed=args.seed, fixed=values)
+        print(f"Searching {len(space.get_hyperparameters())} settings: {', '.join(space.get_hyperparameter_names())}")
+        print(f"Fixed for this search (not searched): {values}")
+        os.makedirs(args.out, exist_ok=True)
+        resume = os.path.exists(os.path.join(args.out, "dehb_state.json"))
         if resume:
-            print(f"Found previous search state in {args.out}/ - resuming (delete it to start fresh).")
+            print(f"Found an earlier search in {args.out}/ - carrying on with it (delete the folder to start afresh).")
+        if not args.no_stop_key:
+            print(f"Press q in this window to stop: the evaluation under way is saved, and the same command carries "
+                  f"on from there. (Or create a file named 'stop' in {args.out}.)")
+        stop = stop_switch(args.out, keys=not args.no_stop_key)
         helper = DEHBHelper(
-            configspace=lje.build_jepa_configspace(seed=args.seed, fixed=values),
-            objective=make_objective(run, fixed=values),
-            direction="maximize",
-            run_cfg=DEHBRunConfig(min_fidelity=args.min_fidelity, max_fidelity=args.max_fidelity, eta=3,
-                                  fevals=args.fevals, seed=args.seed, n_workers=1, output_path=args.out,
-                                  resume=resume),
+            configspace=space,
+            objective=make_objective(run, fixed=values, work_dir=args.out, stop=stop, retry_wait=5.0,
+                                     train_fn=train if args.in_process else train_in_subprocess),
+            direction="minimize",
+            # (a hair under the exact ratio: DEHB counts the rungs by cutting a logarithm off)
+            run_cfg=DEHBRunConfig(min_fidelity=args.max_fidelity / args.eta ** (args.rungs - 1) * 0.999999,
+                                  max_fidelity=args.max_fidelity, eta=args.eta,
+                                  seed=args.seed, n_workers=1, output_path=args.out, resume=resume,
+                                  save_freq="step", best_at_highest_fidelity=True),
         )
-        summary = helper.run()
+        summary = helper.run_stoppable(stop, fevals=args.fevals,
+                                       seconds=args.hours * 3600 if args.hours else None, interrupted=SearchStopped)
         print(json.dumps(summary, indent=2, default=str))
         print(f"\nTrain the best configuration with:  python train_labyrinth_jepa.py train --config {summary['best_config_path']}")
 

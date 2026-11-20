@@ -105,8 +105,9 @@ The encoder:
                refined by gat_layers GAT layers on the chess graph: 64 square tokens. gat_style
                "split" divides each layer's width among its heads and adds the result back to the
                input; "concat" gives every head the full width, places the heads side by side with
-               the square's own features, and a per-square MLP reduces them to gat_growth times the
-               layer's input width, so the tokens widen layer by layer. Either way each head
+               the square's own features, and a per-square MLP (gat_mlp_layers hidden layers) reduces
+               them to gat_growth times the layer's input width, so the tokens widen layer by layer.
+               Either way each head
                averages over the squares it attends to; gat_sum adds a branch that sums the
                neighbours' messages instead, which can count them ("split": a linear map of the
                sum joins the heads' output; "concat": the sum is one more part beside the heads).
@@ -124,11 +125,19 @@ The encoder:
                concatenated and projected to z (z_dim). readout = "mean": the tokens' mean, projected.
                "mean_max": their mean and per-dimension maximum side by side, projected (a mean
                dilutes what a single square holds, such as a king in check). readout_hidden > 0
-               makes the projection an MLP. "concat": the 64 square tokens side by side, in board
-               order (a1 first, the side to move at the bottom), through that MLP or one linear
-               layer: every square keeps a slot of its own in what z is made from, so nothing is
-               averaged away, and z can tell a position from its mirror image by construction.
-               (Square tokens only: registers and unpooled nodes have no fixed slots.)
+               makes the projection an MLP (readout_layers hidden layers). "concat": the 64 square
+               tokens side by side, in board order (a1 first, the side to move at the bottom), through
+               that MLP or one linear layer: every square keeps a slot of its own in what z is made
+               from, so nothing is averaged away, and z can tell a position from its mirror image by
+               construction. Registers have no slots of their own. Unpooled nodes do, through the
+               squares they descend from: every node of the enlarged graph comes from exactly one
+               square, by a path of splits (a kept node, a first child or a second child at each
+               unpooling layer), so each square gets 2 ** unpool_layers slots, one per path, and a
+               node always lands in its path's slot (descendant_slots). The slots (unpool_slot_dim
+               wide, zero where no node fell) go into the readout MLP beside the 64 square tokens.
+               The unpooling then works at a width of its own (unpool_dim), fed by a linear map of
+               the square stage's output, so it also follows gat_style "concat"; this form has no
+               transformer.
     transformer_layers = 0 leaves the transformer out (the square tokens are then only as global as the
     GAT layers make them); pred_transformer_layers puts attention in the masked-square predictor instead.
     token_mixer swaps the transformer's attention for MLPs: "mlp" keeps only the per-token MLPs (depth
@@ -180,16 +189,20 @@ while the square tokens, which the masked-square loss reads, collapse onto one v
 
 The three variants share everything else, so comparing them answers whether the unpooling layers
 earn their place. The unpooling decisions are sampled everywhere, in the target encoder too; their
-log-probability is returned per position and trained with REINFORCE (reward: minus that
-position's prediction loss), with a learned baseline.
+log-probability is returned per position and trained with REINFORCE, with a learned baseline. The
+reward of the decisions made while encoding a view is minus what the losses charged that view's z,
+each position its own: for the whole board its rollout and the heads' reading of its own z, for the
+masked board the whole-board prediction made from its z and the heads' judgement of it. The
+masked-square loss reads the square tokens, which the decisions reach only through a transformer;
+without one it is left out of the reward.
 
-Everything is in JEPAConfig, and build_jepa_configspace() is the DEHB search space over it. The
-DEHB objective is LiDAR (Thilak et al., ICLR 2024): the effective rank of the linear discriminant
-matrix whose classes are positions and whose members are several random encodings of each
-position. It weighs every direction of the embedding by how much positions differ along it relative to
-how much one position's encodings differ, so directions that only carry sampling noise add almost
-nothing (they inflate RankMe instead). RankMe and the self-consistency ratio are reported alongside as
-diagnostics. See representation_report().
+Everything is in JEPAConfig. The search over it (DEHB) is in train_labyrinth_jepa.py, with its
+objective: the heads' losses on a fixed exam. Label-free measures of z are reported alongside as
+diagnostics (representation_report): LiDAR (Thilak et al., ICLR 2024), the effective rank of the linear
+discriminant matrix whose classes are positions and whose members are several random encodings of each
+position, which weighs every direction of the embedding by how much positions differ along it relative
+to how much one position's encodings differ; RankMe; and the self-consistency ratio. None of them is
+the objective: in our runs LiDAR fell while decoding, the threat head and the probes all improved.
 """
 from __future__ import annotations
 
@@ -254,6 +267,7 @@ class JEPAConfig:
                                      # side with the square's own features, and a per-square MLP reduces them to a
                                      # width gat_growth times the layer's input
     gat_growth: float = 1.5          # (concat) each layer's output width over its input width
+    gat_mlp_layers: int = 1          # (concat) hidden layers of each layer's per-square MLP, each as wide as its output
     gat_sum: bool = False            # also sum the neighbours' edge-aware messages: the heads average over the
                                      # squares they attend to, a sum can count them
     gat_residual: bool = False       # (concat) add the layer's input to the first channels of its output, so what a
@@ -265,6 +279,9 @@ class JEPAConfig:
     unpool_layers: int = 2
     unpool_hidden: int = 128         # hidden width of the MLPs inside each unpooling layer
     unpool_edge_dim: int = 16        # width of the edge features the unpooling layers produce
+    unpool_dim: int = 0              # (readout "concat") the width the unpooling layers and their GATs work at: a
+                                     # linear map brings the square tokens to it first. 0: the square tokens' own width
+    unpool_slot_dim: int = 64        # (readout "concat") the width of each unpooled node's slot in what z is made from
 
     # ----- Transformer over the tokens -----
     d_model: int = 256
@@ -285,7 +302,8 @@ class JEPAConfig:
                                      # the 64 square tokens side by side, each in its own slot
     readout_queries: int = 8
     readout_hidden: int = 0          # > 0: an MLP with this hidden width turns the pooled tokens into z (0: one linear layer)
-    z_dim: int = 1024                # keep fixed during a DEHB search, so LiDAR scores are comparable
+    readout_layers: int = 1          # that MLP's hidden layers
+    z_dim: int = 1024                # (LiDAR and RankMe grow with it: they only compare at one z_dim)
 
     # ----- Masked-square predictor (a GAT on the chess graph) -----
     pred_dim: int = 128
@@ -354,6 +372,9 @@ class JEPAConfig:
     zthreat_masked_weight: float = 0.0  # ... on the whole-board z predicted from the masked board's z
     zthreat_plies: int = 2              # the head answers for 0, 1, ..., this many plies of play (the labels
                                         # must be at least this deep)
+    zthreat_rollout_steps: int = 2      # the predicted next z is judged on the positions after this many of the
+                                        # rollout's first moves (those that are graded at all): each needs a label,
+                                        # so past what the labels database holds each costs a search
     zthreat_head: str = "linear"        # "linear" | "bilinear" | "piece_mlp": how much the head works out itself
     zthreat_mode: str = "binary"        # "binary": can the threat arise; "count": also in how many sequences
     zthreat_count_weight: float = 1.0   # ("count") the count term's weight beside the yes/no term
@@ -473,6 +494,16 @@ class JEPAConfig:
         return widths
 
     @property
+    def unpool_slots(self) -> bool:
+        """Whether the unpooled nodes reach z through slots anchored to the squares they descend from."""
+        return self.uses_unpool and self.readout == "concat"
+
+    @property
+    def unpool_width(self) -> int:
+        """The width the unpooling layers and their GATs work at."""
+        return self.unpool_dim if self.unpool_dim > 0 else self.gat_widths[-1]
+
+    @property
     def max_tokens(self) -> int:
         if self.token_variant == "registers":
             return 64 + self.num_registers
@@ -511,18 +542,33 @@ class JEPAConfig:
             raise ValueError(f"anticollapse_views must be one of {ANTICOLLAPSE_VIEWS}")
         if self.gat_style not in GAT_STYLES:
             raise ValueError(f"gat_style must be one of {GAT_STYLES}")
-        if self.gat_style == "concat" and self.uses_unpool:
-            raise ValueError("gat_style 'concat' widens the square tokens, which the unpooling layers do not take")
+        if self.gat_style == "concat" and self.uses_unpool and self.readout != "concat":
+            raise ValueError("unpooling after gat_style 'concat' needs readout 'concat': the other readouts put the "
+                             "unpooled nodes through the square tokens' projection, at the square stage's first width")
+        if self.unpool_dim < 0 or self.unpool_slot_dim < 1:
+            raise ValueError("need unpool_dim >= 0 and unpool_slot_dim >= 1")
+        if self.unpool_dim > 0 and not self.unpool_slots:
+            raise ValueError("unpool_dim needs token_variant 'unpool' with readout 'concat'")
+        if self.unpool_slots and self.transformer_layers > 0:
+            raise ValueError("unpooling into slots (readout 'concat') has no transformer: transformer_layers must be 0")
+        if self.unpool_slots and (self.unpool_width < 4 or self.unpool_width % self.gat_heads):
+            raise ValueError("the unpooling layers' width (unpool_dim, or the square tokens' final width) must be at "
+                             "least 4 and divisible by gat_heads")
         if self.gat_growth < 1:
             raise ValueError("gat_growth must be at least 1")
+        if self.gat_mlp_layers < 1 or self.readout_layers < 1:
+            raise ValueError("gat_mlp_layers and readout_layers must be at least 1")
+        if self.zthreat_rollout_steps < 0:
+            raise ValueError("zthreat_rollout_steps must be at least 0")
         if self.gat_residual and self.gat_style != "concat":
             raise ValueError("gat_residual needs gat_style 'concat' (the split layers always add their input)")
         if self.readout not in READOUTS:
             raise ValueError(f"readout must be one of {READOUTS}")
         if self.readout_hidden < 0:
             raise ValueError("readout_hidden must be at least 0")
-        if self.readout == "concat" and self.token_variant != "squares":
-            raise ValueError("readout 'concat' gives each of the 64 squares a slot: it needs token_variant 'squares'")
+        if self.readout == "concat" and self.token_variant == "registers":
+            raise ValueError("readout 'concat' gives the 64 squares (and the nodes unpooled from them) slots of their "
+                             "own: it takes token_variant 'squares' or 'unpool', not registers")
         if self.token_mixer not in TOKEN_MIXERS:
             raise ValueError(f"token_mixer must be one of {TOKEN_MIXERS}")
         if self.token_mixer == "mixer" and self.uses_unpool:
@@ -752,7 +798,8 @@ class _ConcatGATBlock(nn.Module):
 
     def __init__(self, in_dim: int, out_dim: int, heads: int, edge_dim: int, dropout: float, summed: bool,
                  residual: bool = False, marks: int = 0, mark_generator: Optional[torch.Generator] = None,
-                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None), mark_scale: float = 1.0):
+                 sum_generators: Sequence[Optional[torch.Generator]] = (None, None), mark_scale: float = 1.0,
+                 mlp_layers: int = 1):
         super().__init__()
         self.residual = residual
         self.gat = GATConv(in_dim, in_dim, heads=heads, concat=True, dropout=dropout, edge_dim=edge_dim,
@@ -764,7 +811,7 @@ class _ConcatGATBlock(nn.Module):
             _add_inputs(self.edge, marks, sum_generators[1], mark_scale)
         width = (heads + 1) * in_dim
         self.norm = nn.LayerNorm(width + int(summed) * in_dim)
-        self.mlp = _mlp([width, out_dim, out_dim])
+        self.mlp = _mlp([width] + [out_dim] * mlp_layers + [out_dim])
         if summed:
             _add_inputs(self.mlp[0], in_dim, sum_generators[0])     # the sum's part comes last
 
@@ -796,6 +843,26 @@ class _ConcatGATBlock(nn.Module):
 
 # ##### ##### ##### ##### #####
 #       The encoder
+
+
+def descendant_slots(parent_map: Dict[str, torch.Tensor], square: torch.Tensor, place: torch.Tensor,
+                     nodes_out: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    One unpooling layer further down the family tree of the 64 squares. square / place [N]: for each node
+    going into the layer, the square it descends from and its place among that square's descendants.
+    parent_map: the layer's (guo v2: "f" the node a kept node becomes, "f1" / "f2" a split node's two
+    children, -1 where absent). Returns the same two for the layer's nodes_out nodes: a kept node and a
+    first child take place 2 * place, a second child 2 * place + 1. So after k layers a square's descendants
+    sit at places below 2 ** k, each place meaning one way through the splits, and the same node of the same
+    position lands in the same place whatever the rest of the board did.
+    """
+    new_square, new_place = square.new_empty(nodes_out), place.new_empty(nodes_out)
+    for key, second in (("f", 0), ("f1", 0), ("f2", 1)):
+        target = parent_map[key]
+        has = target >= 0
+        new_square[target[has]] = square[has]
+        new_place[target[has]] = 2 * place[has] + second
+    return new_square, new_place
 
 
 @dataclass
@@ -854,19 +921,29 @@ class LabyrinthEncoder(nn.Module):
                                              for _ in range(c.gat_layers))
         else:
             self.square_gats = nn.ModuleList(_ConcatGATBlock(widths[i], widths[i + 1], c.gat_heads, c.edge_dim,
-                                                             c.gat_dropout, residual=c.gat_residual, **marks, **sums)
+                                                             c.gat_dropout, residual=c.gat_residual,
+                                                             mlp_layers=c.gat_mlp_layers, **marks, **sums)
                                              for i in range(c.gat_layers))
 
         self.unpool_layers = nn.ModuleList()
         self.unpool_gats = nn.ModuleList()
+        self.unpool_in = self.slot_proj = self.slot_norm = None
         if c.uses_unpool:
+            # With the slots (readout "concat") the unpooling works at a width of its own; otherwise at the
+            # square stage's first width, as its nodes then go through the square tokens' projection
+            width = c.unpool_width if c.unpool_slots else c.gat_dim
+            if c.unpool_slots and c.unpool_dim > 0:
+                self.unpool_in = nn.Linear(widths[-1], width)
             edge_in = c.edge_dim
             for _ in range(c.unpool_layers):
                 self.unpool_layers.append(unpool.GuoUnpool(
-                    dx=c.gat_dim, dw=edge_in, dy=c.gat_dim, du=c.unpool_edge_dim,
+                    dx=width, dw=edge_in, dy=width, du=c.unpool_edge_dim,
                     kv=c.unpool_hidden, kia=c.unpool_hidden, kie=c.unpool_hidden, kw=c.unpool_hidden))
-                self.unpool_gats.append(_GATBlock(c.gat_dim, c.gat_heads, c.unpool_edge_dim, c.gat_dropout))
+                self.unpool_gats.append(_GATBlock(width, c.gat_heads, c.unpool_edge_dim, c.gat_dropout))
                 edge_in = c.unpool_edge_dim
+            if c.unpool_slots:
+                self.slot_proj = nn.Linear(width, c.unpool_slot_dim)
+                self.slot_norm = nn.LayerNorm(c.unpool_slot_dim)
         self.registers = nn.Parameter(torch.randn(c.num_registers, c.d_model) * 0.02) \
             if c.token_variant == "registers" else None
 
@@ -893,12 +970,14 @@ class LabyrinthEncoder(nn.Module):
             # for a mean readout with one linear layer: everything built after the readout (the predictors,
             # the heads) then starts exactly as in that model
             nn.Linear(c.d_model, c.z_dim)
-            sizes = [64 * c.d_model] + ([c.readout_hidden] if c.readout_hidden else []) + [c.z_dim]
+            # With unpooling, every square also has 2 ** unpool_layers slots for the nodes that descend from it
+            slots = 64 * 2 ** c.unpool_layers * c.unpool_slot_dim if c.unpool_slots else 0
+            sizes = [64 * c.d_model + slots] + [c.readout_hidden] * (c.readout_layers if c.readout_hidden else 0) + [c.z_dim]
             self.readout_proj = _mlp_from(_own_generator(7), sizes)
         else:
             pooled = {"attention": c.readout_queries, "mean": 1, "mean_max": 2}[c.readout] * c.d_model
             self.readout_proj = nn.Linear(pooled, c.z_dim) if c.readout_hidden == 0 else \
-                _mlp([pooled, c.readout_hidden, c.z_dim])
+                _mlp([pooled] + [c.readout_hidden] * c.readout_layers + [c.z_dim])
 
     def forward(
         self,
@@ -939,18 +1018,35 @@ class LabyrinthEncoder(nn.Module):
         entropy = h.new_zeros(B)
         num_decisions = torch.zeros(B, dtype=torch.long, device=h.device)
         actions: List[unpool.UnpoolActions] = []
+        slots = unpooled_nodes = None
         if c.token_variant == "unpool":
             x, edge_index, edge_attr, batch = h, square_edges, square_attr, graphs.batch
+            if self.unpool_in is not None:
+                x = self.unpool_in(x)
+            # (slots) the square each node descends from, and its place among that square's descendants
+            square = torch.arange(h.size(0), device=h.device) % 64
+            place = torch.zeros_like(square)
             for k, (layer, block) in enumerate(zip(self.unpool_layers, self.unpool_gats)):
                 replay = actions_to_replay[k] if actions_to_replay is not None else None
                 out = layer(x, edge_index, edge_attr, actions_to_replay=replay, rng=rng, batch=batch, num_graphs=B)
+                if c.unpool_slots:
+                    square, place = descendant_slots(out.parent_map, square, place, out.y.size(0))
                 x, edge_index, edge_attr, batch = out.y, out.edge_index, out.edge_attr, out.batch
                 log_prob = log_prob + out.log_prob
                 entropy = entropy + out.entropy
                 actions.append(out.actions)
                 num_decisions = num_decisions + out.actions.counts.sum(0)
                 x = block(x, edge_index, edge_attr)
-            extra, extra_pad = self._pad_by_graph(self.token_proj(x) + self.token_type[1], batch, B)
+            if c.unpool_slots:
+                # Every square has 2 ** unpool_layers slots, one per way its node could have been split; a slot
+                # no node fell into stays at zero (a filled one is layer-normalized, so never zero)
+                slots = h.new_zeros(B, 64, 2 ** c.unpool_layers, c.unpool_slot_dim).index_put(
+                    (batch, square, place), self.slot_norm(self.slot_proj(x)).to(h.dtype))
+                unpooled_nodes = torch.bincount(batch, minlength=B)
+                extra = h.new_zeros(B, 0, c.d_model)
+                extra_pad = torch.zeros(B, 0, dtype=torch.bool, device=h.device)
+            else:
+                extra, extra_pad = self._pad_by_graph(self.token_proj(x) + self.token_type[1], batch, B)
         elif c.token_variant == "registers":
             extra = (self.registers + self.token_type[1]).unsqueeze(0).expand(B, -1, -1)
             extra_pad = torch.zeros(B, c.num_registers, dtype=torch.bool, device=h.device)
@@ -967,7 +1063,8 @@ class LabyrinthEncoder(nn.Module):
             read, _ = self.readout_attn(queries, tokens, tokens, key_padding_mask=pad, need_weights=False)
             z = self.readout_proj(self.readout_norm(read).reshape(B, -1))
         elif c.readout == "concat":
-            z = self.readout_proj(tokens[:, :64].reshape(B, -1))
+            flat = tokens[:, :64].reshape(B, -1)
+            z = self.readout_proj(flat if slots is None else torch.cat([flat, slots.reshape(B, -1)], dim=1))
         else:
             keep = (~pad).unsqueeze(-1).to(tokens.dtype)
             pooled = (tokens * keep).sum(1) / keep.sum(1)
@@ -975,7 +1072,8 @@ class LabyrinthEncoder(nn.Module):
                 # a mean dilutes what one square holds (a king in check); the maximum keeps it
                 pooled = torch.cat([pooled, tokens.masked_fill(pad.unsqueeze(-1), float("-inf")).max(1).values], -1)
             z = self.readout_proj(pooled)
-        return EncoderOutput(z, tokens[:, :64], log_prob, entropy, (~pad).sum(1), num_decisions, actions)
+        num_tokens = (~pad).sum(1) if unpooled_nodes is None else 64 + unpooled_nodes
+        return EncoderOutput(z, tokens[:, :64], log_prob, entropy, num_tokens, num_decisions, actions)
 
     @staticmethod
     def _pad_by_graph(x: torch.Tensor, batch: torch.Tensor, B: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1187,10 +1285,13 @@ def square_classes(graphs: ld.GraphBatch) -> torch.Tensor:
     return torch.where(~occupied & (x[..., 7] > 0), SQUARE_CLASSES - 1, classes)
 
 
-def decode_scores(logits: torch.Tensor, classes: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+def decode_scores(logits: torch.Tensor, classes: torch.Tensor,
+                  with_scores: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
     """The decoder's cross-entropy against square_classes, and the shares of all squares, of the occupied
-    squares and of whole boards it gets right."""
+    squares and of whole boards it gets right (with_scores False: the loss alone, and no scores)."""
     loss = F.cross_entropy(logits.reshape(-1, SQUARE_CLASSES), classes.reshape(-1))
+    if not with_scores:
+        return loss, {}
     with torch.no_grad():
         right = logits.argmax(-1) == classes
         occupied = (classes > 0) & (classes < SQUARE_CLASSES - 1)
@@ -1198,6 +1299,13 @@ def decode_scores(logits: torch.Tensor, classes: torch.Tensor) -> Tuple[torch.Te
                   "pieces": float((right & occupied).sum() / occupied.sum().clamp_min(1)),
                   "exact": float(right.all(-1).float().mean())}
     return loss, scores
+
+
+@torch.no_grad()
+def decode_row_losses(logits: torch.Tensor, classes: torch.Tensor) -> torch.Tensor:
+    """[R] each position's own share of decode_scores' loss (their mean is that loss)."""
+    per = F.cross_entropy(logits.reshape(-1, SQUARE_CLASSES), classes.reshape(-1), reduction="none")
+    return per.view(classes.size(0), -1).mean(1)
 
 
 def move_pairs() -> torch.Tensor:
@@ -1259,14 +1367,18 @@ class ZLegalHead(nn.Module):
         return labels.view(rows, self.num_pairs)
 
 
-def legal_scores(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+def legal_scores(logits: torch.Tensor, labels: torch.Tensor,
+                 with_scores: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Binary cross-entropy with the legal moves and the illegal ones weighing the same (some 30 of the 1,792
-    pairs are legal in a position), and the shares of legal moves found and of illegal ones rejected.
+    pairs are legal in a position), and the shares of legal moves found and of illegal ones rejected
+    (with_scores False: the loss alone).
     """
     per = F.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype), reduction="none")
     n_legal, n_illegal = labels.sum().clamp_min(1), (~labels).sum().clamp_min(1)
     loss = 0.5 * (per[labels].sum() / n_legal + per[~labels].sum() / n_illegal)
+    if not with_scores:
+        return loss, {}
     with torch.no_grad():
         said = logits > 0
         scores = {"found": float((said & labels).sum() / n_legal), "rejected": float((~said & ~labels).sum() / n_illegal)}
@@ -1351,7 +1463,8 @@ THREAT_CLOSE = math.log(1.1)        # a count is "close" when 1 + count is withi
 
 
 def threat_scores(outputs: Tuple[torch.Tensor, Optional[torch.Tensor]], target: torch.Tensor, graded: torch.Tensor,
-                  weights: Optional[Sequence[float]] = None, count_weight: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
+                  weights: Optional[Sequence[float]] = None, count_weight: float = 1.0,
+                  with_scores: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     The legal-threat head's loss against ZThreatHead.targets' (target, graded), and its scores. weights: one per
     ply's layer (threat_schedule's); a layer at 0 is not graded. Per layer:
@@ -1367,7 +1480,8 @@ def threat_scores(outputs: Tuple[torch.Tensor, Optional[torch.Tensor]], target: 
       "exact"     positions with every cell right
       "close"     counts within 10% of the truth; "count_error": the mean error of the log count (a factor of
                   e ** count_error)
-    and "labelled", the share of the positions that have a label.
+    and "labelled", the share of the positions that have a label. with_scores False: the loss alone, and no
+    scores (they take most of this function's time, and a training step that is not logged has no use for them).
     """
     logits, counts = outputs
     weights = list(weights) if weights is not None else [1.0] * logits.size(1)
@@ -1386,20 +1500,23 @@ def threat_scores(outputs: Tuple[torch.Tensor, Optional[torch.Tensor]], target: 
         n_pos, n_neg = pos.sum().clamp_min(1), neg.sum().clamp_min(1)
         per = F.binary_cross_entropy_with_logits(logits[:, k], yes.to(logits.dtype), reduction="none")
         layer = 0.5 * ((per * pos).sum() / n_pos + (per * neg).sum() / n_neg)
-        with torch.no_grad():
-            said = logits[:, k] > 0
-            mistakes = ((said != yes) & cells).sum((1, 2))
-            results = {"found": float((said & pos).sum() / n_pos), "rejected": float((~said & neg).sum() / n_neg),
-                       "wrong": float(mistakes.sum() / n_rows), "exact": float(((mistakes == 0) & rows).sum() / n_rows)}
-            if k > 0:
-                new = pos & ~(target[:, k - 1] > 0)
-                results["new"] = float((said & new).sum() / new.sum().clamp_min(1))
+        results: Dict[str, float] = {}
+        if with_scores:
+            with torch.no_grad():
+                said = logits[:, k] > 0
+                mistakes = ((said != yes) & cells).sum((1, 2))
+                results = {"found": float((said & pos).sum() / n_pos), "rejected": float((~said & neg).sum() / n_neg),
+                           "wrong": float(mistakes.sum() / n_rows), "exact": float(((mistakes == 0) & rows).sum() / n_rows)}
+                if k > 0:
+                    new = pos & ~(target[:, k - 1] > 0)
+                    results["new"] = float((said & new).sum() / new.sum().clamp_min(1))
         if counts is not None and k > 0:
             layer = layer + count_weight * (F.smooth_l1_loss(counts[:, k], target[:, k], reduction="none") * pos).sum() / n_pos
-            with torch.no_grad():
-                off = (counts[:, k] - target[:, k]).abs()
-                results["close"] = float(((off < THREAT_CLOSE) & pos).sum() / n_pos)
-                results["count_error"] = float((off * pos).sum() / n_pos)
+            if with_scores:
+                with torch.no_grad():
+                    off = (counts[:, k] - target[:, k]).abs()
+                    results["close"] = float(((off < THREAT_CLOSE) & pos).sum() / n_pos)
+                    results["count_error"] = float((off * pos).sum() / n_pos)
         loss, scale = loss + w * layer, scale + w
         for key, value in results.items():
             scores[f"{key}_{k}"] = value
@@ -1407,8 +1524,35 @@ def threat_scores(outputs: Tuple[torch.Tensor, Optional[torch.Tensor]], target: 
     for key, parts in means.items():
         if parts:
             scores[key] = sum(w * v for w, v in parts) / sum(w for w, _ in parts)
-    scores["labelled"] = float(rows.float().mean())
+    if with_scores:
+        scores["labelled"] = float(rows.float().mean())
     return loss / max(scale, 1e-12), scores
+
+
+@torch.no_grad()
+def threat_row_losses(outputs: Tuple[torch.Tensor, Optional[torch.Tensor]], target: torch.Tensor, graded: torch.Tensor,
+                      weights: Optional[Sequence[float]] = None, count_weight: float = 1.0) -> torch.Tensor:
+    """
+    [R] each position's own share of threat_scores' loss (their mean is that loss; a position without a label
+    has 0): the same sums, kept apart by position. For the unpooling decisions' reward.
+    """
+    logits, counts = outputs
+    weights = list(weights) if weights is not None else [1.0] * logits.size(1)
+    cells = graded[:, :, None]
+    rows, scale = logits.new_zeros(logits.size(0)), 0.0
+    for k, w in enumerate(weights[:logits.size(1)]):
+        if w <= 0:
+            continue
+        yes = target[:, k] > 0
+        pos, neg = yes & cells, ~yes & cells
+        n_pos, n_neg = pos.sum().clamp_min(1), neg.sum().clamp_min(1)
+        per = F.binary_cross_entropy_with_logits(logits[:, k], yes.to(logits.dtype), reduction="none")
+        layer = 0.5 * ((per * pos).sum((1, 2)) / n_pos + (per * neg).sum((1, 2)) / n_neg)
+        if counts is not None and k > 0:
+            off = F.smooth_l1_loss(counts[:, k], target[:, k], reduction="none")
+            layer = layer + count_weight * (off * pos).sum((1, 2)) / n_pos
+        rows, scale = rows + w * layer, scale + w
+    return rows * logits.size(0) / max(scale, 1e-12)
 
 
 def threat_schedule(config: JEPAConfig, positions_seen: int) -> List[float]:
@@ -1613,20 +1757,25 @@ class LabyrinthJEPA(nn.Module):
 
     def losses(self, batch: ld.JEPABatch, rng: Optional[torch.Generator] = None,
                rollout_weights: Optional[Sequence[float]] = None,
-               threat_weights: Optional[Sequence[float]] = None) -> JEPALosses:
+               threat_weights: Optional[Sequence[float]] = None, with_scores: bool = True) -> JEPALosses:
         """
         All training losses for one batch (already on the model's device). rollout_weights: the loss
         weight of each rollout step (rollout_schedule gives them); its length is how many moves ahead to
         predict, and the batch must reach at least that far where games allow. Default: one move. Steps
         the batch has no target graphs for (rollout_targets = "log") are predicted but not graded.
         threat_weights: the legal-threat head's weight for each ply (threat_schedule gives them; default:
-        every ply at 1).
+        every ply at 1). with_scores False leaves the z heads' scores (boards decoded, threats found, ...) out
+        of stats: the same losses and gradients without the work of scoring, which a step that is not logged
+        has no use for.
         """
         c = self.config
         B = batch.num_graphs
         stats: Dict[str, float] = {}
         weights = list(rollout_weights) if rollout_weights is not None else [1.0]
         steps = batch.rollout[:len(weights)]
+        # For the unpooling decisions' reward: what the losses that read a view's z charged it, per position
+        rl_on = c.uses_unpool and c.unpool_rl
+        charged: Dict[str, List[torch.Tensor]] = {"masked": [], "full": []}
 
         with torch.no_grad():
             self.target.eval()
@@ -1674,7 +1823,10 @@ class LabyrinthJEPA(nn.Module):
         whole_pred = None
         if self.full_predictor is not None:
             whole_pred = self.full_predictor(ctx_masked.z)
-            zpred_loss = self._distance(whole_pred, target_full.z).mean()
+            zpred_rows = self._distance(whole_pred, target_full.z)
+            zpred_loss = zpred_rows.mean()
+            if rl_on and c.zpred_weight > 0:
+                charged["masked"].append(c.zpred_weight * zpred_rows.detach())
             contributions["zpred"] = c.zpred_weight * zpred_loss
             total = total + contributions["zpred"]
             stats["loss_zpred"] = float(zpred_loss.detach())
@@ -1727,6 +1879,8 @@ class LabyrinthJEPA(nn.Module):
             classes = square_classes(batch.full)
             logits = self.board_decoder(whole.z)
             decode_loss = F.cross_entropy(logits.reshape(-1, SQUARE_CLASSES), classes.reshape(-1))
+            if rl_on:
+                charged["full"].append(c.decode_weight * decode_row_losses(logits, classes))
             contributions["decode"] = c.decode_weight * decode_loss
             total = total + contributions["decode"]
             with torch.no_grad():
@@ -1769,13 +1923,20 @@ class LabyrinthJEPA(nn.Module):
         if c.decodes_predictions:
             decoder = self.board_decoder
             real_classes = torch.cat([square_classes(batch.full)] + [square_classes(step.graphs) for _, step, _, _ in fit_steps])
-            add("decode_fit", 1.0, *decode_scores(decoder(real_z), real_classes))
+            fit_logits = decoder(real_z)
+            add("decode_fit", 1.0, *decode_scores(fit_logits, real_classes, with_scores))
+            if rl_on and online_fit:                    # (the fit reads the online z of the whole board: real_z's B rows)
+                charged["full"].append(decode_row_losses(fit_logits, real_classes))
             if c.decode_next_weight > 0 and graded:
                 add("decode_next", c.decode_next_weight, *over_steps(
-                    lambda step, pred: decode_scores(held_fixed(decoder, pred), square_classes(step.graphs))))
+                    lambda step, pred: decode_scores(held_fixed(decoder, pred), square_classes(step.graphs), with_scores)))
             if c.decode_masked_weight > 0:
+                masked_logits = held_fixed(decoder, whole_pred)
                 add("decode_masked", c.decode_masked_weight,
-                    *decode_scores(held_fixed(decoder, whole_pred), square_classes(batch.full)))
+                    *decode_scores(masked_logits, square_classes(batch.full), with_scores))
+                if rl_on:
+                    charged["masked"].append(c.decode_masked_weight
+                                             * decode_row_losses(masked_logits, square_classes(batch.full)))
 
         if self.zlegal_head is not None:
             head = self.zlegal_head
@@ -1783,16 +1944,17 @@ class LabyrinthJEPA(nn.Module):
                 raise ValueError("the z-level legal-move head needs the batch's legal moves (collate_jepa adds them)")
             now = head.labels(batch.legal, B)
             if c.zlegal_weight > 0:
-                add("zlegal", c.zlegal_weight, *legal_scores(head(whole.z), now))
+                add("zlegal", c.zlegal_weight, *legal_scores(head(whole.z), now, with_scores))
             if c.zlegal_judges_predictions:
                 after = [head.labels(step.legal, pred.size(0)) for _, step, pred, _ in graded]
-                add("zlegal_fit", 1.0, *legal_scores(head(real_z), torch.cat([now] + after[:len(fit_steps)])))
+                add("zlegal_fit", 1.0, *legal_scores(head(real_z), torch.cat([now] + after[:len(fit_steps)]), with_scores))
                 if c.zlegal_next_weight > 0 and graded:
                     by_step = {id(step): labels for (_, step, _, _), labels in zip(graded, after)}
                     add("zlegal_next", c.zlegal_next_weight, *over_steps(
-                        lambda step, pred: legal_scores(held_fixed(head, pred), by_step[id(step)])))
+                        lambda step, pred: legal_scores(held_fixed(head, pred), by_step[id(step)], with_scores)))
                 if c.zlegal_masked_weight > 0:
-                    add("zlegal_masked", c.zlegal_masked_weight, *legal_scores(held_fixed(head, whole_pred), now))
+                    add("zlegal_masked", c.zlegal_masked_weight,
+                        *legal_scores(held_fixed(head, whole_pred), now, with_scores))
 
         if self.zthreat_head is not None:
             head = self.zthreat_head
@@ -1800,17 +1962,25 @@ class LabyrinthJEPA(nn.Module):
                 raise ValueError("the legal-threat head needs the batch's threat labels (give the loader a ThreatLabels)")
 
             def judge(outputs, wanted) -> Tuple[torch.Tensor, Dict[str, float]]:
-                return threat_scores(outputs, *wanted, threat_weights, c.zthreat_count_weight)
+                return threat_scores(outputs, *wanted, threat_weights, c.zthreat_count_weight, with_scores)
+
+            def charge(view: str, weight: float, outputs) -> None:
+                if rl_on:
+                    charged[view].append(weight * threat_row_losses(outputs, *now, threat_weights, c.zthreat_count_weight))
 
             now = head.targets(batch.threats, batch.full)
             if c.zthreat_weight > 0:
-                add("zthreat", c.zthreat_weight, *judge(head(whole.z), now))
+                own = head(whole.z)
+                add("zthreat", c.zthreat_weight, *judge(own, now))
+                charge("full", c.zthreat_weight, own)
             if c.zthreat_judges_predictions:
                 # Among the graded rollout steps, those whose positions have labels (the first few)
                 labelled = [entry for entry in graded if entry[1].threats is not None]
                 after = {id(step): head.targets(step.threats, step.graphs) for _, step, _, _ in labelled}
                 if online_fit:
-                    add("zthreat_fit", 1.0, *judge(head(whole.z), now))
+                    own = head(whole.z)
+                    add("zthreat_fit", 1.0, *judge(own, now))
+                    charge("full", 1.0, own)
                 else:
                     real = torch.cat([target_full.z] + [target_steps[k - 1] for k, _, _, _ in labelled])
                     wanted = [now] + [after[id(step)] for _, step, _, _ in labelled]
@@ -1819,7 +1989,9 @@ class LabyrinthJEPA(nn.Module):
                     add("zthreat_next", c.zthreat_next_weight, *over_steps(
                         lambda step, pred: judge(held_fixed(head, pred), after[id(step)]), labelled))
                 if c.zthreat_masked_weight > 0:
-                    add("zthreat_masked", c.zthreat_masked_weight, *judge(held_fixed(head, whole_pred), now))
+                    from_masked = held_fixed(head, whole_pred)
+                    add("zthreat_masked", c.zthreat_masked_weight, *judge(from_masked, now))
+                    charge("masked", c.zthreat_masked_weight, from_masked)
 
         # ---- anti-collapse regularization on the online encoder's embeddings ----
         anticollapse = total.new_zeros(())
@@ -1870,11 +2042,22 @@ class LabyrinthJEPA(nn.Module):
         # ---- unpooling decisions: REINFORCE with learned baselines ----
         # A position involves thousands of decisions, so its log-probability and entropy are averaged per
         # decision: the same gradient direction, on a scale comparable with the prediction losses.
+        # A view's decisions are rewarded with minus what the losses charged that view's z, each position its
+        # own: the masked board's with the whole-board prediction made from its z and the heads' judgement of
+        # it, the whole board's with its rollout and the heads' reading of its own z. The masked-square loss
+        # reads the square tokens, which the decisions reach only through a transformer: without one it would
+        # be noise in the reward, so it is left out.
         rl = total.new_zeros(())
-        if c.uses_unpool and c.unpool_rl:
-            terms = [("mask", ctx_masked, mask_per_pos, slice(None))]
+        if rl_on:
+            terms = []
+            masked = ([c.mask_weight * mask_per_pos] if c.transformer_layers > 0 else []) + charged["masked"]
+            if masked:
+                terms.append(("mask", ctx_masked, sum(masked), slice(None)))
             if ctx_full is not None:
-                terms.append(("next", ctx_full, next_per_pos, steps[0].index))
+                rows = steps[0].index
+                terms.append(("next", ctx_full, c.next_weight * next_per_pos + sum(t[rows] for t in charged["full"]), rows))
+            elif charged["full"]:
+                terms.append(("next", whole, sum(charged["full"]), slice(None)))
             for name, out, loss_per_pos, rows in terms:
                 reward = -loss_per_pos.detach()
                 baseline = self.baselines[name](out.z[rows].detach()).squeeze(-1)
@@ -2066,91 +2249,6 @@ def representation_report(encoder: LabyrinthEncoder, fens: Sequence[str], *, sam
         "rankme_single_sample": rankme(z[:, 0]),
         "self_consistency": self_consistency(z),
     }
-
-
-# ##### ##### ##### ##### #####
-#       The DEHB search space
-
-
-def build_jepa_configspace(seed: int = 0, include_training: bool = True, fixed: Optional[Dict[str, Any]] = None):
-    """
-    The DEHB search space over the architecture (and, with include_training, the training knobs).
-    z_dim is deliberately not searched: LiDAR grows with the dimension, so scores are only comparable
-    at a fixed z_dim. Choose it separately and keep it fixed for a search.
-
-    fixed: JEPAConfig values that are not searched. Their hyperparameters are left out, and one that only
-    applies under a particular value of a fixed hyperparameter (unpool_layers under token_variant =
-    "unpool") is kept, unconditionally, only when the fixed value is that one.
-    """
-    import ConfigSpace as CS
-    fixed = fixed or {}
-    H = CS.CategoricalHyperparameter
-    I = CS.UniformIntegerHyperparameter
-    U = CS.UniformFloatHyperparameter
-
-    # (hyperparameter, None or (the hyperparameter it depends on, the value it needs, or a list of values))
-    specs = [
-        # square stage
-        (I("gat_layers", lower=2, upper=4), None),
-        (H("gat_dim", choices=[64, 128, 256]), None),
-        (H("gat_heads", choices=[2, 4, 8]), None),
-        # extra tokens
-        (H("token_variant", choices=list(TOKEN_VARIANTS)), None),
-        (H("num_registers", choices=[16, 32, 64]), ("token_variant", "registers")),
-        (I("unpool_layers", lower=1, upper=3), ("token_variant", "unpool")),
-        (H("unpool_hidden", choices=[64, 128, 256]), ("token_variant", "unpool")),
-        (H("unpool_edge_dim", choices=[8, 16, 32]), ("token_variant", "unpool")),
-        # transformer and readout
-        (H("d_model", choices=[128, 256, 384]), None),
-        (I("transformer_layers", lower=2, upper=6), None),
-        (H("transformer_heads", choices=[4, 8]), None),
-        (H("readout_queries", choices=[4, 8, 16, 32]), None),
-        # predictors
-        (H("pred_dim", choices=[64, 128, 256]), None),
-        (I("pred_gat_layers", lower=2, upper=4), None),
-        (H("next_hidden", choices=[512, 1024, 2048]), None),
-        (I("next_layers", lower=1, upper=3), None),
-        # masks
-        (U("mask_min_ratio", lower=0.05, upper=0.25), None),
-        (U("mask_max_ratio", lower=0.30, upper=0.60), None),
-        (I("mask_max_block_radius", lower=0, upper=2), None),
-        # rollout curriculum
-        (H("rollout_max_steps", choices=[1, 2, 3, 4, 6]), None),
-        (H("rollout_stage_positions", choices=[100_000, 250_000, 500_000]), ("rollout_max_steps", [2, 3, 4, 6])),
-    ]
-    if include_training:
-        specs += [
-            (U("lr", lower=5e-5, upper=1e-3, log=True), None),
-            (U("weight_decay", lower=1e-3, upper=0.2, log=True), None),
-            (U("ema_start", lower=0.99, upper=0.999), None),
-            (U("next_weight", lower=0.25, upper=4.0, log=True), None),     # relative to mask_weight = 1
-            (H("anticollapse", choices=["sigreg", "vicreg"]), None),
-            (U("sigreg_weight", lower=0.005, upper=0.5, log=True), ("anticollapse", "sigreg")),
-            (U("vicreg_weight", lower=0.1, upper=10.0, log=True), ("anticollapse", "vicreg")),
-            (U("rl_coef", lower=1e-3, upper=1e-1, log=True), ("token_variant", "unpool")),
-            (U("rl_entropy_coef", lower=1e-5, upper=1e-2, log=True), ("token_variant", "unpool")),
-        ]
-
-    def allows(condition: Tuple[str, Any], value: Any) -> bool:
-        return value in condition[1] if isinstance(condition[1], (list, tuple)) else value == condition[1]
-
-    cs = CS.ConfigurationSpace(seed=seed)
-    kept: Dict[str, Tuple[Any, Optional[Tuple[str, Any]]]] = {}
-    for hp, condition in specs:
-        if hp.name in fixed:
-            continue
-        if condition is not None and condition[0] in fixed and not allows(condition, fixed[condition[0]]):
-            continue                       # it only applies under a value the fixed setting rules out
-        cs.add_hyperparameter(hp)
-        kept[hp.name] = (hp, condition)
-    for hp, condition in kept.values():
-        if condition is not None and condition[0] in kept:
-            parent = kept[condition[0]][0]
-            if isinstance(condition[1], (list, tuple)):
-                cs.add_condition(CS.InCondition(hp, parent, list(condition[1])))
-            else:
-                cs.add_condition(CS.EqualsCondition(hp, parent, condition[1]))
-    return cs
 
 
 # ----- ----- -----
