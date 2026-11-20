@@ -60,6 +60,7 @@ layer sees it:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import itertools
 import json
@@ -849,6 +850,76 @@ def pack_views(views: Sequence[GraphView]) -> GraphBatch:
 
 
 @dataclass
+class CompactGraphs:
+    """
+    Several chess graphs in the form a loader hands them over in: what pack_views makes, without what every
+    graph repeats. Every chess graph has the same edges (one per square pair that a queen or a knight joins,
+    and a self-loop per square), and all their edge features but a few are the same too (they say how two
+    squares lie; only the castling flags depend on the position), yet those two tensors are 98% of a
+    GraphBatch's 106 kB a graph. A batch with ten-move rollouts holds some 3,000 graphs, and a loader keeps
+    dozens of batches ready, each once in the workers' shared memory and once pinned: tens of GB of the same
+    numbers. Here the edges are kept once, the edge features once (the first graph's) with a list of where
+    the other graphs differ, and the 0 / 1 values as bytes: under 1 kB a graph.
+
+      x           [B*64, F] uint8
+      edge_index  [2, E] int16: one graph's edges, with its own node numbers 0..63
+      edge_attr   [E, T] uint8: the first graph's edge features
+      changed     [M] int32: every edge feature of any graph that differs from the first graph's, as
+                  (graph * E + edge) * T + column
+      value       [M] uint8: what it is instead
+    to(device) moves these and expands them there into the GraphBatch pack_views would have made (the same
+    values, types and order), so whatever reads a batch after moving it sees no difference.
+    """
+    x: torch.Tensor
+    edge_index: torch.Tensor
+    edge_attr: torch.Tensor
+    changed: torch.Tensor
+    value: torch.Tensor
+    num_graphs: int
+
+    def expand(self) -> GraphBatch:
+        """The GraphBatch these graphs are, on the device they are on."""
+        B, E = self.num_graphs, self.edge_index.size(1)
+        n = self.x.size(0) // B
+        graph = torch.arange(B, device=self.x.device)
+        edge_index = self.edge_index.long().repeat(1, B) + (graph * n).repeat_interleave(E)
+        edge_attr = self.edge_attr.float().repeat(B, 1)
+        edge_attr.view(-1)[self.changed.long()] = self.value.float()
+        return GraphBatch(self.x.float(), edge_index, edge_attr, graph.repeat_interleave(n), B)
+
+    def _map(self, fn) -> "CompactGraphs":
+        return CompactGraphs(fn(self.x), fn(self.edge_index), fn(self.edge_attr), fn(self.changed), fn(self.value),
+                             self.num_graphs)
+
+    def to(self, device, non_blocking: bool = False) -> GraphBatch:
+        return self._map(lambda t: t.to(device, non_blocking=non_blocking)).expand()
+
+    def pin_memory(self) -> "CompactGraphs":
+        return self._map(lambda t: t.pin_memory())
+
+
+def pack_views_compact(views: Sequence[GraphView]):
+    """
+    pack_views(views) as CompactGraphs. Should the views not all have the same edges, or hold values that are
+    not whole numbers a byte holds, the plain GraphBatch is returned instead: nothing is assumed about the
+    graphs that is not checked here.
+    """
+    first = views[0]
+    if any(v.edge_index.shape != first.edge_index.shape or not torch.equal(v.edge_index, first.edge_index)
+           or v.edge_attr.shape != first.edge_attr.shape for v in views[1:]) or int(first.edge_index.max()) > 32767:
+        return pack_views(views)
+    x = torch.cat([v.x for v in views])
+    attr = torch.stack([v.edge_attr for v in views])
+    x8, attr8 = x.to(torch.uint8), attr.to(torch.uint8)
+    if not (torch.equal(x8.to(x.dtype), x) and torch.equal(attr8.to(attr.dtype), attr)) \
+            or x.dtype != torch.float32 or attr.dtype != torch.float32 or attr8.numel() >= 2 ** 31:
+        return pack_views(views)
+    changed = (attr8 != attr8[0]).view(-1).nonzero().flatten()
+    return CompactGraphs(x8, first.edge_index.to(torch.int16), attr8[0].clone(), changed.to(torch.int32),
+                         attr8.view(-1)[changed], len(views))
+
+
+@dataclass
 class RolloutStep:
     """
     Move k of the rollouts in a batch, for the B_k positions whose rollout reaches it (B_k shrinks when
@@ -894,7 +965,9 @@ class RolloutStep:
         return self._map(lambda t: t.pin_memory(), _pin_graphs)
 
 
-def _pin_graphs(g: GraphBatch) -> GraphBatch:
+def _pin_graphs(g):
+    if isinstance(g, CompactGraphs):
+        return g.pin_memory()
     return GraphBatch(g.x.pin_memory(), g.edge_index.pin_memory(), g.edge_attr.pin_memory(), g.batch.pin_memory(),
                       g.num_graphs)
 
@@ -969,7 +1042,12 @@ class JEPABatch:
                          self.threats.pin_memory() if self.threats is not None else None)
 
 
-def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
+def collate_jepa(samples: Sequence[JEPASample], compact: bool = False) -> JEPABatch:
+    """
+    compact: the batch's graphs as CompactGraphs (see there), for handing between processes and to the GPU;
+    batch.to(device) then gives the same batch as without it. Before that its graphs are not GraphBatches.
+    """
+    pack = pack_views_compact if compact else pack_views
     steps: List[RolloutStep] = []
     previous: List[int] = []
     for k in range(max((len(s.rollout) for s in samples), default=0)):
@@ -986,7 +1064,7 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
             row_of = {sample: row for row, sample in enumerate(previous)}
             parent = torch.tensor([row_of[i] for i in ids], dtype=torch.long)
         steps.append(RolloutStep(
-            graphs=pack_views([m.view for m in moves]) if moves[0].view is not None else None,
+            graphs=pack([m.view for m in moves]) if moves[0].view is not None else None,
             index=index,
             parent=parent,
             move_from=index * 64 + torch.tensor([m.from_square for m in moves], dtype=torch.long),
@@ -1000,8 +1078,8 @@ def collate_jepa(samples: Sequence[JEPASample]) -> JEPABatch:
         ))
         previous = ids
     return JEPABatch(
-        full=pack_views([s.full for s in samples]),
-        context=pack_views([s.context for s in samples]),
+        full=pack([s.full for s in samples]),
+        context=pack([s.context for s in samples]),
         mask=torch.cat([s.mask for s in samples]),
         rollout=steps,
         fens=[s.fen for s in samples],
@@ -1091,19 +1169,24 @@ class JEPALoader:
     """
     Batches of JEPASamples from one split, prepared by worker processes. Call set_epoch(e) before
     each epoch: the order, masks and moves then depend only on (seed, epoch). threats: a ThreatLabels, for
-    batches that carry legal-threat labels.
+    batches that carry legal-threat labels. compact: the batches' graphs come as CompactGraphs (a fraction of
+    the size to hand over and to keep ready; batch.to(device) gives the same batch either way).
+    A loader keeps prefetch_factor batches ready per worker, each held twice with pin_memory (once in the
+    workers' shared memory, once pinned): with long rollouts and without compact that is 0.4 GB a batch.
     """
 
     def __init__(self, cache_dir: str, split: str, batch_size: int, *, num_workers: int = 4,
                  mask_config: MaskConfig = MaskConfig(), seed: int = 0, shuffle: bool = True,
                  drop_last: bool = False, indices: Optional[Sequence[int]] = None, pin_memory: bool = False,
-                 prefetch_factor: int = 4, siblings: int = 1, threats: Optional[ThreatLabels] = None):
+                 prefetch_factor: int = 4, siblings: int = 1, threats: Optional[ThreatLabels] = None,
+                 compact: bool = False):
         self.dataset = PositionDataset(cache_dir, split, mask_config, seed, indices)
         self.dataset.siblings = int(siblings)
         self.dataset.threats = threats
         self.sampler = _EpochShuffle(self.dataset, shuffle)
         self.loader_kwargs = dict(batch_size=batch_size, sampler=self.sampler, num_workers=num_workers,
-                                  collate_fn=collate_jepa, drop_last=drop_last, pin_memory=pin_memory)
+                                  collate_fn=functools.partial(collate_jepa, compact=True) if compact
+                                  else collate_jepa, drop_last=drop_last, pin_memory=pin_memory)
         if num_workers > 0:
             self.loader_kwargs["prefetch_factor"] = prefetch_factor
 

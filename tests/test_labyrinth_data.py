@@ -695,6 +695,76 @@ def test_loader_hands_out_threat_labels_with_workers():
         assert next(iter(ld.JEPALoader(cache, "train", 8, num_workers=0, seed=3))).threats is None
 
 
+def same_graphs(a: ld.GraphBatch, b: ld.GraphBatch) -> bool:
+    return a.num_graphs == b.num_graphs and all(
+        x.dtype == y.dtype and torch.equal(x, y)
+        for x, y in ((a.x, b.x), (a.edge_index, b.edge_index), (a.edge_attr, b.edge_attr), (a.batch, b.batch)))
+
+
+def test_compact_graphs_expand_to_the_same_batch():
+    """
+    A batch handed over as CompactGraphs (the edges and their features kept once, the differences listed) is,
+    once moved to a device, the batch pack_views makes: the same values, types and order, for whole boards,
+    masked boards (whose castling edges can be hidden) and the positions along a rollout.
+    """
+    rnd = random.Random(0)
+    boards = random_positions(12, seed=11) + [chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"),
+                                              chess.Board("4k3/8/8/8/8/8/8/4K3 w - - 0 1")]
+    fens = [f for f in (ld.normalize_fen(b.fen(en_passant="xfen")) for b in boards) if f]
+    assert any(chess.Board(f, chess960=True).castling_rights for f in fens), "some positions keep castling rights"
+    samples = [ld.build_sample(f, rnd, rollout_steps=4, target_steps=[1, 2, 4], siblings=2) for f in fens]
+    plain, compact = ld.collate_jepa(samples), ld.collate_jepa(samples, compact=True)
+    assert isinstance(compact.full, ld.CompactGraphs) and isinstance(compact.context, ld.CompactGraphs)
+    assert compact.num_graphs == plain.num_graphs
+    moved = compact.to("cpu")
+    assert isinstance(moved.full, ld.GraphBatch)
+    assert same_graphs(moved.full, plain.full) and same_graphs(moved.context, plain.context)
+    assert torch.equal(moved.mask, plain.mask) and torch.equal(moved.legal, plain.legal)
+    assert len(moved.rollout) == len(plain.rollout) == 4
+    for a, b in zip(moved.rollout, plain.rollout):
+        assert (a.graphs is None) == (b.graphs is None) and (a.graphs is None or same_graphs(a.graphs, b.graphs))
+        assert torch.equal(a.index, b.index) and torch.equal(a.move_from, b.move_from)
+    assert moved.rollout[2].graphs is None and compact.rollout[2].graphs is None, "a step that is not a target has no graph"
+
+    # the castling flags are what differs between positions: there are differences, and they are few
+    differing = int(compact.full.changed.numel())
+    assert 0 < differing < 40 * len(samples), differing
+    size = lambda g: sum(t.numel() * t.element_size() for t in vars(g).values() if isinstance(t, torch.Tensor))
+    assert size(compact.full) * 15 < size(plain.full), (size(compact.full), size(plain.full))
+
+    # graphs that do not share their edges, or hold values a byte cannot, are handed over as they are
+    views = [s.full for s in samples[:3]]
+    odd = ld.GraphView(views[1].x, views[1].edge_index[:, :-1], views[1].edge_attr[:-1])
+    assert isinstance(ld.pack_views_compact([views[0], odd]), ld.GraphBatch)
+    half = ld.GraphView(views[1].x * 0.5, views[1].edge_index, views[1].edge_attr)
+    packed = ld.pack_views_compact([views[0], half])
+    assert isinstance(packed, ld.GraphBatch) and same_graphs(packed, ld.pack_views([views[0], half]))
+    assert same_graphs(ld.pack_views_compact(views).expand(), ld.pack_views(views))
+
+    if torch.cuda.is_available():                       # pinned, then expanded on the GPU
+        on_gpu = ld.collate_jepa(samples, compact=True).pin_memory().to("cuda", non_blocking=True)
+        there = plain.to("cuda")
+        assert same_graphs(on_gpu.full, there.full) and same_graphs(on_gpu.rollout[0].graphs, there.rollout[0].graphs)
+
+    # a loader's compact batches are its plain batches
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "fens.txt")
+        with open(path, "w") as f:
+            f.write("\n".join(fens))
+        cache = os.path.join(tmp, "cache")
+        ld.build_position_cache_from_file(path, cache, val_fraction=0.0, test_fraction=0.0, verbose=False)
+        batches = []
+        for compact_loader, workers in ((False, 0), (True, 0), (True, 2)):
+            loader = ld.JEPALoader(cache, "train", 8, num_workers=workers, seed=3, compact=compact_loader)
+            loader.set_rollout_steps(3)
+            batches.append([b.to("cpu") for b in loader])
+        for other in batches[1:]:
+            assert len(other) == len(batches[0])
+            for a, b in zip(other, batches[0]):
+                assert a.fens == b.fens and same_graphs(a.full, b.full) and same_graphs(a.context, b.context)
+                assert all(same_graphs(x.graphs, y.graphs) for x, y in zip(a.rollout, b.rollout))
+
+
 # ##### ##### ##### ##### #####
 #   Runner
 
