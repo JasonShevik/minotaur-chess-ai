@@ -844,7 +844,7 @@ def train_in_subprocess(config: lje.JEPAConfig, run: RunConfig, log: Callable[[s
     GPU can leave CUDA unusable for the rest of its process, and a search is a hundred runs, some of them
     meant to find out what fits. The run needs run.out_dir: the job goes in as <out_dir>/evaluation.json and
     the outcome comes back as <out_dir>/evaluation_result.json. Returns what train returns (of the history,
-    only the rates), and raises what train raises: MemoryBudgetExceeded for any way of running out of memory,
+    only HISTORY_KEPT), and raises what train raises: MemoryBudgetExceeded for any way of running out of memory,
     TrainingDiverged, and EvaluationCrashed for anything else.
     stop: asked twice a second; when it answers True the run is told through its stop file, saves and returns.
     """
@@ -889,7 +889,8 @@ def _evaluate_job(folder: str) -> int:
         outcome: Dict[str, Any] = {"status": "done", "result": {
             "final": result["final"], "steps": result["steps"], "batch_size": result["batch_size"],
             "stopped": result["stopped"],
-            "history": [{"positions_per_s": h["positions_per_s"]} for h in result["history"] if "positions_per_s" in h]}}
+            "history": [{key: h[key] for key in HISTORY_KEPT if key in h}
+                        for h in result["history"] if "positions_per_s" in h]}}
     except TrainingDiverged as error:
         outcome = {"status": "diverged", "error": str(error)}
     except Exception as error:
@@ -1034,6 +1035,33 @@ def _plain(value: Any) -> Any:
     return round(value, 12) if isinstance(value, float) else value
 
 
+# What an evaluation in a process of its own hands back of each logged step
+HISTORY_KEPT = ("step", "positions_per_s", "tokens", "unpool_entropy_per_decision")
+
+
+def unpool_course(history: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    What the unpooling did over a run, from its logged steps: the nodes a position's graph has after unpooling
+    (64 before it; at most 64 x 2 ** unpool_layers) and the entropy of an unpooling decision (about 1.0 for an
+    untrained layer: most decisions are three-way choices about an edge, 1.10 when the three are equally
+    likely; it falls as the decisions settle), each at the first logged step, half-way through, and over the
+    run's ninth and last tenth (so the last two say which way it was still going). {} when nothing was logged.
+    """
+    logged = [h for h in history if "tokens" in h and "unpool_entropy_per_decision" in h]
+    if not logged:
+        return {}
+
+    def mean(key: str, start: float, end: float) -> float:
+        rows = logged[int(start * len(logged)):max(int(start * len(logged)) + 1, int(end * len(logged)))]
+        return sum(h[key] for h in rows) / len(rows)
+
+    course: Dict[str, float] = {}
+    for name, key, shift in (("unpool_nodes", "tokens", -64.0), ("unpool_entropy", "unpool_entropy_per_decision", 0.0)):
+        course.update({f"{name}_first": logged[0][key] + shift, f"{name}_half": mean(key, 0.45, 0.55) + shift,
+                       f"{name}_ninth_tenth": mean(key, 0.8, 0.9) + shift, f"{name}_last_tenth": mean(key, 0.9, 1.0) + shift})
+    return course
+
+
 def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
                    train_fn: Callable[..., Dict[str, Any]] = train, log: Callable[[str], None] = print,
                    work_dir: Optional[str] = None, stop: Optional[Callable[[], bool]] = None,
@@ -1146,6 +1174,8 @@ def make_objective(base_run: RunConfig, fixed: Optional[Dict[str, Any]] = None,
                 # how to run this configuration again: train --config <the search's best_config.json> reads it
                 "run": {"jepa_config": config.to_dict(), "batch_size": batch_size, "warmup_steps": how["warmup_steps"]},
             })
+            if config.uses_unpool:         # how far the graphs grew and whether the decisions settled
+                info.update(unpool_course(result["history"]))
             return ObjectiveResult(metric=float(final["exam_loss"]), info=info)
 
     return objective

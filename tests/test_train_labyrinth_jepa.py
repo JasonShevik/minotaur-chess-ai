@@ -493,6 +493,22 @@ def test_search_objective_scores_runs_and_handles_failures():
         ran = info["run"]
         assert ran["batch_size"] == 8 and ran["jepa_config"]["rollout_stage_positions"] == 12   # half of 48, in 2 stages
         assert "batch_size" not in ran["jepa_config"] and ran["jepa_config"]["gat_style"] == "concat"
+        assert not any(key.startswith("unpool_") for key in info), "nothing unpools in this run"
+
+        # an unpooling run also says how far its graphs grew and whether its decisions settled
+        def unpools(config, run, log=None, stop=None):
+            logged = [{"step": s + 1, "positions_per_s": 10.0, "tokens": 64 + 64 + s,
+                       "unpool_entropy_per_decision": 0.6 - 0.005 * s} for s in range(100)]
+            return {"final": {"exam_loss": 2.0}, "steps": run.total_steps, "history": logged + [{"step": 100, "lidar": 1.0}],
+                    "stopped": False}
+        info = tj.make_objective(base, fixed={**fixed, "token_variant": "unpool"}, log=quiet, train_fn=unpools)(
+            {"batch_size": 8}, 1.0).info
+        assert info["unpool_nodes_first"] == 64 and abs(info["unpool_nodes_half"] - 113.5) < 1e-9, "64 nodes before unpooling"
+        assert abs(info["unpool_nodes_ninth_tenth"] - 148.5) < 1e-9 and abs(info["unpool_nodes_last_tenth"] - 158.5) < 1e-9
+        assert abs(info["unpool_entropy_first"] - 0.6) < 1e-9 and abs(info["unpool_entropy_last_tenth"] - 0.1275) < 1e-9
+        assert info["unpool_entropy_ninth_tenth"] > info["unpool_entropy_last_tenth"], "still falling at the end"
+        assert tj.unpool_course([{"step": 1, "positions_per_s": 10.0}]) == {}
+        assert tj.unpool_course([{"tokens": 100.0, "unpool_entropy_per_decision": 0.3}])["unpool_nodes_last_tenth"] == 36
 
         def finished(run) -> dict:
             return {"final": {"exam_loss": 2.5, "exam_loss_decode_fit": 2.5}, "steps": run.total_steps,
@@ -590,7 +606,7 @@ def test_an_evaluation_runs_in_a_process_of_its_own():
         there = tj.train_in_subprocess(cfg, tiny_run(cache, out, **settings), stop=stop)
         assert there["steps"] == 6 and not there["stopped"] and asked
         assert abs(there["final"]["exam_loss"] - here["final"]["exam_loss"]) < 1e-4, "the same run, in another process"
-        assert len(there["history"]) == 6 and all(set(h) == {"positions_per_s"} for h in there["history"])
+        assert len(there["history"]) == 6 and all(set(h) == set(tj.HISTORY_KEPT) for h in there["history"])
 
         # a stop is passed on through the run's stop file: it saves and says it stopped
         stopped = tj.train_in_subprocess(cfg, tiny_run(cache, os.path.join(tmp, "stopped"), **{**settings, "total_steps": 4000}),
