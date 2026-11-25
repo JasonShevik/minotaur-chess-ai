@@ -403,6 +403,46 @@ def test_a_stopped_run_saves_and_carries_on():
         assert switch() and switch() and not os.path.exists(os.path.join(out, "stop"))
 
 
+def test_a_run_can_be_the_first_part_of_a_longer_one():
+    """
+    stop_at_step: the run follows the longer run's schedules (the target encoder's momentum is spread over
+    total_steps), saves and closes at that step, and the same run without it carries on to the same end.
+    Also: a run with no masked board (JEPAConfig.uses_masked_view False) trains, evaluates and sits the exam.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        cfg = heads_config(mask_weight=0.0, zpred_weight=0.0, decode_masked_weight=0.0, zlegal_masked_weight=0.0,
+                           anticollapse_views="full")
+        assert not cfg.uses_masked_view
+        settings = dict(total_steps=6, eval_every=0, probe_positions=0, grad_terms_every=0, checkpoint_every=0,
+                        snapshot_first=0, snapshot_every=4, exam=True, exam_positions=8, exam_batch_size=4, exam_workers=0)
+        whole = tj.train(cfg, tiny_run(cache, os.path.join(tmp, "whole"), **settings), log=quiet)
+        assert not whole["stopped"] and whole["final"]["exam_loss"] > 0
+        assert not any(key.startswith(("exam_loss_decode_masked", "exam_loss_zlegal_masked")) for key in whole["final"])
+        assert all(h["loss_mask"] == 0.0 for h in whole["history"] if "loss" in h)
+
+        out = os.path.join(tmp, "run")
+        messages = []
+        first = tj.train(cfg, tiny_run(cache, out, stop_at_step=4, **settings), log=messages.append)
+        assert first["stopped"] and first["steps"] == 4 and first["final"] == {}
+        assert any("stopped at step 4 as planned" in m for m in messages)
+        assert os.listdir(os.path.join(out, "snapshots")) == ["step_0000004.pt"]
+        again = tj.train(cfg, tiny_run(cache, out, stop_at_step=4, **settings), log=quiet)
+        assert again["stopped"] and again["steps"] == 4, "the same command stays where it stopped"
+        rest = tj.train(cfg, tiny_run(cache, out, **settings), log=quiet)
+        assert not rest["stopped"] and rest["steps"] == 6
+        with open(os.path.join(out, "history.jsonl")) as f:
+            entries = [json.loads(line) for line in f if '"loss"' in line]
+        expected = [h for h in whole["history"] if "loss" in h]
+        assert len(entries) == 6
+        assert all(abs(a["loss"] - b["loss"]) < 1e-4 for a, b in zip(entries, expected)), "the same run as the long one"
+        assert all(a["momentum"] == b["momentum"] for a, b in zip(entries, expected) if "momentum" in a)
+        assert abs(rest["final"]["exam_loss"] - whole["final"]["exam_loss"]) < 1e-3
+        # a stop_at_step at or past the end changes nothing
+        late = tj.train(cfg, tiny_run(cache, os.path.join(tmp, "late"), stop_at_step=6, **settings), log=quiet)
+        assert not late["stopped"] and late["steps"] == 6
+
+
 def test_a_stopped_run_carries_on_on_the_gpu():
     """The checkpoint is loaded onto the run's device, the random generator's state with it; resuming on a GPU
     must still restore it (it once failed there, and only there)."""

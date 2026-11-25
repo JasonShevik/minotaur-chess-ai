@@ -156,6 +156,10 @@ class RunConfig:
     threat_db: Optional[str] = "minotaur_reach.db"   # the labels database (reach_labeler.py), for the legal-threat head
     threat_compute: bool = True                      # search the positions it does not hold on the spot (needs the
                                                      # compiled search, build_fast_reach.py); False: leave them ungraded
+    stop_at_step: Optional[int] = None               # save and close at this step, as a stop request does: the first
+                                                     # part of a longer run, on that run's schedules (total_steps sets
+                                                     # the target encoder's and the learning rate's), to carry on later
+                                                     # or to compare with the longer run's snapshot at the same step
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -666,8 +670,9 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
 
     final: Dict[str, float] = {}
     stopped = False
+    stop_at = run.stop_at_step if run.stop_at_step is not None and run.stop_at_step < run.total_steps else None
     while step < run.total_steps:
-        if stop is not None and stop():
+        if (stop is not None and stop()) or (stop_at is not None and step >= stop_at):
             stopped = True
             break
         new_weights = lje.rollout_schedule(config, step * batch_size)
@@ -797,8 +802,11 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
             _snapshot(paths["snapshots"], model, step, config, run)
 
     if stopped:
-        log(f"[{step:>7}] stopped on request" + (f": saved {paths['last.pt']}; the same command carries on from here"
-                                                  if paths else ""))
+        planned = stop_at is not None and step >= stop_at
+        how = "the same command with a later stop_at_step, or none, carries on" if planned \
+            else "the same command carries on from here"
+        log(f"[{step:>7}] " + (f"stopped at step {stop_at} as planned" if planned else "stopped on request")
+            + (f": saved {paths['last.pt']}; {how}" if paths else ""))
     else:
         final = run_eval()
     if paths:
@@ -1326,6 +1334,9 @@ def main() -> None:
     t.add_argument("--checkpoint-every", type=int, default=RunConfig.checkpoint_every,
                    help="save last.pt every this many steps (a stop always saves it)")
     t.add_argument("--no-resume", action="store_true")
+    t.add_argument("--stop-at", type=int, default=None,
+                   help="save and close at this step (before --steps): the first part of a longer run, on that run's "
+                        "schedules; the same command with a later --stop-at, or none, carries on")
     t.add_argument("--exam", action="store_true",
                    help="every evaluation also sits the exam: the heads' losses with the whole rollout and every "
                         "threat ply at full weight, whatever the curricula have reached")
@@ -1374,7 +1385,7 @@ def main() -> None:
         run = replace(run, out_dir=args.out, total_steps=args.steps, eval_every=args.eval_every,
                       min_lr_fraction=args.min_lr_fraction,
                       warmup_steps=args.warmup_steps or how.get("warmup_steps") or RunConfig.warmup_steps,
-                      checkpoint_every=args.checkpoint_every, resume=not args.no_resume,
+                      checkpoint_every=args.checkpoint_every, resume=not args.no_resume, stop_at_step=args.stop_at,
                       exam=args.exam, eager_rollouts=args.eager_rollouts,
                       probe_db=args.probe_db, probe_puzzles=args.probe_puzzles,
                       probe_positions=args.probe_positions,

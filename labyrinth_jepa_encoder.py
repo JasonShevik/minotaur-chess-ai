@@ -463,6 +463,16 @@ class JEPAConfig:
         return self.num_edge_types + int(self.orientation_anchor)
 
     @property
+    def uses_masked_view(self) -> bool:
+        """Whether anything reads the masked board: the masked-square loss, the whole-board prediction or a head
+        judging it, or the regularizer. When nothing does (all four weights 0 and anticollapse_views "full"),
+        the masked board is not encoded at all."""
+        regularized = self.anticollapse != "none" and (self.anticollapse_views in ("both", "masked")
+                                                       or self.anticollapse_squares)
+        return (self.mask_weight > 0 or self.zpred_weight > 0 or self.decode_masked_weight > 0
+                or self.zlegal_masked_weight > 0 or self.zthreat_masked_weight > 0 or regularized)
+
+    @property
     def decodes_predictions(self) -> bool:
         return self.decode_next_weight > 0 or self.decode_masked_weight > 0
 
@@ -1784,13 +1794,17 @@ class LabyrinthJEPA(nn.Module):
                             for step in steps]
 
         # ---- masked squares ----
-        ctx_masked = self.encoder(batch.context, mask=batch.mask, rng=rng)
-        pred = self.mask_predictor(ctx_masked.squares, batch.context, batch.mask)
-        per_square = self._distance(pred[batch.mask], target_full.squares.reshape(B * 64, -1)[batch.mask])
-        owner = batch.full.batch[batch.mask]
-        n_masked = torch.bincount(owner, minlength=B).clamp_min(1)
-        mask_per_pos = torch.zeros(B, device=per_square.device).index_add(0, owner, per_square) / n_masked
-        mask_loss = mask_per_pos.mean()
+        # (With nothing reading the masked board it is left out: no encoder pass, a masked-square loss of 0.)
+        if c.uses_masked_view:
+            ctx_masked = self.encoder(batch.context, mask=batch.mask, rng=rng)
+            pred = self.mask_predictor(ctx_masked.squares, batch.context, batch.mask)
+            per_square = self._distance(pred[batch.mask], target_full.squares.reshape(B * 64, -1)[batch.mask])
+            owner = batch.full.batch[batch.mask]
+            n_masked = torch.bincount(owner, minlength=B).clamp_min(1)
+            mask_per_pos = torch.zeros(B, device=per_square.device).index_add(0, owner, per_square) / n_masked
+            mask_loss = mask_per_pos.mean()
+        else:
+            ctx_masked, mask_per_pos, mask_loss = None, None, target_full.z.new_zeros(())
 
         # ---- next positions: a latent rollout, a loss at every step ----
         predictions: List[torch.Tensor] = []
@@ -2050,7 +2064,8 @@ class LabyrinthJEPA(nn.Module):
         rl = total.new_zeros(())
         if rl_on:
             terms = []
-            masked = ([c.mask_weight * mask_per_pos] if c.transformer_layers > 0 else []) + charged["masked"]
+            masked = ([c.mask_weight * mask_per_pos] if c.transformer_layers > 0 and ctx_masked is not None
+                      else []) + charged["masked"]
             if masked:
                 terms.append(("mask", ctx_masked, sum(masked), slice(None)))
             if ctx_full is not None:
@@ -2072,15 +2087,18 @@ class LabyrinthJEPA(nn.Module):
             total = total + contributions["rl"]
 
         with torch.no_grad():
-            z = ctx_masked.z
+            # The online encoder's reading the figures below describe: the masked board's, or without one the
+            # whole board's (the target encoder's when the online encoder read nothing at all).
+            shown = ctx_masked if ctx_masked is not None else ctx_full if ctx_full is not None else target_full
+            z = shown.z
             stats.update({
                 "loss_mask": float(mask_loss), "loss_next": float(next_loss),
                 "z_std": float(z.std(0).mean()),                         # falls toward 0 on collapse
                 "z_mean_cosine": float(F.cosine_similarity(z, z.mean(0, keepdim=True)).mean()),  # near 1: all z alike
                 "anticollapse": float(anticollapse),
                 "target_z_std": float(target_full.z.std(0).mean()),
-                "tokens": float(ctx_masked.num_tokens.float().mean()),
-                "unpool_entropy_per_decision": float((ctx_masked.entropy / ctx_masked.num_decisions.clamp_min(1)).mean()),
+                "tokens": float(shown.num_tokens.float().mean()),
+                "unpool_entropy_per_decision": float((shown.entropy / shown.num_decisions.clamp_min(1)).mean()),
             })
         return JEPALosses(total, mask_loss, next_loss, rl, anticollapse, stats, contributions)
 

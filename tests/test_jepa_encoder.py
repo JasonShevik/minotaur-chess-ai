@@ -1354,6 +1354,55 @@ def test_heads_alone_train_without_the_latent_losses():
     assert float(again.total) == float(out.total)
 
 
+def test_the_masked_board_is_left_out_when_nothing_reads_it():
+    """
+    With the masked weights at 0 and the regularizer on the whole board only, the masked board is not encoded:
+    one pass of the online encoder instead of two, a masked-square loss of 0, the masked-square predictor
+    untouched, and the terms that never read it exactly as they are with it. Any one reader brings it back.
+    """
+    heads = dict(zhead_fit="online", decode_next_weight=1.0, anticollapse="sigreg")
+    off = dict(mask_weight=0.0, zpred_weight=0.0, decode_masked_weight=0.0)
+    assert small_config("squares", anticollapse_views="both", **off, **heads).uses_masked_view
+    assert small_config("squares", anticollapse_views="full", anticollapse_squares=True, **off, **heads).uses_masked_view
+    assert small_config("squares", anticollapse_views="full", **heads).uses_masked_view            # mask_weight 1
+    for key in ("zpred_weight", "decode_masked_weight"):
+        assert small_config("squares", anticollapse_views="full", **{**off, key: 1.0}, **heads).uses_masked_view, key
+    for variant in ("squares", "unpool"):
+        cfg = small_config(variant, anticollapse_views="full", **off, **heads)
+        cfg.validate()
+        assert not cfg.uses_masked_view
+        torch.manual_seed(0)
+        model = lje.LabyrinthJEPA(cfg)
+        assert model.full_predictor is None
+        batch = make_batch(cfg)
+        passes = []
+        hook = model.encoder.register_forward_hook(lambda *_: passes.append(1))
+        out = model.losses(batch, rng=torch.Generator().manual_seed(0))
+        hook.remove()
+        assert len(passes) == 1, (variant, len(passes))
+        assert float(out.terms["mask"]) == 0.0 and float(out.mask) == 0.0
+        assert "anticollapse_full" in out.terms and "anticollapse_masked" not in out.terms
+        for key in ("z_std", "z_mean_cosine", "tokens", "unpool_entropy_per_decision", "loss_mask"):
+            assert math.isfinite(out.stats[key]), key
+        out.total.backward()
+        assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder.parameters())
+        assert all(p.grad is None for p in model.mask_predictor.parameters())
+        if variant == "unpool":
+            assert "rl" in out.terms
+            continue
+        # the same weights with the masked board regularized too: the terms that do not read it are unchanged
+        torch.manual_seed(0)
+        both = lje.LabyrinthJEPA(small_config(variant, anticollapse_views="both", **off, **heads))
+        assert all(torch.equal(v, model.state_dict()[k]) for k, v in both.state_dict().items())
+        passes = []
+        hook = both.encoder.register_forward_hook(lambda *_: passes.append(1))
+        with_view = both.losses(batch, rng=torch.Generator().manual_seed(0))
+        hook.remove()
+        assert len(passes) == 2
+        for name in ("next", "decode_fit", "decode_next"):
+            assert float(with_view.terms[name]) == float(out.terms[name]), name
+
+
 def test_predictors_can_read_z_layer_normalized():
     """
     predictor_input_norm layer-normalizes z where it enters the next-position, whole-board and move predictors:
