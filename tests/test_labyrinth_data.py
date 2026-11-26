@@ -447,6 +447,87 @@ def test_sibling_moves_are_other_first_moves_from_the_same_position():
         assert torch.equal(with_siblings.parent, without.parent) and torch.equal(with_siblings.index, without.index)
 
 
+def test_branches_are_other_lines_of_play_from_the_same_position():
+    rng = random.Random(27)
+    boards = random_positions(8, seed=27, per_start=3)
+    boards.append(chess.Board("7k/8/8/8/8/8/8/K6R b - - 0 1", chess960=True))   # in check, two legal moves
+    seeds = [rng.randrange(10 ** 9) for _ in boards]
+    alone = [ld.build_sample(ld.fen_of(b), random.Random(s), rollout_steps=4) for b, s in zip(boards, seeds)]
+    samples = [ld.build_sample(ld.fen_of(b), random.Random(s), rollout_steps=4, siblings=2, branches=(3, 3))
+               for b, s in zip(boards, seeds)]
+    for board, a, s in zip(boards, alone, samples):
+        # the mask and the rollout are the same with and without branches
+        assert torch.equal(a.mask, s.mask) and [m.move for m in a.rollout] == [m.move for m in s.rollout]
+        assert a.branches == []
+        start = chess.Board(ld.fen_of(board), chess960=True)
+        legal = {m.uci() for m in start.legal_moves}
+        assert len(s.branches) == min(2, max(0, len(legal) - 1 - len(s.siblings)))
+        firsts = [s.rollout[0].move] + [m.move for m in s.siblings] + [line[0].move for line in s.branches]
+        assert len(set(firsts)) == len(firsts) and set(firsts) <= legal, "every line starts with a move of its own"
+        orient = (lambda sq: sq) if start.turn == chess.WHITE else (lambda sq: sq ^ 56)
+        for line in s.branches:
+            assert 1 <= len(line) <= 3
+            current = start.copy()
+            for m in line:                                   # a line of legal play, each move from where the last one led
+                move = chess.Move.from_uci(m.move)
+                assert move in current.legal_moves
+                assert m.from_square == orient(move.from_square), "squares in the starting position's frame"
+                current.push(move)
+                assert m.next_fen == ld.fen_of(current) and m.view is not None and m.threats is None
+            assert len(line) == 3 or not list(current.legal_moves), "shorter only when the game ends"
+    assert samples[-1].branches == [], "two legal moves: the rollout's and the sibling's, none left for a branch"
+    # never longer than the rollout; a graph only on target steps
+    short = ld.build_sample(ld.fen_of(boards[0]), random.Random(seeds[0]), rollout_steps=2, target_steps=[2], branches=(3, 1))
+    assert [len(line) for line in short.branches] == [2, 1]
+    assert [m.view is not None for m in short.branches[0]] == [False, True] and short.branches[1][0].view is None
+
+    batch, plain = ld.collate_jepa(samples), ld.collate_jepa([ld.build_sample(ld.fen_of(b), random.Random(s), rollout_steps=4, siblings=2)
+                                                             for b, s in zip(boards, seeds)])
+    assert len(batch.rollout) == 4
+    rows_of = []                                             # per step: (sample, line or -1 for a sibling, the move)
+    for k in range(4):
+        rows = [(i, 0, s.rollout[k]) for i, s in enumerate(samples) if len(s.rollout) > k]
+        if k == 0:
+            rows += [(i, -1, m) for i, s in enumerate(samples) for m in s.siblings]
+        rows += [(i, b + 1, line[k]) for i, s in enumerate(samples) for b, line in enumerate(s.branches) if len(line) > k]
+        rows_of.append(rows)
+    for k, (step, rows) in enumerate(zip(batch.rollout, rows_of)):
+        n = plain.rollout[k].index.numel()
+        # the rollouts' (and siblings') rows are where they are without branches; the branches' rows follow
+        assert step.index.tolist() == [i for i, _, _ in rows] and step.index[:n].tolist() == plain.rollout[k].index.tolist()
+        assert torch.equal(step.parent[:n], plain.rollout[k].parent) and torch.equal(step.move_from[:n], plain.rollout[k].move_from)
+        assert step.graphs.num_graphs == len(rows)
+        x = step.graphs.x.view(len(rows), 64, -1)
+        for row, (i, line, m) in enumerate(rows):
+            assert torch.equal(x[row], m.view.x), "each row's graph is its own move's position"
+            assert int(step.move_from[row]) == i * 64 + m.from_square and int(step.move_to[row]) == i * 64 + m.to_square
+            if k == 0:
+                assert int(step.parent[row]) == i
+            else:                                            # its parent row is the same line's move before it
+                pi, pline, pm = rows_of[k - 1][int(step.parent[row])]
+                assert (pi, pline) == (i, line)
+                before = samples[i].rollout[k - 1] if line == 0 else samples[i].branches[line - 1][k - 1]
+                assert pm is before
+    assert batch.to("cpu").rollout[2].index.tolist() == batch.rollout[2].index.tolist()
+    compact = ld.collate_jepa(samples, compact=True).to("cpu")
+    assert all(torch.equal(a.graphs.x, b.graphs.x) and torch.equal(a.parent, b.parent) for a, b in zip(compact.rollout, batch.rollout))
+
+    # legal-threat labels: the rollout's own positions only, unless the source says branches too
+    fen = ld.fen_of(boards[0])
+    for with_branches in (False, True):
+        source = SearchedThreats(1, rollout_steps=2, branches=with_branches)
+        s = ld.build_sample(fen, random.Random(5), rollout_steps=3, branches=(3, 2), threats=source)
+        assert [m.threats is not None for m in s.rollout] == [True, True, False]
+        assert all(m.threats.origin == ld.THREATS_COMPUTED for m in s.rollout[:2])
+        for line in s.branches:
+            assert [m.threats is not None for m in line] == [True, True, False][:len(line)]
+            wanted = ld.THREATS_COMPUTED if with_branches else ld.THREATS_NONE
+            assert all(m.threats.origin == wanted for m in line[:2])
+            assert all((m.threats.codes.size > 0) == with_branches for m in line[:2])
+        packed = ld.collate_jepa([s]).rollout[0].threats
+        assert packed.origin.tolist() == [ld.THREATS_COMPUTED] + [ld.THREATS_COMPUTED if with_branches else ld.THREATS_NONE] * len(s.branches)
+
+
 def test_legal_moves_are_listed_in_the_graphs_frame():
     boards = random_positions(12, seed=31, per_start=6)
     boards += [chess.Board(f, chess960=True) for f in (

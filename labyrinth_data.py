@@ -26,6 +26,8 @@ DataLoader worker processes so the GPU never waits.
             latent space never sees the intermediate positions,
           * optionally (siblings > 1) other legal first moves from the same position and the positions
             they lead to: several different moves to predict from one board,
+          * optionally (branches) other lines of play from the same position, each with a first move of its
+            own and random moves after it: a tree of positions to predict instead of one path,
           * the position's legal moves, as from/to square pairs of its graph: labels the rules give, for
             heads graded against the board itself instead of against the target encoder,
           * optionally (threats: a ThreatLabels) the position's legal-threat labels, and those of the positions
@@ -564,13 +566,18 @@ class ThreatLabels:
       * failing both, the position goes without a label and whatever is graded against threats leaves it out.
     rollout_steps: the positions after this many of a sample's first rollout moves get labels too (the
     labeller labels reach_labeler.ROLLOUT_PLIES of them); 0 when nothing judges those positions.
+    branches: whether the positions on a sample's other branches (build_sample's `branches`) get labels as well,
+    to the same depth; without it they go unlabelled and ungraded, and a sample costs the same searches as
+    without branches.
     It can be pickled: each loader worker opens the database for itself.
     """
 
-    def __init__(self, plies: int, db_path: Optional[str] = None, compute: bool = True, rollout_steps: int = 2):
+    def __init__(self, plies: int, db_path: Optional[str] = None, compute: bool = True, rollout_steps: int = 2,
+                 branches: bool = False):
         if plies < 0 or rollout_steps < 0:
             raise ValueError("need plies >= 0 and rollout_steps >= 0")
         self.plies, self.db_path, self.compute, self.rollout_steps = int(plies), db_path, bool(compute), int(rollout_steps)
+        self.branches = bool(branches)
         self._conn: Optional[sqlite3.Connection] = None
         self._looked = False
 
@@ -642,8 +649,12 @@ class ThreatLabels:
         """The position's labels in its own frame (fen as fen_of writes it: what the labels are stored under)."""
         counts, origin = self.counts(fen)
         if counts is None:
-            return PositionThreats(np.zeros(0, np.int32), np.zeros(0, np.float32), THREATS_NONE, self.layers)
+            return self.none()
         return PositionThreats(*threat_cells(counts, white_to_move), origin, self.layers)
+
+    def none(self) -> PositionThreats:
+        """A position without a label: it keeps its row in a batch, and nothing of it is graded."""
+        return PositionThreats(np.zeros(0, np.int32), np.zeros(0, np.float32), THREATS_NONE, self.layers)
 
 
 @dataclass
@@ -715,6 +726,8 @@ class JEPASample:
                                                      # graph's frame (the rook's square for castling; the
                                                      # promotions of one pawn move count once), sorted
     threats: Optional[PositionThreats] = None        # its legal-threat labels (None: the loader has no ThreatLabels)
+    branches: List[List[NextPosition]] = field(default_factory=list)   # other lines of play from the same position:
+                                                     # each starts with a first move of its own and goes on from there
 
     @property
     def next(self) -> Optional[NextPosition]:
@@ -753,7 +766,7 @@ def build_views(fen: str, mask: torch.Tensor) -> Tuple[GraphView, GraphView, che
 def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskConfig(),
                  mask: Optional[torch.Tensor] = None, rollout_steps: int = 1,
                  target_steps: Optional[Sequence[int]] = None, siblings: int = 1,
-                 threats: Optional[ThreatLabels] = None) -> JEPASample:
+                 threats: Optional[ThreatLabels] = None, branches: Sequence[int] = ()) -> JEPASample:
     """
     Everything one position contributes to a training step. fen should be normalized (normalize_fen);
     the cache already is. mask: use this mask instead of sampling one. rollout_steps: how many random
@@ -764,9 +777,15 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     each with its position as a target when step 1 is one. A target step also lists the legal moves of
     the position it leads to. threats: where to get legal-threat labels: the position's own, and those of the
     positions its first threats.rollout_steps target steps lead to.
+    branches: other lines of play from the same position, one for each number given: a first move no other
+    line starts with, then random legal moves up to that many plies in all (never more than rollout_steps;
+    fewer branches when the position has too few moves, a shorter one when its game ends). Their positions are
+    targets at the same steps as the rollout's. They carry legal-threat labels only when threats.branches is
+    set; otherwise they are marked unlabelled, and only the rollout's own positions are graded on threats.
 
-    The random draws come in a fixed order (mask, then move 1, move 2, ..., then the sibling moves), so
-    for a given rng the mask and the rollout's moves are the same whatever rollout_steps and siblings are.
+    The random draws come in a fixed order (mask, then move 1, move 2, ..., then the sibling moves, then the
+    branches one after the other), so for a given rng the mask and the rollout's moves are the same whatever
+    rollout_steps, siblings and branches are.
     """
     if mask is None:
         mask = sample_mask(rng, mask_config)
@@ -778,9 +797,10 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
     rollout: List[NextPosition] = []
     targets = None if target_steps is None else set(target_steps)
 
-    def play(current: chess.Board, move: chess.Move, rooks, k: int):
+    def play(current: chess.Board, move: chess.Move, rooks, k: int, labelled: bool = True):
         """Move k, played from `current`: its NextPosition, the board and the castling rook squares after
-        it, and that board's legal moves when the step is a target (else None: not listed yet)."""
+        it, and that board's legal moves when the step is a target (else None: not listed yet). labelled
+        False: where the position would get a legal-threat label it is marked as having none."""
         t = cg.move_transition(current, move, rooks)
         after = current.copy(stack=False)
         after.push(move)
@@ -789,7 +809,7 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
             view = GraphView.from_edge_lists(*cg.create_filled_chess_graphs(t.next_fen, t.next_castling_rook_squares))
             after_moves = list(after.legal_moves)
             if threats is not None and k <= threats.rollout_steps:
-                after_threats = threats.of(fen_of(after), after.turn == chess.WHITE)
+                after_threats = threats.of(fen_of(after), after.turn == chess.WHITE) if labelled else threats.none()
         step = NextPosition(t.move, t.next_fen, orient(move.from_square), orient(move.to_square),
                             current.piece_type_at(move.from_square), t.promotion,
                             (t.is_castling, t.is_capture, t.is_en_passant), view,
@@ -812,11 +832,27 @@ def build_sample(fen: str, rng: random.Random, mask_config: MaskConfig = MaskCon
         step, current, current_rooks, moves = play(current, move, current_rooks, k)
         rollout.append(step)
     extra: List[NextPosition] = []
+    sibling_moves: List[chess.Move] = []
     if siblings > 1:
-        extra = [play(board, move, rook_squares, 1)[0]
-                 for move in rng.sample(other_first_moves, min(siblings - 1, len(other_first_moves)))]
+        sibling_moves = rng.sample(other_first_moves, min(siblings - 1, len(other_first_moves)))
+        extra = [play(board, move, rook_squares, 1)[0] for move in sibling_moves]
+    lines: List[List[NextPosition]] = []
+    if branches and rollout:
+        free = [m for m in other_first_moves if m not in sibling_moves]
+        labelled = threats is not None and threats.branches
+        for length, move in zip(branches, rng.sample(free, min(len(branches), len(free)))):
+            step, current, current_rooks, moves = play(board, move, rook_squares, 1, labelled)
+            line = [step]
+            for k in range(2, min(int(length), rollout_steps) + 1):
+                if moves is None:
+                    moves = list(current.legal_moves)
+                if not moves:
+                    break
+                step, current, current_rooks, moves = play(current, rng.choice(moves), current_rooks, k, labelled)
+                line.append(step)
+            lines.append(line)
     own_threats = threats.of(fen, board.turn == chess.WHITE) if threats is not None else None
-    return JEPASample(fen, full, context, mask, rollout, extra, legal, own_threats)
+    return JEPASample(fen, full, context, mask, rollout, extra, legal, own_threats, lines)
 
 
 # ##### ##### ##### ##### #####
@@ -1049,20 +1085,19 @@ def collate_jepa(samples: Sequence[JEPASample], compact: bool = False) -> JEPABa
     """
     pack = pack_views_compact if compact else pack_views
     steps: List[RolloutStep] = []
-    previous: List[int] = []
-    for k in range(max((len(s.rollout) for s in samples), default=0)):
-        ids = [i for i, s in enumerate(samples) if len(s.rollout) > k]
-        moves = [samples[i].rollout[k] for i in ids]
+    # A step's rows: the rollouts' own moves first, then (step 1 only) the sibling moves, then the branches',
+    # so the rows a rollout continues from are where they are without siblings and branches. A row is known by
+    # (its sample, its line of play): line 0 is the rollout, 1, 2, ... the branches.
+    previous: Dict[Tuple[int, int], int] = {}
+    depth = max((max([len(s.rollout)] + [len(line) for line in s.branches]) for s in samples), default=0)
+    for k in range(depth):
+        rows = [(i, 0, s.rollout[k]) for i, s in enumerate(samples) if len(s.rollout) > k]
         if k == 0:
-            # Sibling moves go after the rollouts' own first moves, so the rows that move 2 continues from stay put
-            rows = ids + [i for i, s in enumerate(samples) for _ in s.siblings]
-            moves = moves + [m for s in samples for m in s.siblings]
-            index = torch.tensor(rows, dtype=torch.long)
-            parent = index.clone()
-        else:
-            index = torch.tensor(ids, dtype=torch.long)
-            row_of = {sample: row for row, sample in enumerate(previous)}
-            parent = torch.tensor([row_of[i] for i in ids], dtype=torch.long)
+            rows += [(i, -1, m) for i, s in enumerate(samples) for m in s.siblings]
+        rows += [(i, b + 1, line[k]) for i, s in enumerate(samples) for b, line in enumerate(s.branches) if len(line) > k]
+        moves = [m for _, _, m in rows]
+        index = torch.tensor([i for i, _, _ in rows], dtype=torch.long)
+        parent = index.clone() if k == 0 else torch.tensor([previous[i, line] for i, line, _ in rows], dtype=torch.long)
         steps.append(RolloutStep(
             graphs=pack([m.view for m in moves]) if moves[0].view is not None else None,
             index=index,
@@ -1076,7 +1111,7 @@ def collate_jepa(samples: Sequence[JEPASample], compact: bool = False) -> JEPABa
                                dtype=torch.long) if moves[0].view is not None else None,
             threats=ThreatBatch.pack([m.threats for m in moves]) if moves[0].threats is not None else None,
         ))
-        previous = ids
+        previous = {(i, line): row for row, (i, line, _) in enumerate(rows) if line >= 0}
     return JEPABatch(
         full=pack([s.full for s in samples]),
         context=pack([s.context for s in samples]),
@@ -1111,6 +1146,7 @@ class PositionDataset(Dataset):
         self.rollout_steps = 1
         self.rollout_targets: Optional[List[int]] = None     # None: every step is a target
         self.siblings = 1                                     # different first moves per position (build_sample)
+        self.branches: Tuple[int, ...] = ()                   # other lines of play per position, by length (build_sample)
         self.threats: Optional[ThreatLabels] = None           # where legal-threat labels come from (None: no labels)
         self._positions: Optional[np.ndarray] = None
         total = len(np.load(self.path, mmap_mode="r"))
@@ -1140,7 +1176,8 @@ class PositionDataset(Dataset):
 
     def __getitem__(self, i: int) -> JEPASample:
         return build_sample(self.fen(i), self.rng_for(i), self.mask_config, rollout_steps=self.rollout_steps,
-                            target_steps=self.rollout_targets, siblings=self.siblings, threats=self.threats)
+                            target_steps=self.rollout_targets, siblings=self.siblings, threats=self.threats,
+                            branches=self.branches)
 
 
 class _EpochShuffle(Sampler):
@@ -1179,9 +1216,10 @@ class JEPALoader:
                  mask_config: MaskConfig = MaskConfig(), seed: int = 0, shuffle: bool = True,
                  drop_last: bool = False, indices: Optional[Sequence[int]] = None, pin_memory: bool = False,
                  prefetch_factor: int = 4, siblings: int = 1, threats: Optional[ThreatLabels] = None,
-                 compact: bool = False):
+                 compact: bool = False, branches: Sequence[int] = ()):
         self.dataset = PositionDataset(cache_dir, split, mask_config, seed, indices)
         self.dataset.siblings = int(siblings)
+        self.dataset.branches = tuple(int(length) for length in branches)
         self.dataset.threats = threats
         self.sampler = _EpochShuffle(self.dataset, shuffle)
         self.loader_kwargs = dict(batch_size=batch_size, sampler=self.sampler, num_workers=num_workers,

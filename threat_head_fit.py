@@ -221,6 +221,9 @@ def main() -> None:
         path = os.path.join(folder, "snapshots", f"step_{int(snap):07d}.pt")
         encoders[name] = pl.load_encoder(path, device, "online" if args.online else "target")
     heads = [h.strip() for h in args.heads.split(",") if h.strip()]
+    unknown = [h for h in heads if h not in lje.THREAT_HEADS]
+    if unknown:
+        parser.error(f"--heads: {unknown} not among {lje.THREAT_HEADS}")
     results = run(encoders, args.db, args.cache, heads, args.mode, args.plies, args.positions, args.test_positions,
                   args.steps, device, seed=args.seed)
     print()

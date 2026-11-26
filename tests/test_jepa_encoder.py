@@ -14,6 +14,8 @@ They check contracts, not learning:
   * LiDAR, RankMe and the self-consistency ratio behave as defined on constructed embeddings;
   * unpooling into slots for the concat readout, and what its decisions are rewarded with.
 """
+import dataclasses
+import json
 import math
 import random
 import sys
@@ -418,6 +420,80 @@ def test_sibling_moves_are_graded_with_the_first_step():
     assert torch.isfinite(losses.total) and "loss_inverse" in losses.stats
     losses.total.backward()
     assert float(model.next_predictor.names[0].weight.grad.abs().sum()) > 0
+
+
+def test_branches_are_predicted_step_by_step_from_their_own_line():
+    """
+    rollout_branches: the batch's steps hold the rollouts' rows and then the branches', each row continuing
+    from its own line's prediction. The rollouts' predictions are what they are without branches; a branch's
+    are what a rollout of its moves alone would give; the threat head judges the rollouts' positions only.
+    """
+    cfg = small_config("squares", rollout_max_steps=4, rollout_branches=(3, 3), move_encoding="rank_file",
+                       zhead_fit="online", decode_next_weight=1.0, zthreat_next_weight=1.0, zthreat_plies=1,
+                       zthreat_rollout_steps=2, zthreat_dim=8, zthreat_hidden=8)
+    cfg.validate()
+    assert lje.JEPAConfig.from_dict({"rollout_max_steps": 4, "rollout_branches": [3, 3]}).rollout_branches == (3, 3)
+    # the settings come back from a JSON file as they were written, and build the same config
+    assert json.loads(json.dumps(cfg.to_dict())) == cfg.to_dict() and lje.JEPAConfig.from_dict(cfg.to_dict()) == cfg
+    for bad in ((0,), (5,), (2.5,)):
+        try:
+            small_config("squares", rollout_max_steps=4, rollout_branches=bad).validate()
+            raise AssertionError(f"rollout_branches {bad} accepted")
+        except ValueError:
+            pass
+    torch.manual_seed(0)
+    model = lje.LabyrinthJEPA(cfg)
+    source = SearchedThreats(1, rollout_steps=cfg.zthreat_rollout_steps)
+
+    def samples_with(branches):                          # one generator per position, as the dataset has
+        return [ld.build_sample(f, random.Random(40 + i), cfg.mask_config(), rollout_steps=4, branches=branches,
+                                threats=source) for i, f in enumerate(FENS[:4])]
+
+    tree, path = samples_with(cfg.rollout_branches), samples_with(())
+    batch, alone = ld.collate_jepa(tree), ld.collate_jepa(path)
+    wanted = sum(min(2, chess.Board(f, chess960=True).legal_moves.count() - 1) for f in FENS[:4])
+    assert sum(len(s.branches) for s in tree) == wanted >= 6 and len(tree[1].branches) == 2
+    assert [step.index.numel() for step in batch.rollout][:3] == [alone.rollout[k].index.numel() + sum(
+        len(line) > k for s in tree for line in s.branches) for k in range(3)]
+    assert batch.rollout[3].index.numel() == alone.rollout[3].index.numel(), "the branches end after three plies"
+    with torch.no_grad():
+        enc = model.encoder(batch.full)
+        a = model.predict_rollout(enc.z, enc.squares, alone.rollout)
+        b = model.predict_rollout(enc.z, enc.squares, batch.rollout)
+        assert all(torch.allclose(x, y[:x.size(0)], atol=1e-6) for x, y in zip(a, b)), "the rollouts are untouched"
+        # one branch on its own, as if it were its position's rollout
+        i = 1
+        line = tree[i].branches[0]
+        lone = dataclasses.replace(tree[i], rollout=line, branches=[], siblings=[])
+        only = ld.collate_jepa([lone])
+        one = model.encoder(only.full)
+        c = model.predict_rollout(one.z, one.squares, only.rollout)
+        for k, pred in enumerate(c):
+            rows = [(j, 0) for j, s in enumerate(tree) if len(s.rollout) > k]
+            rows += [(j, n + 1) for j, s in enumerate(tree) for n, other in enumerate(s.branches) if len(other) > k]
+            assert torch.allclose(pred[0], b[k][rows.index((i, 1))], atol=1e-5), f"the branch's step {k + 1}"
+    losses = model.losses(batch, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0] * 4)
+    assert torch.isfinite(losses.total) and all(f"loss_next_{k}" in losses.stats for k in (1, 2, 3, 4))
+    assert "zthreat_next_found_step2" in losses.stats and "zthreat_next_found_step3" not in losses.stats
+    # the threat head's judgement of the predictions is the one the rollouts alone get: the branches' rows are not graded
+    lone_losses = model.losses(alone, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0] * 4)
+    assert abs(float(losses.terms["zthreat_next"]) - float(lone_losses.terms["zthreat_next"])) < 1e-5
+    assert abs(float(losses.terms["decode_next"]) - float(lone_losses.terms["decode_next"])) > 1e-6, "the decoder judges them all"
+    losses.total.backward()
+    assert float(model.next_predictor.names[0].weight.grad.abs().sum()) > 0
+    # with labels on the branches too, the threat term changes
+    labelled = ld.collate_jepa([ld.build_sample(f, random.Random(40 + i), cfg.mask_config(), rollout_steps=4,
+                                                branches=cfg.rollout_branches,
+                                                threats=SearchedThreats(1, rollout_steps=2, branches=True))
+                                for i, f in enumerate(FENS[:4])])
+    more = model.losses(labelled, rng=torch.Generator().manual_seed(0), rollout_weights=[1.0] * 4)
+    assert abs(float(more.terms["zthreat_next"]) - float(losses.terms["zthreat_next"])) > 1e-6
+    # an unknown head name is refused where it used to build the piece_mlp head
+    try:
+        lje.ZThreatHead(dataclasses.replace(cfg, zthreat_head="bi-linear"))
+        raise AssertionError("an unknown zthreat_head was accepted")
+    except ValueError:
+        pass
 
 
 def test_latent_rollout_trains_every_step_without_peeking():

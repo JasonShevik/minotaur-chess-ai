@@ -25,6 +25,9 @@ answers the predictors are graded against. Two predictors give the training sign
                      rollout_schedule). With rollout_targets = "log" only a few steps are graded (see
                      rollout_target_steps), so a long rollout needs few target encodings.
                      rollout_siblings > 1 adds other first moves from the same position (one ply each).
+                     rollout_branches adds other lines of play from it, each a first move of its own and
+                     random moves after it for the number of plies given: a tree of positions to predict
+                     (the legal-threat head judges only the rollout's own, unless zthreat_branches).
     whole board      (zpred_weight > 0) From z of the masked board, predict the target encoder's z of
                      the whole board: the masked-square task at the level of the position vector. (The
                      predictor is also built, without this loss, when a head judges its output.)
@@ -375,6 +378,8 @@ class JEPAConfig:
     zthreat_rollout_steps: int = 2      # the predicted next z is judged on the positions after this many of the
                                         # rollout's first moves (those that are graded at all): each needs a label,
                                         # so past what the labels database holds each costs a search
+    zthreat_branches: bool = False      # also judge the predicted z of the positions on rollout_branches (to the
+                                        # same number of plies): each needs a label, so each costs a search
     zthreat_head: str = "linear"        # "linear" | "bilinear" | "piece_mlp": how much the head works out itself
     zthreat_mode: str = "binary"        # "binary": can the threat arise; "count": also in how many sequences
     zthreat_count_weight: float = 1.0   # ("count") the count term's weight beside the yes/no term
@@ -421,6 +426,10 @@ class JEPAConfig:
     rollout_siblings: int = 1        # different first moves predicted from each position: the rollout's own and
                                      # this many less one other legal moves (one ply each, graded as step 1), so a
                                      # batch asks what tells the moves of one board apart
+    rollout_branches: Tuple[int, ...] = ()   # other lines of play predicted from each position, one for each number:
+                                     # a first move no other line starts with, then random moves, that many plies
+                                     # in all (at most rollout_max_steps; a step is graded with the rollout's step
+                                     # of the same number). (4-ply rollout, branches (3, 3): ten positions a sample)
 
     # ----- Unpooling decisions (REINFORCE) -----
     unpool_rl: bool = True           # False freezes the decision policy; everything else still trains
@@ -445,10 +454,16 @@ class JEPAConfig:
         """Build a config from a (possibly partial) dict such as a DEHB sample; unknown keys are ignored."""
         names = {f.name for f in dataclasses.fields(cls)}
         clean = {k: (v.item() if hasattr(v, "item") else v) for k, v in values.items() if k in names}
+        if "rollout_branches" in clean:                 # (a list in a JSON file)
+            clean["rollout_branches"] = tuple(int(length) for length in clean["rollout_branches"])
         return cls(**clean)
 
     def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
+        """The settings as JSON holds them (a list for rollout_branches), so a dict read back from a file is
+        equal to the one written; from_dict takes either."""
+        values = dataclasses.asdict(self)
+        values["rollout_branches"] = list(self.rollout_branches)
+        return values
 
     def mask_config(self) -> ld.MaskConfig:
         return ld.MaskConfig(self.mask_min_ratio, self.mask_max_ratio, self.mask_max_block_radius)
@@ -546,6 +561,8 @@ class JEPAConfig:
             raise ValueError(f"rollout_targets must be one of {ROLLOUT_TARGETS}")
         if self.rollout_siblings < 1:
             raise ValueError("rollout_siblings must be at least 1")
+        if any(int(length) != length or not 1 <= length <= self.rollout_max_steps for length in self.rollout_branches):
+            raise ValueError("rollout_branches must be whole numbers of plies from 1 to rollout_max_steps")
         if self.mark_init_scale <= 0:
             raise ValueError("mark_init_scale must be positive")
         if self.anticollapse_views not in ANTICOLLAPSE_VIEWS:
@@ -1432,12 +1449,14 @@ class ZThreatHead(nn.Module):
             self.square = nn.Linear(c.z_dim, 64 * d)
             self.mix = nn.Parameter(torch.eye(d).repeat(groups, 1, 1) * d ** -0.5)
             self.bias = nn.Parameter(torch.zeros(groups))
-        else:
+        elif self.kind == "piece_mlp":
             h = c.zthreat_hidden
             self.hidden = nn.Linear(c.z_dim, 64 * h)
             self.norm = nn.LayerNorm(h)
             self.out_weight = nn.Parameter(torch.empty(64, h, groups * 64).uniform_(-h ** -0.5, h ** -0.5))
             self.out_bias = nn.Parameter(torch.zeros(64, groups * 64))
+        else:
+            raise ValueError(f"zthreat_head must be one of {THREAT_HEADS}, not {self.kind!r}")
 
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """z [R, z_dim] -> (logits, log counts or None), each [R, layers, 64, 64]: [row, ply, piece square, target square]."""

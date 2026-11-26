@@ -355,7 +355,8 @@ def threat_labels(config: lje.JEPAConfig, run: RunConfig, batch_size: int,
         return None
     on_steps = config.zthreat_next_weight > 0 or (config.zthreat_judges_predictions and config.zhead_fit == "target")
     source = ld.ThreatLabels(config.zthreat_plies, run.threat_db, compute=run.threat_compute,
-                             rollout_steps=config.zthreat_rollout_steps if on_steps else 0)
+                             rollout_steps=config.zthreat_rollout_steps if on_steps else 0,
+                             branches=config.zthreat_branches)
     if source.connection is None and not source.searches:
         raise ValueError(f"the legal-threat head needs labels: there is no labels database at {run.threat_db!r} "
                          f"(reach_labeler.py makes one; --threat-db says where it is) and the compiled search "
@@ -568,6 +569,7 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     loader = ld.JEPALoader(run.cache_dir, "train", batch_size, num_workers=run.num_workers,
                            mask_config=config.mask_config(), seed=run.seed, indices=indices,
                            pin_memory=device.type == "cuda", drop_last=True, siblings=config.rollout_siblings,
+                           branches=config.rollout_branches,
                            threats=threats, compact=run.compact_batches, prefetch_factor=run.prefetch_factor)
     if len(loader) == 0:
         raise ValueError(f"the training set ({len(loader.dataset)} positions) is smaller than one batch ({batch_size})")
@@ -577,11 +579,12 @@ def train(config: lje.JEPAConfig, run: RunConfig, log: Callable[[str], None] = p
     n_val = len(val_rows)
     val_loader = ld.JEPALoader(run.cache_dir, "val", batch_size, num_workers=0, mask_config=config.mask_config(),
                                seed=run.seed + 1, shuffle=False, indices=val_rows,
-                               siblings=config.rollout_siblings, threats=threats,
+                               siblings=config.rollout_siblings, branches=config.rollout_branches, threats=threats,
                                compact=run.compact_batches) if n_val else None
     exam_loader = None
     if run.exam:
         # The same positions, masks and moves for every run, whatever its seed, batch size and mask settings
+        # (one line of play each: no sibling moves or branches, so runs with and without them sit the same exam)
         exam_rows = random.Random(EVAL_SUBSET_SEED).sample(range(len(val_dataset)), min(run.exam_positions, len(val_dataset)))
         exam_loader = ld.JEPALoader(run.cache_dir, "val", run.exam_batch_size, num_workers=run.exam_workers,
                                     mask_config=ld.MaskConfig(), seed=EXAM_SEED, shuffle=False, indices=exam_rows,
@@ -1035,9 +1038,11 @@ def resolve_search(point: Dict[str, Any], positions: int,
 
 
 def _plain(value: Any) -> Any:
-    """Numbers as plain Python ones (rounded, so a value read back from a file compares equal)."""
+    """Numbers as plain Python ones (rounded) and tuples as lists, so a value read back from a file compares equal."""
     if isinstance(value, dict):
         return {str(k): _plain(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
     if hasattr(value, "item"):
         value = value.item()
     return round(value, 12) if isinstance(value, float) else value

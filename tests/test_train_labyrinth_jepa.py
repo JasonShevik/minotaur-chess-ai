@@ -443,6 +443,35 @@ def test_a_run_can_be_the_first_part_of_a_longer_one():
         assert not late["stopped"] and late["steps"] == 6
 
 
+def test_a_run_with_branches_trains_and_sits_the_one_line_exam():
+    """rollout_branches reach the training and validation batches; the exam stays one line of play for every run."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        cache = make_cache(tmp)
+        settings = dict(total_steps=4, eval_every=0, probe_positions=0, grad_terms_every=0, checkpoint_every=0,
+                        snapshot_first=0, exam=True, exam_positions=8, exam_batch_size=4, exam_workers=0)
+        results = {}
+        for name, branches in (("tree", (2, 2)), ("path", ())):
+            cfg = heads_config(rollout_start_steps=3, rollout_max_steps=3, rollout_branches=branches)
+            seen = []
+            wrapped = lje.LabyrinthJEPA.losses
+
+            def losses(self, batch, *args, _seen=seen, _wrapped=wrapped, **kw):
+                _seen.append([step.index.numel() for step in batch.rollout])
+                return _wrapped(self, batch, *args, **kw)
+            lje.LabyrinthJEPA.losses = losses
+            try:
+                results[name] = tj.train(cfg, tiny_run(cache, os.path.join(tmp, name), **settings), log=quiet)
+            finally:
+                lje.LabyrinthJEPA.losses = wrapped
+            results[name + "_rows"] = seen
+        tree, path = results["tree_rows"], results["path_rows"]
+        # training batches (8 positions): up to two more rows a position at plies 1 and 2, none at ply 3
+        assert all(rows[0] > 8 and rows[1] > rows[2] for rows in tree[:4]) and all(rows[0] <= 8 for rows in path[:4])
+        # the exam's batches (4 positions) carry one line each, with or without branches
+        assert [rows for rows in tree if rows[0] <= 4] == [rows for rows in path if rows[0] <= 4] != []
+        assert results["tree"]["final"]["exam_loss"] > 0 and results["path"]["final"]["exam_loss"] > 0
+
+
 def test_a_stopped_run_carries_on_on_the_gpu():
     """The checkpoint is loaded onto the run's device, the random generator's state with it; resuming on a GPU
     must still restore it (it once failed there, and only there)."""
