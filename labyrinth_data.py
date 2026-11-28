@@ -561,7 +561,7 @@ class ThreatLabels:
     Where a loader gets positions' legal-threat labels, to `plies` plies of play:
       * the labels database reach_labeler.py fills (db_path), for every position it holds at least that deep;
       * for any other position, with compute set and the compiled search built (piece_reach.USING_C), the
-        search itself: about 0.1 ms a position at 2 plies, 3 ms at 3. The Python search is never run here: at
+        search itself: about 0.1 ms a position at 2 plies, 2 ms at 3. The Python search is never run here: at
         70 ms to seconds a position it would stall training;
       * failing both, the position goes without a label and whatever is graded against threats leaves it out.
     rollout_steps: the positions after this many of a sample's first rollout moves get labels too (the

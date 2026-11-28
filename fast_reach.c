@@ -7,7 +7,8 @@
  *     python build_fast_reach.py
  *
  * which makes fast_reach.dll (Windows) or fast_reach.so next to this file; piece_reach.py uses it when it is
- * there. By hand:  gcc -O3 -shared -static-libgcc fast_reach.c -o fast_reach.dll   (add -fPIC for a .so)
+ * there. By hand:  gcc -O3 -march=native -funroll-loops -shared -static-libgcc fast_reach.c -o fast_reach.dll
+ * (add -fPIC for a .so). -march=native: the library is for the machine that builds it.
  *
  * What is counted is described at the top of piece_reach.py. How it is counted here:
  *
@@ -18,7 +19,11 @@
  *     slider's attacks (used for that piece's own moves and for the other king's safety), then each piece's
  *     legal squares as one 64-bit mask.
  *   * The positions one ply above the last (whose children are only looked at, not searched) do most of the
- *     work. From the fourth ply on, many of them are reached by more than one move order, so what such a
+ *     work, and a child is not worked out whole there: one move leaves most pieces threatening exactly what
+ *     they threatened before it, so only the pieces the move can reach are worked out again (the piece that
+ *     moved, those that look at a square that changed hands, those whose pin, king's safety, castling or en
+ *     passant the move touches), and the rest are counted as unchanged. A side in check is worked out whole.
+ *   * From the fourth ply on, many of those positions are reached by more than one move order, so what such a
  *     position adds (its own threats and the sum of its children's) is kept in a table under the position
  *     itself, numbered by its own pieces, and added again from there when the position comes back.
  *   * The whole answer for the last few root positions is kept too. A labelled sample is a position and the
@@ -31,6 +36,7 @@
  *
  * Squares are python-chess's: a1 = 0, b1 = 1, ..., h8 = 63.
  */
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,12 +70,14 @@ static inline int lsb(uint64_t x) { return __builtin_ctzll(x); }
 typedef struct {
     uint64_t bb[2][6];              /* [colour][piece type] */
     uint64_t occ[2];
-    int8_t piece_at[64];            /* piece type, or -1 */
     int8_t king[2];                 /* the kings' squares */
     int8_t turn;
     int8_t ep_sq;                   /* the square a pawn just jumped over, or -1 */
     int8_t castle_rook[4];          /* [colour * 2 + side]: the rook's square or -1; side 0 = h-side (king to g), 1 = a-side (king to c) */
+    int8_t piece_at[64];            /* piece type, or -1. Last: a position that is only looked at goes without it (make_leaf) */
 } Pos;
+
+#define POS_HEAD offsetof(Pos, piece_at)
 
 typedef struct {
     uint8_t from, to, promo, flags; /* promo: 0 or KNIGHT..QUEEN */
@@ -236,6 +244,49 @@ static void make_move(const Pos *src, Move m, Pos *dst) {
     }
 }
 
+/* The position after the move, for looking at only: everything but piece_at, which is left unset. (What works out
+   a position's moves as masks reads the bitboards alone; list_moves and make_move need piece_at.) */
+static inline void make_leaf(const Pos *src, Move m, Pos *dst) {
+    memcpy(dst, src, POS_HEAD);
+    const int c = src->turn, e = c ^ 1, f = m.from, t = m.to;
+    const uint64_t fb = BIT(f), tb = BIT(t);
+    dst->turn = (int8_t)e;
+    dst->ep_sq = -1;
+    if (m.flags & F_CASTLE) {
+        int kt, rt;
+        castle_squares(f, t, &kt, &rt);
+        dst->bb[c][KING] = BIT(kt);
+        dst->bb[c][ROOK] = (dst->bb[c][ROOK] & ~tb) | BIT(rt);
+        dst->occ[c] = (dst->occ[c] & ~(fb | tb)) | BIT(kt) | BIT(rt);
+        dst->king[c] = (int8_t)kt;
+        dst->castle_rook[c * 2] = dst->castle_rook[c * 2 + 1] = -1;
+        return;
+    }
+    const int pt = src->piece_at[f];
+    if (m.flags & F_EP) {
+        const uint64_t taken = BIT(t ^ 8);
+        dst->bb[e][PAWN] &= ~taken;
+        dst->occ[e] &= ~taken;
+    } else if (src->piece_at[t] >= 0) {
+        dst->bb[e][src->piece_at[t]] &= ~tb;
+        dst->occ[e] &= ~tb;
+        if (t == dst->castle_rook[e * 2]) dst->castle_rook[e * 2] = -1;
+        if (t == dst->castle_rook[e * 2 + 1]) dst->castle_rook[e * 2 + 1] = -1;
+    }
+    dst->bb[c][pt] &= ~fb;
+    dst->bb[c][m.promo ? m.promo : pt] |= tb;
+    dst->occ[c] = (dst->occ[c] & ~fb) | tb;
+    if (pt == KING) {
+        dst->king[c] = (int8_t)t;
+        dst->castle_rook[c * 2] = dst->castle_rook[c * 2 + 1] = -1;
+    } else if (pt == ROOK) {
+        if (f == dst->castle_rook[c * 2]) dst->castle_rook[c * 2] = -1;
+        if (f == dst->castle_rook[c * 2 + 1]) dst->castle_rook[c * 2 + 1] = -1;
+    } else if (pt == PAWN && abs(t - f) == 16) {
+        dst->ep_sq = (int8_t)((f + t) >> 1);
+    }
+}
+
 /* A FEN (standard, X-FEN or Shredder castling letters; move counters optional) -> Pos. 0 when the position is
    one this file handles, otherwise non-zero (see the top of the file). */
 static int parse_fen(const char *fen, Pos *pos) {
@@ -373,25 +424,22 @@ static void gen_side(const Pos *p, int c, int ep_active, uint64_t occ, const uin
         for (b = p->bb[c][KNIGHT] & ~pinned; b; POP(b)) {       /* a pinned knight has no move */
             int sq = lsb(b);
             t = KNIGHT_ATK[sq] & targets;
-            if (t) { s->from[n] = (uint8_t)sq; s->to[n] = t; s->extra[n] = 0; n++; }
+            s->from[n] = (uint8_t)sq; s->to[n] = t; s->extra[n] = 0; n += t != 0;
         }
         for (b = p->bb[c][BISHOP] | p->bb[c][ROOK] | p->bb[c][QUEEN]; b; POP(b)) {
             int sq = lsb(b);
             t = slider[sq] & targets;
             if (pinned >> sq & 1) t &= ray[sq];
-            if (t) { s->from[n] = (uint8_t)sq; s->to[n] = t; s->extra[n] = 0; n++; }
+            s->from[n] = (uint8_t)sq; s->to[n] = t; s->extra[n] = 0; n += t != 0;
         }
 
         const int up = c == WHITE ? 8 : -8;
-        const uint64_t start = c == WHITE ? RANK_2 : RANK_7;
+        const uint64_t jump_rank = c == WHITE ? 0x00000000FF000000ULL : 0x000000FF00000000ULL;   /* where a double step ends */
         const int ep = ep_active ? p->ep_sq : -1;
         for (b = p->bb[c][PAWN]; b; POP(b)) {
             int sq = lsb(b), one = sq + up;
-            t = PAWN_ATK[c][sq] & opp;
-            if (!(occ >> one & 1)) {
-                t |= BIT(one);
-                if ((start >> sq & 1) && !(occ >> (one + up) & 1)) t |= BIT(one + up);
-            }
+            const uint64_t step = BIT(one) & ~occ;
+            t = (PAWN_ATK[c][sq] & opp) | step | ((c == WHITE ? step << 8 : step >> 8) & ~occ & jump_rank);
             t &= targets;
             if (pinned >> sq & 1) t &= ray[sq];
             if (ep >= 0 && (PAWN_ATK[c][sq] >> ep & 1)) {
@@ -402,7 +450,7 @@ static void gen_side(const Pos *p, int c, int ep_active, uint64_t occ, const uin
                     if (!(rook_attacks(K, after) & e_orth) && !(bishop_attacks(K, after) & e_diag)) t |= BIT(ep);
                 }
             }
-            if (t) { s->from[n] = (uint8_t)sq; s->to[n] = t; s->extra[n] = 0; n++; }
+            s->from[n] = (uint8_t)sq; s->to[n] = t; s->extra[n] = 0; n += t != 0;
         }
 
         if (!checkers) {
@@ -426,10 +474,11 @@ static void gen_side(const Pos *p, int c, int ep_active, uint64_t occ, const uin
 
 /* The legal moves of the side to move (out[0]) and, when both is set, of the other side as if it were its
    turn, without the en passant square (out[1]). Every slider's attacks are worked out once and serve both
-   that piece's own moves and the other king's safety. */
-static void gen_both(const Pos *p, int both, Side out[2]) {
+   that piece's own moves and the other king's safety.
+   slider: filled with every slider's attacks in p, by its square (the caller's 64 words). */
+static void gen_both(const Pos *p, int both, Side out[2], uint64_t *slider) {
     const uint64_t occ = p->occ[0] | p->occ[1];
-    uint64_t slider[64], att[2], b;
+    uint64_t att[2], b;
     for (int c = 0; c < 2; c++) {
         uint64_t pawns = p->bb[c][PAWN], a = KING_ATK[p->king[c]];
         a |= c == WHITE ? ((pawns & NOT_A) << 7) | ((pawns & NOT_H) << 9) : ((pawns & NOT_A) >> 9) | ((pawns & NOT_H) >> 7);
@@ -601,6 +650,53 @@ static uint64_t *table_reserve(Ctx *C, uint64_t hash, int n) {
 }
 
 /* ---------- ---------- ----------
+ *   What one move can change
+ */
+
+/* The squares a knight on any square of d attacks (so: where a knight must stand to attack a square of d). */
+static inline uint64_t knight_reach(uint64_t d) {
+    const uint64_t h1 = ((d >> 1) & NOT_H) | ((d << 1) & NOT_A);
+    const uint64_t h2 = ((d >> 2) & 0x3F3F3F3F3F3F3F3FULL) | ((d << 2) & 0xFCFCFCFCFCFCFCFCULL);
+    return (h1 << 16) | (h1 >> 16) | (h2 << 8) | (h2 >> 8);
+}
+
+/* The squares from which a pawn of colour c looks at a square of d: it would step or jump there, or take there. */
+static inline uint64_t pawn_reach(int c, uint64_t d) {
+    return c == WHITE ? (d >> 8) | ((d >> 16) & RANK_2) | ((d & NOT_H) >> 7) | ((d & NOT_A) >> 9)
+                      : (d << 8) | ((d << 16) & RANK_7) | ((d & NOT_A) << 7) | ((d & NOT_H) << 9);
+}
+
+/* Colour c's pinned pieces (as gen_side finds them). A pinned piece moves only along the line through its king. */
+static inline uint64_t pinned_of(const Pos *p, int c, uint64_t occ) {
+    const int e = c ^ 1, K = p->king[c];
+    const uint64_t e_diag = p->bb[e][BISHOP] | p->bb[e][QUEEN], e_orth = p->bb[e][ROOK] | p->bb[e][QUEEN];
+    uint64_t pinned = 0;
+    for (uint64_t b = (SNIPE_B[K] & e_diag) | (SNIPE_R[K] & e_orth); b; POP(b)) {
+        const uint64_t between = BETWEEN_BB[K][lsb(b)] & occ;
+        if (between && !(between & (between - 1)) && (between & p->occ[c])) pinned |= between;
+    }
+    return pinned;
+}
+
+/* Colour c's castling when it is not in check (as gen_side decides it): the square its king would go to (kx)
+   and, for the h-side and the a-side, the rook (rs) and the square that rook would go to (rx). */
+static inline void castle_extras(const Pos *p, int c, uint64_t occ, uint64_t danger, uint64_t *kx, int rs[2], uint64_t rx[2]) {
+    const int K = p->king[c], e = c ^ 1;
+    for (int side = 0; side < 2; side++) {
+        int r = p->castle_rook[c * 2 + side], kt, rt;
+        if (r < 0) continue;
+        castle_squares(K, r, &kt, &rt);
+        const uint64_t king_path = BETWEEN_BB[K][kt];
+        const uint64_t empty = king_path | BETWEEN_BB[r][rt] | BIT(kt) | BIT(rt);
+        if ((occ ^ BIT(K) ^ BIT(r)) & empty) continue;
+        if (danger & king_path) continue;
+        if (attacked(p, kt, e, occ ^ BIT(K) ^ BIT(r) ^ BIT(rt))) continue;
+        if (kt != K) *kx |= BIT(kt);
+        if (rt != r) { rs[side] = r; rx[side] = BIT(rt); }
+    }
+}
+
+/* ---------- ---------- ----------
  *   Legal threats
  *
  *   out is [plies + 1][64][64]: [k][p][s] counts the sequences of k plies after which the piece that stood on
@@ -677,7 +773,8 @@ static void threats_walk(Ctx *C, const Pos *pos, const uint8_t *who, int left, i
     }
 
     Side sd[2];
-    gen_both(pos, 1, sd);
+    uint64_t slider[64];
+    gen_both(pos, 1, sd, slider);
     C->stats[0]++;
     add_threats(&sd[0], who, layer);
     add_threats(&sd[1], who, layer);
@@ -692,36 +789,155 @@ static void threats_walk(Ctx *C, const Pos *pos, const uint8_t *who, int left, i
            kept for the next time this position turns up.
            One move changes little: in most children a piece threatens exactly what it threatens here (base).
            Those children are only counted (same); the squares are walked one by one just for the rest. */
-        uint8_t local[64] = {0}, same[32], *scratch = C->scratch;
+        uint8_t local[64] = {0}, same[32], differs[32], *scratch = C->scratch;
+        uint8_t mine[2][16];                            /* each colour's pieces here, by their numbers */
+        int n_mine[2] = {0, 0};
         uint64_t cells[32], base[32];
         int i = 0;
-        for (uint64_t b = occ; b; POP(b), i++) { local[lsb(b)] = (uint8_t)i; cells[i] = 0; base[i] = 0; same[i] = 0; }
+        for (uint64_t b = occ; b; POP(b), i++) {
+            const int sq = lsb(b), colour = (int)(pos->occ[BLACK] >> sq & 1);
+            local[sq] = (uint8_t)i; cells[i] = 0; base[i] = 0; differs[i] = 0;
+            mine[colour][n_mine[colour]++] = (uint8_t)i;
+        }
         for (int side = 0; side < 2; side++)
             for (int j = 0; j < sd[side].n; j++) base[local[sd[side].from[j]]] = sd[side].to[j] | sd[side].extra[j];
+
+        /* A child is not worked out whole. A piece's threats there can differ from its threats here only if the
+           move reaches it: it moved; a square it looks at changed hands (D); its pin, its king's safety or its
+           right to castle or to take en passant changed. Those pieces are worked out again; every other piece
+           threatens what it threatens here, and is not looked at. A side that is in check (there, or here when
+           it is the side to move) or whose king moved is worked out whole, as before. differs[i]: the children
+           in which piece i does not threaten exactly what it threatens here. */
+        const int M = pos->turn, O = M ^ 1, KM = pos->king[M];
+        const uint64_t pinned_here[2] = {pinned_of(pos, WHITE, occ), pinned_of(pos, BLACK, occ)};
+        const uint64_t king_lines[2] = {SNIPE_B[pos->king[WHITE]] | SNIPE_R[pos->king[WHITE]],
+                                        SNIPE_B[pos->king[BLACK]] | SNIPE_R[pos->king[BLACK]]};
+        const int checked_here = attacked(pos, KM, O, occ);
+        const uint64_t ep_pawns = pos->ep_sq >= 0 ? PAWN_ATK[O][pos->ep_sq] & pos->bb[M][PAWN] : 0;
+        uint64_t castle_rooks[2] = {0, 0};
+        for (int c = 0; c < 2; c++)
+            for (int side = 0; side < 2; side++)
+                if (pos->castle_rook[c * 2 + side] >= 0) castle_rooks[c] |= BIT(pos->castle_rook[c * 2 + side]);
+
+#define TALLY(sq_, t_) do { \
+            const int piece_ = local[sq_]; \
+            const uint64_t mask_ = (t_); \
+            if (mask_ != base[piece_]) { \
+                uint8_t *row_ = scratch + piece_ * 64; \
+                differs[piece_]++; \
+                cells[piece_] |= mask_; \
+                for (uint64_t x_ = mask_; x_; POP(x_)) row_[lsb(x_)]++; \
+            } \
+        } while (0)
+
         for (int k = 0; k < nm; k++) {
             Pos child;
-            Side cs[2];
             const Move m = mv[k];
-            make_move(pos, m, &child);
+            make_leaf(pos, m, &child);
             int kt = m.to, rt = m.to;
             if (m.flags & F_CASTLE) castle_squares(m.from, m.to, &kt, &rt);
             const uint8_t keep_k = local[kt], keep_r = local[rt];
+            const int taken = (m.flags & F_EP) ? local[m.to ^ 8]
+                            : (!(m.flags & F_CASTLE) && pos->piece_at[m.to] >= 0) ? keep_k : -1;
             follow(local, m);
-            gen_both(&child, 1, cs);
-            for (int side = 0; side < 2; side++) {
-                const Side *s = &cs[side];
-                for (int j = 0; j < s->n; j++) {
-                    const int piece = local[s->from[j]];
-                    const uint64_t t = s->to[j] | s->extra[j];
-                    if (t == base[piece]) { same[piece]++; continue; }
-                    uint8_t *row = scratch + piece * 64;
-                    cells[piece] |= t;
-                    for (uint64_t x = t; x; POP(x)) row[lsb(x)]++;
+
+            const uint64_t occ2 = child.occ[0] | child.occ[1];
+            const uint64_t changed = occ ^ occ2;                                            /* empty <-> occupied */
+            const uint64_t D = (pos->occ[0] ^ child.occ[0]) | (pos->occ[1] ^ child.occ[1]);  /* ... or changed hands */
+            const uint64_t fresh = BIT(kt) | BIT(rt);                                       /* where a piece arrived */
+            const uint64_t moved = fresh | BIT(m.from) | BIT(m.to);                         /* ... or left */
+            /* Every slider's attacks (kept from here when no square it attacked changed), each colour's attacks,
+               and the sliders that look at a square of D */
+            uint64_t child_slider[64], att[2], touched = 0, b;
+#define SLIDE(expr) { \
+                const int sq = lsb(b); \
+                uint64_t v; \
+                if (fresh >> sq & 1) { v = (expr); touched |= BIT(sq); } \
+                else { v = slider[sq]; if (D & v) { touched |= BIT(sq); if (changed & v) v = (expr); } } \
+                child_slider[sq] = v; \
+                a |= v; }
+            for (int c = 0; c < 2; c++) {
+                uint64_t pawns = child.bb[c][PAWN], a = KING_ATK[child.king[c]];
+                a |= c == WHITE ? ((pawns & NOT_A) << 7) | ((pawns & NOT_H) << 9) : ((pawns & NOT_A) >> 9) | ((pawns & NOT_H) >> 7);
+                for (b = child.bb[c][KNIGHT]; b; POP(b)) a |= KNIGHT_ATK[lsb(b)];
+                for (b = child.bb[c][BISHOP]; b; POP(b)) SLIDE(bishop_attacks(sq, occ2))
+                for (b = child.bb[c][ROOK]; b; POP(b)) SLIDE(rook_attacks(sq, occ2))
+                for (b = child.bb[c][QUEEN]; b; POP(b)) SLIDE(bishop_attacks(sq, occ2) | rook_attacks(sq, occ2))
+                att[c] = a;
+            }
+#undef SLIDE
+
+            for (int c = 0; c < 2; c++) {
+                const int e = c ^ 1, K = child.king[c], to_move = c == O;       /* in the child the other side moves */
+                if (c == O ? (int)(att[M] >> K & 1) : (checked_here || K != KM)) {
+                    /* the whole side: every piece is taken to differ, then those that do not are given back */
+                    Side all;
+                    gen_side(&child, c, to_move, occ2, child_slider, att[e], &all);
+                    for (int j = 0; j < n_mine[c]; j++) differs[mine[c][j]]++;
+                    for (int j = 0; j < all.n; j++) {
+                        const int piece = local[all.from[j]];
+                        const uint64_t t = all.to[j] | all.extra[j];
+                        if (t == base[piece]) { differs[piece]--; continue; }
+                        uint8_t *row = scratch + piece * 64;
+                        cells[piece] |= t;
+                        for (uint64_t x = t; x; POP(x)) row[lsb(x)]++;
+                    }
+                    continue;
+                }
+                const uint64_t own = child.occ[c], opp = child.occ[e];
+                if (to_move && taken >= 0) differs[taken]++;                    /* a piece that is gone threatens nothing */
+                /* (a pin can come or go wherever a piece left or arrived: castling can swap a king and a rook
+                   without any square changing hands) */
+                const uint64_t pinned = ((D | moved) & king_lines[c]) ? pinned_of(&child, c, occ2) : pinned_here[c];
+                const int ep = to_move ? child.ep_sq : -1;
+                uint64_t reached = (fresh & own)
+                                 | (child.bb[c][KNIGHT] & knight_reach(D))
+                                 | (touched & own)
+                                 | (child.bb[c][PAWN] & pawn_reach(c, D))
+                                 | ((pinned ^ pinned_here[c]) & own)
+                                 | (castle_rooks[c] & child.bb[c][ROOK]);
+                if (ep >= 0) reached |= PAWN_ATK[e][ep] & child.bb[c][PAWN];
+                if (!to_move) reached |= ep_pawns & child.bb[c][PAWN];
+                uint64_t kx = 0, rx[2] = {0, 0};
+                int rs[2] = {-1, -1};
+                if (child.castle_rook[c * 2] >= 0 || child.castle_rook[c * 2 + 1] >= 0)
+                    castle_extras(&child, c, occ2, att[e], &kx, rs, rx);
+
+                TALLY(K, (KING_ATK[K] & ~own & ~att[e]) | kx);
+                reached &= ~BIT(K);
+                for (b = reached & child.bb[c][KNIGHT]; b; POP(b)) {
+                    const int sq = lsb(b);
+                    TALLY(sq, (pinned >> sq & 1) ? 0 : KNIGHT_ATK[sq] & ~own);
+                }
+                for (b = reached & (child.bb[c][BISHOP] | child.bb[c][ROOK] | child.bb[c][QUEEN]); b; POP(b)) {
+                    const int sq = lsb(b);
+                    uint64_t t = child_slider[sq] & ~own;
+                    if (pinned >> sq & 1) t &= LINE_BB[K][sq];
+                    t |= (sq == rs[0] ? rx[0] : 0) | (sq == rs[1] ? rx[1] : 0);
+                    TALLY(sq, t);
+                }
+                if (reached & child.bb[c][PAWN]) {
+                    const int up = c == WHITE ? 8 : -8;
+                    const uint64_t jump_rank = c == WHITE ? 0x00000000FF000000ULL : 0x000000FF00000000ULL;
+                    const uint64_t e_diag = child.bb[e][BISHOP] | child.bb[e][QUEEN], e_orth = child.bb[e][ROOK] | child.bb[e][QUEEN];
+                    for (b = reached & child.bb[c][PAWN]; b; POP(b)) {
+                        const int sq = lsb(b), one = sq + up;
+                        const uint64_t step = BIT(one) & ~occ2;
+                        uint64_t t = (PAWN_ATK[c][sq] & opp) | step | ((c == WHITE ? step << 8 : step >> 8) & ~occ2 & jump_rank);
+                        if (pinned >> sq & 1) t &= LINE_BB[K][sq];
+                        if (ep >= 0 && (PAWN_ATK[c][sq] >> ep & 1)) {
+                            const uint64_t after = (occ2 ^ BIT(sq) ^ BIT(ep ^ 8)) | BIT(ep);
+                            if (!(rook_attacks(K, after) & e_orth) && !(bishop_attacks(K, after) & e_diag)) t |= BIT(ep);
+                        }
+                        TALLY(sq, t);
+                    }
                 }
             }
             local[kt] = keep_k;
             local[rt] = keep_r;
         }
+#undef TALLY
+        for (i = 0; i < n; i++) same[i] = (uint8_t)(nm - differs[i]);
         C->stats[0] += (uint64_t)nm;
 
         uint64_t *entry = stored ? table_reserve(C, hash, n) : NULL;
@@ -776,7 +992,8 @@ static void reach_walk(Ctx *C, const Pos *pos, const uint8_t *who, const uint8_t
                        const uint8_t *pieces, int n, int ply, int depth) {
     Side sd[2];
     Move mv[MAX_MOVES];
-    gen_both(pos, 0, sd);
+    uint64_t slider[64];
+    gen_both(pos, 0, sd, slider);
     C->stats[0]++;
     const int nm = list_moves(pos, &sd[0], mv);
     if (!nm) return;
